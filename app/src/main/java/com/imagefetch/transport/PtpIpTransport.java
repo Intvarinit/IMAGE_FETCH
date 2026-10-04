@@ -42,6 +42,8 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int PACKET_INIT_COMMAND_ACK = 2;
     private static final int PACKET_INIT_EVENT_REQUEST = 3;
     private static final int PACKET_INIT_EVENT_ACK = 4;
+    /** 相机侧已有会话/忙时对 InitCommandRequest 的应答：type 5。 */
+    private static final int PACKET_INIT_FAIL = 5;
     private static final int PACKET_COMMAND_REQUEST = 6;
     private static final int PACKET_COMMAND_RESPONSE = 7;
     private static final int PACKET_EVENT = 8;
@@ -55,6 +57,7 @@ public final class PtpIpTransport implements CameraTransport {
 
     private static final int OPERATION_GET_DEVICE_INFO = 0x1001;
     private static final int OPERATION_OPEN_SESSION = 0x1002;
+    private static final int OPERATION_CLOSE_SESSION = 0x1003;
     private static final int OPERATION_GET_STORAGE_IDS = 0x1004;
     private static final int OPERATION_GET_STORAGE_INFO = 0x1005;
     private static final int OPERATION_GET_OBJECT_HANDLES = 0x1007;
@@ -70,8 +73,9 @@ public final class PtpIpTransport implements CameraTransport {
     private static final long MAX_TRANSFER_BYTES = 512L * 1024 * 1024;
     private static final int MAX_PACKET_BYTES = 64 * 1024 * 1024;
 
-    /** 保活参数：单次探测超时 3s。 */
+    /** 保活参数：单次 PING 探测超时 3s；命令复核超时 3s。 */
     public static final int PROBE_TIMEOUT_MS = 3000;
+    private static final int VERIFY_TIMEOUT_MS = 3000;
 
     /** 已连 PTP/IP 相机的厂商分类（detectVendor 结果，断连清零）。 */
     public enum CameraVendor {
@@ -100,6 +104,8 @@ public final class PtpIpTransport implements CameraTransport {
     private IOException eventReaderFailure;
     private volatile IOException commandChannelFailure;
     private long probeResponseSequence;
+    /** 相机是否回 PONG；实测不回时置 false，保活改用真实命令往返（跨重连保持）。 */
+    private volatile boolean pingKeepAliveSupported = true;
     private Thread eventReaderThread;
     private int transactionId = 1;
     private String cameraName = "PTP/IP Camera";
@@ -155,8 +161,15 @@ public final class PtpIpTransport implements CameraTransport {
             ensureTransportGeneration(generation);
             Packet commandAck = readPacket(pendingCommandInput);
             ensureTransportGeneration(generation);
+            if (commandAck.type == PACKET_INIT_FAIL) {
+                throw new IOException(
+                        "相机拒绝了新连接（InitFail）：相机侧仍持有上一次的会话。"
+                                + "等待约 30 秒让相机会话超时后重试，"
+                                + "或在相机上关闭再打开 Wi‑Fi 立即释放。");
+            }
             if (commandAck.type != PACKET_INIT_COMMAND_ACK || commandAck.data.length < 28) {
-                throw new IOException("相机返回了无效的 PTP/IP 握手数据");
+                throw new IOException(
+                        "相机返回了无效的 PTP/IP 握手数据（type=" + commandAck.type + "）");
             }
             long connectionNumber = u32(commandAck.data, 8);
             String announcedName = utf16(commandAck.data, 28);
@@ -218,6 +231,41 @@ public final class PtpIpTransport implements CameraTransport {
         return true;
     }
 
+    /**
+     * 尽力发送 CloseSession(0x1003)，让相机立即释放本次会话。
+     * 不做这件事的直接后果：相机会一直持有旧会话，下一次 InitCommandRequest 直接被
+     * 回 InitFail(type 5)，表现为「第一次能连、之后每次连接都失败」。
+     * 只做一次短超时尝试，失败即放弃——socket 随后会被关闭，相机将按自己的超时回收。
+     */
+    @Override
+    public synchronized void releaseSession() {
+        Socket socket = commandSocket;
+        InputStream input = commandInput;
+        OutputStream output = commandOutput;
+        if (socket == null || input == null || output == null || socket.isClosed()) return;
+        synchronized (probeMonitor) {
+            // 命令通道已判死（或已中止）时不再尝试，避免把断链状态误当会话问题。
+            if (commandChannelFailure != null) return;
+        }
+        int previousTimeout = -1;
+        try {
+            previousTimeout = socket.getSoTimeout();
+            socket.setSoTimeout(1200);
+            ByteWriter request = new ByteWriter();
+            request.u32(1);
+            request.u16(OPERATION_CLOSE_SESSION);
+            request.u32(transactionId++);
+            writePacket(output, PACKET_COMMAND_REQUEST, request.data());
+            readPacket(input); // 应答码不作为成败依据：会话本就即将关闭。
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                socket.setSoTimeout(previousTimeout);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     @Override
     public synchronized long[] capture() throws Exception {
         ensureConnected();
@@ -234,8 +282,66 @@ public final class PtpIpTransport implements CameraTransport {
         return new long[0];
     }
 
-    /** PTP/IP event 通道 Probe Request/Response（type 13/14），单次超时 3s。 */
+    /**
+     * 保活探测。
+     * 原始实现把「PING 无应答」直接当成链路断开，但相当多的相机只单向下发 PING、
+     * 并不回应发起方的 PING——于是空闲十几秒就会被误判掉线，触发一次无谓的拆链重连
+     * （真机表现为「下载完一个文件、等一会儿就提示重连」）。
+     * 现在改为：PING 无应答时用一次真实 PTP 往返复核，复核通过即认定链路存活，
+     * 并永久降级为命令探测；只有两种方式都失败才判定离线。
+     */
     public synchronized void probe() throws Exception {
+        if (!pingKeepAliveSupported) {
+            verifyAlive();
+            return;
+        }
+        Exception pingFailure;
+        try {
+            probeWithPing();
+            return;
+        } catch (Exception failure) {
+            pingFailure = failure;
+        }
+        synchronized (probeMonitor) {
+            // 通道已因真实 IO 错误判死时没有复核的必要，直接失败。
+            if (eventReaderFailure != null || commandChannelFailure != null) throw pingFailure;
+        }
+        verifyAlive();
+        pingKeepAliveSupported = false;
+    }
+
+    /** 相机是否会对发起方的 PING 回 PONG；为 false 时保活走真实命令往返。 */
+    public boolean pingKeepAliveSupported() {
+        return pingKeepAliveSupported;
+    }
+
+    /**
+     * 真实往返探活：GetDeviceInfo 带数据阶段，必须整段读完，否则命令通道会残留数据而串包
+     * （与连接时识别厂商走的是同一条路径）。读超时临时压到 3s：健康的相机毫秒级返回。
+     */
+    private void verifyAlive() throws Exception {
+        Socket socket = commandSocket;
+        int previousTimeout = -1;
+        if (socket != null) {
+            try {
+                previousTimeout = socket.getSoTimeout();
+                socket.setSoTimeout(VERIFY_TIMEOUT_MS);
+            } catch (Exception ignored) {
+            }
+        }
+        try {
+            commandWithData(OPERATION_GET_DEVICE_INFO, transactionId++, new long[0]);
+        } finally {
+            if (socket != null && previousTimeout > 0) {
+                try {
+                    socket.setSoTimeout(previousTimeout);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void probeWithPing() throws Exception {
         ensureConnected();
         Socket expectedSocket = eventSocket;
         OutputStream output = eventOutput;
@@ -510,8 +616,16 @@ public final class PtpIpTransport implements CameraTransport {
         if (response.type != PACKET_COMMAND_RESPONSE
                 || response.data.length < 14
                 || u32(response.data, 10) != (transaction & 0xffff_ffffL)) {
-            throw commandChannelFailed(
-                    new IOException("相机返回了无效的 PTP/IP 响应"));
+            // 带上实收内容，便于区分「相机回错事务」与「命令通道串包」。
+            throw commandChannelFailed(new IOException(String.format(
+                    Locale.ROOT,
+                    "相机返回了无效的 PTP/IP 响应（op=0x%04X type=%d 实收事务=%s 期望=%d）",
+                    operation,
+                    response.type,
+                    response.data.length >= 14
+                            ? String.valueOf(u32(response.data, 10))
+                            : "缺失",
+                    transaction & 0xffff_ffffL)));
         }
         return u16(response.data, 8);
     }

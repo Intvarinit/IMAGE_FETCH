@@ -311,13 +311,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         return text.toString();
     }
 
-    /** 明确区分两处落点：应用内副本（去重与重传的真源）与系统相册可见位置。 */
+    /** 明确区分两处落点：应用内暂存（下载中转，导出后清理）与系统相册可见位置。 */
     private void updateStorageLabels() {
         String album = exportToGalleryBox.isChecked()
                 ? GalleryExporter.RELATIVE_PATH
                 : getString(R.string.album_dir_disabled);
         outputDirView.setText(getString(R.string.output_dir_label) + "："
                 + coordinator.outputDirectory().getAbsolutePath()
+                + (exportToGalleryBox.isChecked() ? "（导出成功后自动清理）" : "（导出关闭时保留）")
                 + "\n" + getString(R.string.album_dir_label) + "：" + album);
     }
 
@@ -415,12 +416,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     @Override
-    public void onFileSaved(File file, long bytes, long elapsedMillis) {
+    public void onFileSaved(File file, long bytes, long elapsedMillis, String note) {
         runOnUiThread(() -> {
             setBusy(false);
             progressBar.setProgress(100);
+            // note 必须带上：否则相册导出结果会被这条消息覆盖掉，用户无从判断。
             statusView.setText("已保存 " + file.getName() + " · " + bytes
-                    + " 字节 · " + elapsedMillis + " ms");
+                    + " 字节 · " + elapsedMillis + " ms" + (note == null ? "" : note));
         });
     }
 

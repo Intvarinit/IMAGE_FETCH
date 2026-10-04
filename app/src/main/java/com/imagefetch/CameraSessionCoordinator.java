@@ -67,7 +67,8 @@ public final class CameraSessionCoordinator {
 
         void onProgress(long received, long total);
 
-        void onFileSaved(File file, long bytes, long elapsedMillis);
+        /** note 为相册导出结果（含失败原因）；界面上必须与文件名一起显示，否则会被覆盖掉。 */
+        void onFileSaved(File file, long bytes, long elapsedMillis, String note);
 
         void onError(String message, Throwable error);
     }
@@ -96,6 +97,12 @@ public final class CameraSessionCoordinator {
     private static final int PREVIEW_MAX_PX = 1600;
     /** 拍摄前基线只需覆盖最新的若干张，不必整卡枚举。 */
     private static final int CAPTURE_BASELINE_ITEMS = 60;
+    /** 相机不回 PONG 时的保活周期：真实命令往返比 PING 重，放慢到 30s。 */
+    private static final long COMMAND_PROBE_INTERVAL_MS = 30000L;
+    /** 传输结束后的冷却期：相机可能仍在写卡，期间不做保活判定。 */
+    private static final long TRANSFER_COOLDOWN_MS = 10000L;
+    /** 最近一次传输结束时刻（含失败），用于心跳冷却。 */
+    private volatile long lastTransferFinishedAt;
     /** 完整扫描结果缓存：同一会话内翻页复用，避免每页重扫整卡。 */
     private volatile List<CameraStorage.Item> fullScanItems;
     private volatile long thumbnailGeneration;
@@ -146,8 +153,11 @@ public final class CameraSessionCoordinator {
             if (active == null || !active.supportsHeartbeat()) return;
             if (!(active instanceof PtpIpTransport)) return;
             final PtpIpTransport ptpIp = (PtpIpTransport) active;
-            // 拍摄/传输进行中：本 tick 跳过，避免保活探测与会话事务相互等待。
-            if (control != null) {
+            // 拍摄/传输进行中，以及刚传完的冷却期：本 tick 跳过，避免保活探测与会话事务相互等待
+            // （相机写完卡前响应变慢属正常，此时判活容易误报离线）。
+            if (control != null
+                    || System.currentTimeMillis() - lastTransferFinishedAt
+                            < TRANSFER_COOLDOWN_MS) {
                 startHeartbeat();
                 return;
             }
@@ -168,7 +178,10 @@ public final class CameraSessionCoordinator {
                         enterReconnecting();
                         return;
                     }
-                    startHeartbeat();
+                    // 相机不回 PONG 时走真实命令探测，代价高，周期放长。
+                    startHeartbeat(ptpIp.pingKeepAliveSupported()
+                            ? ReconnectPolicy.HEARTBEAT_INTERVAL_MS
+                            : COMMAND_PROBE_INTERVAL_MS);
                 });
             });
         }
@@ -571,12 +584,20 @@ public final class CameraSessionCoordinator {
      * 失败信息每批操作只弹一次，避免批量下载时反复打断。
      */
     private String exportToGalleryIfEnabled(File file) {
-        if (!exportToGallery) return "";
+        // 明确写出“没导出”的原因，避免与“导出失败”混淆（状态栏文字是唯一线索）。
+        if (!exportToGallery) return " · 未勾选「保存到系统相册」";
         try {
             galleryExporter.export(file, file.getName());
+            // 只留相册：导出成功后清掉私有目录副本，避免同一张照片占两份空间。
+            // 去重索引（.imported-index）按对象身份记录，不依赖副本存在，跳过重复下载的能力不受影响。
+            if (!file.delete()) {
+                return " · 已存入系统相册 " + GalleryExporter.RELATIVE_PATH + "（副本未能删除）";
+            }
             return " · 已存入系统相册 " + GalleryExporter.RELATIVE_PATH;
         } catch (Exception error) {
-            String reason = error.getMessage() == null ? "未知错误" : error.getMessage();
+            String reason = error.getMessage() == null
+                    ? error.getClass().getSimpleName()
+                    : error.getMessage();
             if (!exportFailureReported) {
                 exportFailureReported = true;
                 mainHandler.post(() -> listener.onError(
@@ -598,11 +619,18 @@ public final class CameraSessionCoordinator {
         releaseWifiLock();
         cameraWifiNetwork = null;
         sessionNetwork = null;
-        TransferControl current = control;
-        if (current != null) current.cancel("用户断开连接");
         final CameraTransport session = transport;
-        if (session != null) session.abortTransport();
+        TransferControl current = control;
+        if (current != null) {
+            current.cancel("用户断开连接");
+            // 传输中：必须立刻打断阻塞中的读写（此时也无法再优雅释放会话）。
+            if (session != null) session.abortTransport();
+        }
         executor.submit(() -> {
+            if (session != null) {
+                // 先让相机释放会话，再拆链路：否则相机侧旧会话会挡住下一次连接（InitFail）。
+                session.releaseSession();
+            }
             closeQuietly(session);
             connected = false;
             cameraName = "";
@@ -670,12 +698,12 @@ public final class CameraSessionCoordinator {
                             listener.onStatus(item.filename + " 已入库，跳过重复落盘。");
                             continue;
                         }
+                        String note = exportToGalleryIfEnabled(result.file);
                         listener.onStatus("已保存 " + result.file.getName()
                                 + " · " + result.bytes + " 字节 · "
-                                + result.elapsedMillis + " ms"
-                                + exportToGalleryIfEnabled(result.file));
+                                + result.elapsedMillis + " ms" + note);
                         mainHandler.post(() -> listener.onFileSaved(
-                                result.file, result.bytes, result.elapsedMillis));
+                                result.file, result.bytes, result.elapsedMillis, note));
                     }
                     return;
                 }
@@ -729,12 +757,12 @@ public final class CameraSessionCoordinator {
                         listener.onStatus(item.filename + " 已入库，跳过重复落盘。");
                         continue;
                     }
+                    String note = exportToGalleryIfEnabled(result.file);
                     listener.onStatus("已保存 " + result.file.getName()
                             + " · " + result.bytes + " 字节 · "
-                            + result.elapsedMillis + " ms"
-                            + exportToGalleryIfEnabled(result.file));
+                            + result.elapsedMillis + " ms" + note);
                     mainHandler.post(() -> listener.onFileSaved(
-                            result.file, result.bytes, result.elapsedMillis));
+                            result.file, result.bytes, result.elapsedMillis, note));
                 }
             } catch (InterruptedException interrupted) {
                 mainHandler.post(() -> listener.onStatus(interruptedMessage(current)));
@@ -744,6 +772,7 @@ public final class CameraSessionCoordinator {
             } finally {
                 activeResolver = null;
                 control = null;
+                lastTransferFinishedAt = System.currentTimeMillis();
                 // 快门可能已改变卡内对象，句柄缓存与完整扫描缓存都不能再用。
                 invalidateStorageCache();
             }
@@ -779,11 +808,12 @@ public final class CameraSessionCoordinator {
                         continue;
                     }
                     // 与拍摄路径一致：落盘成功后按用户开关导出到系统相册。
+                    String note = exportToGalleryIfEnabled(result.file);
                     listener.onStatus("已保存 " + result.file.getName()
                             + " · " + result.bytes + " 字节 · " + result.elapsedMillis + " ms"
-                            + exportToGalleryIfEnabled(result.file));
+                            + note);
                     mainHandler.post(() -> listener.onFileSaved(
-                            result.file, result.bytes, result.elapsedMillis));
+                            result.file, result.bytes, result.elapsedMillis, note));
                 }
             } catch (InterruptedException interrupted) {
                 mainHandler.post(() -> listener.onStatus(interruptedMessage(current)));
@@ -792,6 +822,7 @@ public final class CameraSessionCoordinator {
                         error.getMessage() != null ? error.getMessage() : "下载失败", error));
             } finally {
                 control = null;
+                lastTransferFinishedAt = System.currentTimeMillis();
             }
         });
     }
@@ -832,8 +863,12 @@ public final class CameraSessionCoordinator {
     // ── 心跳与自动重连 ──
 
     private void startHeartbeat() {
+        startHeartbeat(ReconnectPolicy.HEARTBEAT_INTERVAL_MS);
+    }
+
+    private void startHeartbeat(long intervalMillis) {
         mainHandler.removeCallbacks(heartbeatRunnable);
-        mainHandler.postDelayed(heartbeatRunnable, ReconnectPolicy.HEARTBEAT_INTERVAL_MS);
+        mainHandler.postDelayed(heartbeatRunnable, intervalMillis);
     }
 
     /** 连续 3 次心跳无响应 / 绑定网络丢失 → 判离线，进入重连态。 */

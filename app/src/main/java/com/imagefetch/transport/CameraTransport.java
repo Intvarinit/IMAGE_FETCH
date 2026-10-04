@@ -81,5 +81,13 @@ public interface CameraTransport extends Closeable {
         // 默认无操作：没有需要打断的阻塞 IO 的实现可以忽略。
     }
 
+    /**
+     * 尽力让相机释放当前会话（PTP/IP 发送 CloseSession；USB/PTP 无需）。
+     * 不释放时相机会一直持有旧会话，下一次连接握手会被直接拒绝（InitFail），
+     * 表现为「第一次能连、之后每次都失败」。只作尽力而为的收尾，不抛异常。
+     */
+    default void releaseSession() {
+    }
+
     void setObjectEventListener(ObjectEventListener listener);
 }

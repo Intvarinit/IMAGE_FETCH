@@ -1,8 +1,10 @@
 package com.imagefetch.storage;
 
+import android.Manifest;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -41,6 +43,12 @@ public final class GalleryExporter {
         if (source == null || !source.isFile() || source.length() == 0) {
             throw new IOException("待导出的文件不存在或为空。");
         }
+        // Android 9 及以下写外置存储需要权限；先判权限，避免把权限问题误报成写入失败。
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                && context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        != PackageManager.PERMISSION_GRANTED) {
+            throw new IOException("系统未授予存储权限，无法写入相册（Android 9 及以下需要该权限）。");
+        }
         ContentResolver resolver = context.getContentResolver();
         ContentValues values = new ContentValues();
         values.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
@@ -69,7 +77,10 @@ public final class GalleryExporter {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ContentValues publish = new ContentValues();
                 publish.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                resolver.update(target, publish, null, null);
+                // 发布失败会让条目光停在 pending 状态：肉眼能看到文件，图库却查不到。
+                if (resolver.update(target, publish, null, null) <= 0) {
+                    throw new IOException("相册条目未能发布（仍处于 pending 状态）。");
+                }
             }
         } catch (Exception error) {
             // 失败不得留下半成品条目。
