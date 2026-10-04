@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- PTP/IP 是原始 TCP，不经过该策略；保持默认禁止明文 HTTP 即可。 -->
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

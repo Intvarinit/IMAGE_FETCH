@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">IMAGE_FETCH</string>
+    <string name="host_label">相机地址（Wi&#8209;Fi AP 或局域网 IP）</string>
+    <string name="host_hint">192.168.1.1</string>
+    <string name="port_label">端口</string>
+    <string name="connect">连接</string>
+    <string name="connect_usb">连接 USB</string>
+    <string name="disconnect">断开</string>
+    <string name="capture_and_fetch">拍摄并取回</string>
+    <string name="refresh_storage">刷新存储卡</string>
+    <string name="download_selected">下载所选</string>
+    <string name="status_idle">未连接</string>
+    <string name="export_to_gallery">保存到系统相册</string>
+    <string name="previous_page">上一页</string>
+    <string name="next_page">下一页</string>
+    <string name="full_scan">完整扫描</string>
+    <string name="page_info">第 1 / 1 页</string>
+    <string name="selected_mark">✓</string>
+    <string name="selected_count">长按图片可选中 · 已选 0 张</string>
+    <string name="output_dir_label">应用内副本</string>
+    <string name="album_dir_label">系统相册</string>
+    <string name="album_dir_disabled">已关闭（只保留应用内副本）</string>
+    <string name="page_size_label">每页</string>
+    <string name="close">关闭</string>
+    <string name="preview_toggle_select">选中此图</string>
+    <string name="preview_toggle_unselect">取消选中</string>
+    <string name="preview_loading">正在读取原图…</string>
+    <string name="preview_thumbnail_only">（无原图可读，当前为缩略图）</string>
+</resources>
