@@ -54,17 +54,49 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int PACKET_PROBE_RESPONSE = 14;
 
     private static final int RESPONSE_OK = 0x2001;
+    /** 相机侧已存在会话（我们固定用 sessionID=1）：视为可复用的同一会话，而非致命错误。 */
+    private static final int RESPONSE_SESSION_ALREADY_OPEN = 0x201e;
+    /** 本工程固定使用的 PTP 会话号（与 USB 侧一致）。 */
+    private static final long SESSION_ID = 1L;
 
     private static final int OPERATION_GET_DEVICE_INFO = 0x1001;
     private static final int OPERATION_OPEN_SESSION = 0x1002;
-    private static final int OPERATION_CLOSE_SESSION = 0x1003;
     private static final int OPERATION_GET_STORAGE_IDS = 0x1004;
     private static final int OPERATION_GET_STORAGE_INFO = 0x1005;
     private static final int OPERATION_GET_OBJECT_HANDLES = 0x1007;
     private static final int OPERATION_GET_OBJECT_INFO = 0x1008;
     private static final int OPERATION_GET_OBJECT = 0x1009;
     private static final int OPERATION_GET_THUMB = 0x100a;
+    /** 标准 PTP 快门（ISO 15740）。EOS 机型普遍不支持，回 0x2005。 */
     private static final int OPERATION_CAPTURE = 0x100e;
+    /**
+     * Canon EOS 厂商遥控快门（opcode 见 libgphoto2 camlibs/ptp2/ptp.h，并经其调试日志复核）：
+     * 0x9114 SetRemoteMode → 0x9115 SetEventMode → 0x9128 RemoteReleaseOn
+     * → 0x9129 RemoteReleaseOff。EOS 只接受这条路径，标准 0x100E 会回 0x2005。
+     *
+     * <p>注意 0x9116 是 EOS_GetEvent（回事件数据块）而非快门：曾误用它，结果每次
+     * 都「回 0x2001 但相机毫无反应」——那只是把待读事件取走了。
+     */
+    private static final int CANON_SET_REMOTE_MODE = 0x9114;
+    private static final int CANON_SET_EVENT_MODE = 0x9115;
+    private static final int CANON_REMOTE_RELEASE_ON = 0x9128;
+    private static final int CANON_REMOTE_RELEASE_OFF = 0x9129;
+    /** 操作不被支持：0x100E 在 EOS 上的典型应答，也是此处区分报错文案的依据。 */
+    private static final int RESPONSE_OPERATION_NOT_SUPPORTED = 0x2005;
+    /** 参数不被支持：厂商快门参数形态不一致时的典型应答，用于决定是否换参数重试。 */
+    private static final int RESPONSE_PARAMETER_NOT_SUPPORTED = 0x2006;
+    /** Canon 半按编码：实测相机在此步测光/对焦，但不会释放快门。 */
+    private static final long[] HALF_PRESS = {1, 0};
+    /**
+     * 半按到全按之间留给测光/对焦的时间。不能太短：间隔不足会在合焦前就按下，
+     * 表现为「相机亮过对焦灯但没拍照」。
+     */
+    private static final long CANON_RELEASE_HOLD_MS = 1000L;
+    /** Canon 全按编码。libgphoto2 调试日志中全按即 {@code remotereleaseon(params, 2, 0)}。 */
+    private static final long[] FULL_PRESS = {2, 0};
+    /** 全按后判定「是否真的拍到」的探测窗口与间隔。 */
+    private static final long CANON_SHOT_VERIFY_MS = 5000L;
+    private static final long CANON_SHOT_VERIFY_INTERVAL_MS = 500L;
 
     /** 标准 PTP ObjectAdded 事件；厂商等价事件（如 Canon EOS）TBC-awaiting-hardware。 */
     private static final int EVENT_OBJECT_ADDED = 0x4002;
@@ -76,6 +108,14 @@ public final class PtpIpTransport implements CameraTransport {
     /** 保活参数：单次 PING 探测超时 3s；命令复核超时 3s。 */
     public static final int PROBE_TIMEOUT_MS = 3000;
     private static final int VERIFY_TIMEOUT_MS = 3000;
+
+    /**
+     * 握手重试：覆盖 InitFail（相机仍持有旧会话）与 ECONNREFUSED（相机 PTP 服务刚随上一个
+     * 连接结束而重启，需几秒才重新监听 15740）。按 3s / 5s / 8s 退避共试 4 次，
+     * 给相机约 16s 的恢复窗口。
+     */
+    private static final long[] CONNECT_RETRY_DELAYS_MS = {3000L, 5000L, 8000L};
+    private static final int CONNECT_ATTEMPTS = CONNECT_RETRY_DELAYS_MS.length + 1;
 
     /** 已连 PTP/IP 相机的厂商分类（detectVendor 结果，断连清零）。 */
     public enum CameraVendor {
@@ -89,9 +129,18 @@ public final class PtpIpTransport implements CameraTransport {
     private volatile Socket eventSocket;
     private volatile Socket connectingCommandSocket;
     private volatile Socket connectingEventSocket;
+    /** 最近一次成功建链用的本机出口地址:端口（真机排查「走的哪个网卡」靠它）。 */
+    private volatile String lastLocalEndpoint = "未建立";
+    /** 最近一次建链的网络选择结果（绑定相机 Wi‑Fi / 回退默认路由）。 */
+    private volatile String lastNetworkBinding = "未建立";
+    /** 最近一次 connect() 的逐次尝试记录，供报错弹窗直接展示。 */
+    private final List<String> connectDiagnostics =
+            Collections.synchronizedList(new ArrayList<>());
     // 默认走系统路由；协调器在相机 Wi‑Fi 非默认网络时注入
     // Network.getSocketFactory()，把 PTP/IP socket 绑定到相机所在 Wi‑Fi。
     private volatile SocketFactory socketFactory = SocketFactory.getDefault();
+    /** 是否正在按相机 Wi‑Fi 绑定 socket（决定连接失败时能否回退默认路由）。 */
+    private volatile boolean bindToCameraNetwork;
     private final Object transportLock = new Object();
     private long transportGeneration;
     private InputStream commandInput;
@@ -110,11 +159,21 @@ public final class PtpIpTransport implements CameraTransport {
     private int transactionId = 1;
     private String cameraName = "PTP/IP Camera";
     private CameraVendor vendor = CameraVendor.UNKNOWN;
+    /** Canon 遥控/事件模式是否已在本会话设置过（每次重连复位）。 */
+    private boolean canonRemoteModeReady;
+    /** 最近一次 capture() 的厂商快门逐步诊断（每步响应码与应答载荷）。 */
+    private final StringBuilder captureSteps = new StringBuilder();
     private volatile ObjectEventListener objectEventListener;
     /** 存储卡文件句柄缓存（存储卷 → 句柄）：快速分页翻页时不必重新遍历目录。 */
     private final Map<Long, List<Long>> handleCache =
             Collections.synchronizedMap(new LinkedHashMap<>());
     private final String initiatorName;
+    /**
+     * 发起方 GUID（InitCommandRequest 的 16 字节）：持久化后每次握手复用同一身份，
+     * 相机有机会把重连识别为「同一设备」而非新设备，从而允许替换旧连接。
+     * 为 null 时退回每次随机（原行为）。
+     */
+    private volatile byte[] initiatorGuid;
 
     public PtpIpTransport() {
         this("IMAGE_FETCH Android");
@@ -124,8 +183,23 @@ public final class PtpIpTransport implements CameraTransport {
         this.initiatorName = initiatorName;
     }
 
+    /** 注入持久化的发起方 GUID（长度必须为 16；传 null 恢复每次随机）。 */
+    public void setInitiatorGuid(byte[] guid) {
+        initiatorGuid = (guid != null && guid.length == 16) ? guid.clone() : null;
+    }
+
+    /** 当前握手用的 GUID 十六进制串（诊断用）。 */
+    public String initiatorGuidHex() {
+        byte[] guid = initiatorGuid;
+        if (guid == null) return "每次随机（未持久化）";
+        StringBuilder text = new StringBuilder(32);
+        for (byte b : guid) text.append(String.format(Locale.ROOT, "%02X", b));
+        return text.toString();
+    }
+
     /** 注入 socket 工厂（传 null 恢复默认路由）；须在 connect() 前调用。 */
     public synchronized void setSocketFactory(SocketFactory factory) {
+        bindToCameraNetwork = factory != null;
         socketFactory = factory != null ? factory : SocketFactory.getDefault();
     }
 
@@ -140,17 +214,116 @@ public final class PtpIpTransport implements CameraTransport {
         if (host == null || host.trim().isEmpty() || port < 1 || port > 65535) {
             throw new IOException("Wi‑Fi 相机地址或端口无效");
         }
+        String target = host.trim();
+        connectDiagnostics.clear();
+        lastLocalEndpoint = "未建立";
+        lastNetworkBinding = bindToCameraNetwork ? "相机 Wi‑Fi（待绑定）" : "系统默认路由（未绑定）";
+        Exception lastFailure = null;
+        for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+            long startedAt = System.currentTimeMillis();
+            try {
+                String name = connectOnce(target, port);
+                connectDiagnostics.add(String.format(
+                        Locale.ROOT,
+                        "第 %d/%d 次握手成功（%d ms），本机出口 %s",
+                        attempt,
+                        CONNECT_ATTEMPTS,
+                        System.currentTimeMillis() - startedAt,
+                        lastLocalEndpoint));
+                return name;
+            } catch (InitRejectedException rejection) {
+                // 相机侧仍持有旧会话：稍等后重新握手即可，用户不必去重开相机 Wi‑Fi。
+                lastFailure = rejection;
+                recordConnectFailure(attempt, startedAt, rejection, true);
+            } catch (Exception refused) {
+                // ECONNREFUSED：网络可达但 15740 无人监听——相机的 PTP 服务很可能刚随
+                // 上一个连接结束而重启，给它几秒。其它失败（EHOSTUNREACH 等）不重试。
+                if (!isConnectionRefused(refused)) {
+                    recordConnectFailure(attempt, startedAt, refused, false);
+                    throw refused;
+                }
+                lastFailure = refused;
+                recordConnectFailure(attempt, startedAt, refused, true);
+            }
+            if (attempt == CONNECT_ATTEMPTS) break;
+            sleepQuietly(CONNECT_RETRY_DELAYS_MS[attempt - 1]);
+        }
+        if (lastFailure instanceof InitRejectedException) {
+            throw new IOException(
+                    "相机拒绝了新连接（InitFail）：相机侧仍持有上一次的会话（已重试 "
+                            + CONNECT_ATTEMPTS + " 次）。请在相机上关闭再打开 Wi‑Fi 立即释放。",
+                    lastFailure);
+        }
+        throw lastFailure;
+    }
+
+    /** ECONNREFUSED：目标可达但端口无监听（与 EHOSTUNREACH「主机不可达」相反）。 */
+    private static boolean isConnectionRefused(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            String message = cause.getMessage();
+            if (message == null) continue;
+            if (message.contains("ECONNREFUSED") || message.contains("Connection refused")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void recordConnectFailure(
+            int attempt, long startedAt, Throwable error, boolean willRetry) {
+        connectDiagnostics.add(String.format(
+                Locale.ROOT,
+                "第 %d/%d 次握手失败（%d ms，%s）：%s",
+                attempt,
+                CONNECT_ATTEMPTS,
+                System.currentTimeMillis() - startedAt,
+                willRetry ? "将重试" : "不重试",
+                describe(error)));
+    }
+
+    /** 展开异常链：根因（ECONNABORTED / EPERM / ECONNREFUSED）常被包在内层，报错时要看得到。 */
+    private static String describe(Throwable error) {
+        StringBuilder text = new StringBuilder();
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (text.length() > 0) text.append(" ← ");
+            text.append(cause.getClass().getSimpleName())
+                    .append(": ")
+                    .append(cause.getMessage());
+        }
+        return text.toString();
+    }
+
+    /** 最近一次连接尝试的完整诊断（网络选择 + 本机出口 + 逐次失败的异常链）。 */
+    public String connectDiagnostics() {
+        StringBuilder text = new StringBuilder();
+        text.append("网络选择：").append(lastNetworkBinding);
+        text.append("\n本机出口：").append(lastLocalEndpoint);
+        text.append("\n发起方 GUID：").append(initiatorGuidHex());
+        List<String> lines;
+        synchronized (connectDiagnostics) {
+            lines = new ArrayList<>(connectDiagnostics);
+        }
+        for (String line : lines) text.append('\n').append(line);
+        return text.toString();
+    }
+
+    /** 单次 PTP/IP 握手 + OpenSession；InitFail 交给 connect() 决定是否重试。 */
+    private String connectOnce(String host, int port) throws Exception {
         final long generation = beginTransportAttempt();
         try {
-            Socket pendingCommandSocket = open(host.trim(), port, generation, true);
+            Socket pendingCommandSocket = open(host, port, generation, true);
             InputStream pendingCommandInput = new BufferedInputStream(
                     pendingCommandSocket.getInputStream());
             OutputStream pendingCommandOutput = new BufferedOutputStream(
                     pendingCommandSocket.getOutputStream());
 
             ByteWriter initialization = new ByteWriter();
-            byte[] guid = new byte[16];
-            new SecureRandom().nextBytes(guid);
+            byte[] guid = initiatorGuid;
+            if (guid == null) {
+                // 未持久化时退回每次随机（旧行为）。
+                guid = new byte[16];
+                new SecureRandom().nextBytes(guid);
+            }
             initialization.bytes(guid);
             initialization.utf16(initiatorName);
             initialization.u32(0x00010000L);
@@ -162,10 +335,7 @@ public final class PtpIpTransport implements CameraTransport {
             Packet commandAck = readPacket(pendingCommandInput);
             ensureTransportGeneration(generation);
             if (commandAck.type == PACKET_INIT_FAIL) {
-                throw new IOException(
-                        "相机拒绝了新连接（InitFail）：相机侧仍持有上一次的会话。"
-                                + "等待约 30 秒让相机会话超时后重试，"
-                                + "或在相机上关闭再打开 Wi‑Fi 立即释放。");
+                throw new InitRejectedException("相机拒绝了新连接（InitFail）");
             }
             if (commandAck.type != PACKET_INIT_COMMAND_ACK || commandAck.data.length < 28) {
                 throw new IOException(
@@ -175,7 +345,7 @@ public final class PtpIpTransport implements CameraTransport {
             String announcedName = utf16(commandAck.data, 28);
             if (!announcedName.isEmpty()) cameraName = announcedName;
 
-            Socket pendingEventSocket = open(host.trim(), port, generation, false);
+            Socket pendingEventSocket = open(host, port, generation, false);
             InputStream pendingEventInput = new BufferedInputStream(
                     pendingEventSocket.getInputStream());
             OutputStream pendingEventOutput = new BufferedOutputStream(
@@ -215,8 +385,12 @@ public final class PtpIpTransport implements CameraTransport {
                     pendingEventOutput,
                     generation);
 
-            int response = command(OPERATION_OPEN_SESSION, 0, new long[]{1});
-            if (response != RESPONSE_OK) throw rejected(response);
+            int response = command(OPERATION_OPEN_SESSION, 0, new long[]{SESSION_ID});
+            // 相机侧只维持一个会话：我们固定用 sessionID=1，若它仍持有我们上次的会话，
+            // 视为成功直接复用（与 USB 侧一致），而不是报错逼用户重开相机 Wi‑Fi。
+            if (response != RESPONSE_OK && response != RESPONSE_SESSION_ALREADY_OPEN) {
+                throw rejected(response);
+            }
             ensureTransportGeneration(generation);
             transactionId = 1;
             return cameraName;
@@ -231,55 +405,205 @@ public final class PtpIpTransport implements CameraTransport {
         return true;
     }
 
-    /**
-     * 尽力发送 CloseSession(0x1003)，让相机立即释放本次会话。
-     * 不做这件事的直接后果：相机会一直持有旧会话，下一次 InitCommandRequest 直接被
-     * 回 InitFail(type 5)，表现为「第一次能连、之后每次连接都失败」。
-     * 只做一次短超时尝试，失败即放弃——socket 随后会被关闭，相机将按自己的超时回收。
-     */
     @Override
-    public synchronized void releaseSession() {
-        Socket socket = commandSocket;
-        InputStream input = commandInput;
-        OutputStream output = commandOutput;
-        if (socket == null || input == null || output == null || socket.isClosed()) return;
-        synchronized (probeMonitor) {
-            // 命令通道已判死（或已中止）时不再尝试，避免把断链状态误当会话问题。
-            if (commandChannelFailure != null) return;
+    public synchronized long[] capture() throws Exception {
+        ensureConnected();
+        synchronized (captureSteps) {
+            captureSteps.setLength(0);
         }
-        int previousTimeout = -1;
-        try {
-            previousTimeout = socket.getSoTimeout();
-            socket.setSoTimeout(1200);
-            ByteWriter request = new ByteWriter();
-            request.u32(1);
-            request.u16(OPERATION_CLOSE_SESSION);
-            request.u32(transactionId++);
-            writePacket(output, PACKET_COMMAND_REQUEST, request.data());
-            readPacket(input); // 应答码不作为成败依据：会话本就即将关闭。
-        } catch (Exception ignored) {
-        } finally {
+        // 厂商识别此前只在测试里调用，从未接入实连路径：不识别就无法决定走标准快门
+        // 还是厂商遥控快门。先用握手名称零成本判断，判不出来才发 GetDeviceInfo（多一次往返）。
+        if (vendor == CameraVendor.UNKNOWN) {
+            vendor = vendorForName(cameraName);
+        }
+        if (vendor == CameraVendor.UNKNOWN) {
             try {
-                socket.setSoTimeout(previousTimeout);
+                detectVendor();
             } catch (Exception ignored) {
+                // 识别失败按标准路径尝试，实际响应码会出现在最终报错里。
             }
+        }
+        String vendorFailure = "";
+        if (vendor == CameraVendor.CANON) {
+            try {
+                canonRemoteRelease();
+                // 原图写入机身存储卡，交由 NewPhotoResolver 通过句柄差集发现。
+                return new long[0];
+            } catch (Exception vendorError) {
+                vendorFailure = "Canon 遥控快门（0x9114/0x9115/0x9128）失败："
+                        + describe(vendorError);
+            }
+        }
+        int response = command(OPERATION_CAPTURE, transactionId++, new long[]{0, 0});
+        recordCaptureStep("0x100E InitiateCapture(0,0) → " + hexCode(response));
+        if (response == RESPONSE_OK) {
+            return new long[0];
+        }
+        String standard = String.format(
+                Locale.ROOT, "标准 Capture(0x100E) 返回 0x%04X", response);
+        if (response == RESPONSE_OPERATION_NOT_SUPPORTED) {
+            throw new IOException(
+                    "相机不支持标准快门 InitiateCapture(0x100E)。"
+                            + (vendorFailure.isEmpty() ? "" : vendorFailure + "；")
+                            + standard
+                            + "。EOS 机型只接受厂商遥控快门；请确认相机在拍照模式"
+                            + "（非回放/录像）、未在写卡，且镜头为 AF 或 MF 均可。"
+                            + captureStepsSuffix(),
+                    rejected(response));
+        }
+        if (vendorFailure.isEmpty()) {
+            throw new IOException(
+                    "相机拒绝了快门操作。" + standard + captureStepsSuffix(),
+                    rejected(response));
+        }
+        throw new IOException(
+                vendorFailure + "；" + standard + captureStepsSuffix(), rejected(response));
+    }
+
+    /** 把本轮快门各步的响应码拼到错误/超时文案后面，便于判断是谁没成。 */
+    private String captureStepsSuffix() {
+        String steps = captureDiagnostics();
+        return steps.isEmpty() ? "" : "\n快门诊断：\n" + steps;
+    }
+
+    /**
+     * Canon EOS 遥控快门：进入遥控/事件模式后按下-释放快门。
+     * 遥控模式每个会话只需设置一次；这些命令失败也继续尝试释放（部分机型连上即遥控态）。
+     */
+    private void canonRemoteRelease() throws Exception {
+        if (!canonRemoteModeReady) {
+            // 这两步的响应码不能忽略：若遥控模式没设置成功，后面的释放命令即使回 OK
+            // 相机也不会真的拍。以前丢掉了返回值，导致「回 OK 但没拍照」无从判断。
+            int remoteMode = command(CANON_SET_REMOTE_MODE, transactionId++, new long[]{1});
+            recordCaptureStep("0x9114 SetRemoteMode(1) → " + hexCode(remoteMode));
+            int eventMode = command(CANON_SET_EVENT_MODE, transactionId++, new long[]{1});
+            recordCaptureStep("0x9115 SetEventMode(1) → " + hexCode(eventMode));
+            canonRemoteModeReady = true;
+        }
+        // 半按：实测相机在此步会测光/对焦（屏幕里对焦成功）但不拍，因此后面必须补全按。
+        ReleaseResult half = releaseCommand(CANON_REMOTE_RELEASE_ON, HALF_PRESS);
+        recordCaptureStep(stepText("0x9128 RemoteReleaseOn(1,0) 半按", half));
+        if (half.code != RESPONSE_OK) throw rejected(half.code);
+        sleepQuietly(CANON_RELEASE_HOLD_MS);
+
+        // 全按：只发一次 libgphoto2 实证过的 (2, 0)。
+        long baseline = probeMaxObjectHandle();
+        ReleaseResult press = releaseCommand(CANON_REMOTE_RELEASE_ON, FULL_PRESS);
+        recordCaptureStep(stepText("0x9128 RemoteReleaseOn(2,0) 全按", press));
+        // 全按后必须立刻松开：0x9128 等价于「按住快门不放」，机身驱动模式是连拍时，
+        // 按住多久就一直拍多久——原先要等 waitForNewObject 探到对象才松手，慢速连拍下
+        // 一次点击会拍出好几张。现在先松手，再等对象出现（等待不影响已拍张数）。
+        try {
+            ReleaseResult released = releaseCommand(CANON_REMOTE_RELEASE_OFF, FULL_PRESS);
+            recordCaptureStep(stepText("0x9129 RemoteReleaseOff(2,0)", released));
+        } catch (Exception ignored) {
+            // 释放失败不影响本次已触发的拍摄；下次拍摄会重新按下-释放。
+        }
+        if (press.code != RESPONSE_OK) {
+            throw new IOException(
+                    "相机拒绝了 Canon 遥控快门 0x9128 RemoteReleaseOn(2,0)。"
+                            + captureStepsSuffix(),
+                    rejected(press.code));
+        }
+        if (baseline >= 0 && waitForNewObject(baseline)) {
+            recordCaptureStep("已确认产生新对象");
+        }
+    }
+
+    /**
+     * 轮询存储卡句柄最大值，判断这次全按是否真的产生了新对象。
+     * 这是「相机回了 OK 但没拍」唯一能自证的办法。
+     */
+    private boolean waitForNewObject(long baselineHandle) {
+        long deadline = System.currentTimeMillis() + CANON_SHOT_VERIFY_MS;
+        while (System.currentTimeMillis() < deadline) {
+            sleepQuietly(CANON_SHOT_VERIFY_INTERVAL_MS);
+            long current = probeMaxObjectHandle();
+            if (current > baselineHandle) return true;
+        }
+        return false;
+    }
+
+    /** 存储卡上最大的对象句柄；探测失败返回 -1（不抛，避免掩盖真正的快门问题）。 */
+    private long probeMaxObjectHandle() {
+        try {
+            // 拍摄会新增对象，必须让分页句柄缓存失效后再枚举，否则看不到新句柄。
+            invalidateStorageCache();
+            StorageBrowser.loadPage(this::invokeOperation, 1, 0, handleCache);
+            long max = 0;
+            synchronized (handleCache) {
+                for (List<Long> handles : handleCache.values()) {
+                    for (Long handle : handles) {
+                        if (handle != null && handle > max) max = handle;
+                    }
+                }
+            }
+            return max;
+        } catch (Exception error) {
+            recordCaptureStep("句柄探测失败（不影响发快门）：" + describe(error));
+            return -1;
+        }
+    }
+
+    /**
+     * 发送快门命令并返回响应码与应答载荷。
+     * 0x9128/0x9129 通常只回纯响应包，但个别固件会带回数据阶段；直接用 {@code command()}
+     * 会因固定按纯响应包偏移解析而误报「无效响应」。
+     * 这里复用 {@code commandWithData()}：有数据段就正常收完，
+     * 只回纯响应时它抛出的响应码正好就是我们要的返回值。
+     */
+    private ReleaseResult releaseCommand(int operation, long[] parameters) throws Exception {
+        try {
+            return new ReleaseResult(
+                    RESPONSE_OK, commandWithData(operation, transactionId++, parameters));
+        } catch (PtpResponseException rejection) {
+            return new ReleaseResult(rejection.responseCode, new byte[0]);
+        }
+    }
+
+    /** 一次厂商快门命令的结果：响应码 + 应答载荷（载荷可能带新对象信息）。 */
+    private static final class ReleaseResult {
+        final int code;
+        final byte[] payload;
+
+        ReleaseResult(int code, byte[] payload) {
+            this.code = code;
+            this.payload = payload;
         }
     }
 
     @Override
-    public synchronized long[] capture() throws Exception {
-        ensureConnected();
-        int response = command(OPERATION_CAPTURE, transactionId++, new long[]{0, 0});
-        if (response != RESPONSE_OK) {
-            if (vendor == CameraVendor.CANON) {
-                throw new IOException(
-                        "相机拒绝了标准 Capture(0x100E)；Canon EOS 厂商快门扩展尚未实现"
-                                + "（TBC-awaiting-hardware）。");
-            }
-            throw rejected(response);
+    public String captureDiagnostics() {
+        synchronized (captureSteps) {
+            return captureSteps.toString();
         }
-        // 原图写入机身存储卡，交由 NewPhotoResolver 通过句柄差集发现。
-        return new long[0];
+    }
+
+    /** 记录一步厂商快门诊断（同一轮 capture 内累积，供「拍摄超时」时展示）。 */
+    private void recordCaptureStep(String text) {
+        synchronized (captureSteps) {
+            if (captureSteps.length() > 0) captureSteps.append('\n');
+            captureSteps.append(text);
+        }
+    }
+
+    private static String stepText(String label, ReleaseResult result) {
+        return label + " → " + hexCode(result.code) + payloadSummary(result.payload);
+    }
+
+    private static String hexCode(int code) {
+        return String.format(Locale.ROOT, "0x%04X", code);
+    }
+
+    /** 应答载荷摘要：EOS 快门应答里可能带新对象信息，先记前 16 字节供定位。 */
+    private static String payloadSummary(byte[] payload) {
+        if (payload == null || payload.length == 0) return "（无数据段）";
+        StringBuilder text = new StringBuilder("，数据 ")
+                .append(payload.length).append("B：");
+        for (int index = 0; index < Math.min(payload.length, 16); index++) {
+            text.append(String.format(Locale.ROOT, "%02X ", payload[index]));
+        }
+        return text.toString();
     }
 
     /**
@@ -594,7 +918,9 @@ public final class PtpIpTransport implements CameraTransport {
     private static CameraVendor vendorForName(String name) {
         String text = name.toLowerCase(Locale.ROOT);
         if (text.contains("nikon")) return CameraVendor.NIKON;
-        if (text.contains("canon")) return CameraVendor.CANON;
+        // EOS 机型的握手名称通常是「EOS RP」这类，不含 "canon"；此时也要判为 Canon，
+        // 否则会去走它并不支持的标准快门 0x100E。
+        if (text.contains("canon") || text.contains("eos")) return CameraVendor.CANON;
         if (text.contains("sony") || text.contains("ilce") || text.contains("alpha")) {
             return CameraVendor.SONY;
         }
@@ -917,32 +1243,82 @@ public final class PtpIpTransport implements CameraTransport {
             int port,
             long generation,
             boolean commandChannel) throws IOException {
-        Socket socket = socketFactory.createSocket();
-        synchronized (transportLock) {
-            ensureTransportGenerationLocked(generation);
-            if (commandChannel) connectingCommandSocket = socket;
-            else connectingEventSocket = socket;
-        }
-        try {
-            // 相机刚从 Wi‑Fi 休眠中醒来时 TCP 握手可能明显变慢，超时放宽到 15s。
-            socket.connect(new InetSocketAddress(host, port), 15000);
-            ensureTransportGeneration(generation);
-            socket.setSoTimeout(12000);
-            socket.setTcpNoDelay(true);
-            socket.setKeepAlive(true);
-            ensureTransportGeneration(generation);
-            return socket;
-        } catch (IOException error) {
-            synchronized (transportLock) {
-                if (commandChannel && connectingCommandSocket == socket) {
-                    connectingCommandSocket = null;
-                } else if (!commandChannel && connectingEventSocket == socket) {
-                    connectingEventSocket = null;
+        InetSocketAddress endpoint = new InetSocketAddress(host, port);
+        // 绑定相机 Wi‑Fi 失败时允许回退一次默认路由（见下方 isNetworkBindFailure）。
+        boolean allowFallback = bindToCameraNetwork;
+        SocketFactory factory = socketFactory;
+        while (true) {
+            Socket socket = null;
+            try {
+                socket = factory.createSocket();
+                synchronized (transportLock) {
+                    ensureTransportGenerationLocked(generation);
+                    if (commandChannel) connectingCommandSocket = socket;
+                    else connectingEventSocket = socket;
                 }
+                // 相机刚从 Wi‑Fi 休眠中醒来时 TCP 握手可能明显变慢，超时放宽到 15s。
+                socket.connect(endpoint, 15000);
+                ensureTransportGeneration(generation);
+                socket.setSoTimeout(12000);
+                socket.setTcpNoDelay(true);
+                socket.setKeepAlive(true);
+                ensureTransportGeneration(generation);
+                // 记下真实出口：真机排查「走的是相机 Wi‑Fi 还是默认路由」全靠这两个字段。
+                lastLocalEndpoint = String.valueOf(socket.getLocalSocketAddress());
+                lastNetworkBinding = !bindToCameraNetwork
+                        ? "系统默认路由（未绑定相机 Wi‑Fi）"
+                        : (allowFallback
+                                ? "相机 Wi‑Fi（已绑定）"
+                                : "相机 Wi‑Fi（绑定被拒，已回退默认路由）");
+                return socket;
+            } catch (Exception failure) {
+                if (socket != null) {
+                    forgetConnectingSocket(socket, commandChannel);
+                    closeQuietly(socket);
+                }
+                // 绑定相机 Wi‑Fi 被系统拒绝（Android 10+ 对非自有网络抛 EPERM，消息形如
+                // 「Binding socket to network N failed: EPERM (Operation not permitted)」）。
+                // 绑定可能发生在 createSocket() 或 connect() 内部，且异常不一定包装成
+                // IOException，因此这里统一按消息判定；命中就回退默认路由再试一次：
+                // 手机连着相机 Wi‑Fi 时 192.168.1.0/24 本就走该接口。其它失败原样抛出。
+                if (!allowFallback || !isNetworkBindFailure(failure)) {
+                    throw failure instanceof IOException
+                            ? (IOException) failure
+                            : new IOException(String.valueOf(failure.getMessage()), failure);
+                }
+                allowFallback = false;
+                factory = SocketFactory.getDefault();
             }
-            closeQuietly(socket);
-            throw error;
         }
+    }
+
+    /** 连接失败后解除「连接中 socket」登记，避免 abortTransport 去关一个已废弃的 socket。 */
+    private void forgetConnectingSocket(Socket socket, boolean commandChannel) {
+        synchronized (transportLock) {
+            if (commandChannel && connectingCommandSocket == socket) {
+                connectingCommandSocket = null;
+            } else if (!commandChannel && connectingEventSocket == socket) {
+                connectingEventSocket = null;
+            }
+        }
+    }
+
+    /**
+     * 是否是「绑定到相机 Wi‑Fi」被系统拒绝（Android 10+ 对应用不拥有的网络抛 EPERM）。
+     * 该错误在 socket.connect() 内部抛出，消息形如
+     * 「Binding socket to network 2843 failed: EPERM (Operation not permitted)」。
+     */
+    private static boolean isNetworkBindFailure(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            String message = cause.getMessage();
+            if (message == null) continue;
+            if (message.contains("Binding socket to network")
+                    || message.contains("EPERM")
+                    || message.contains("Operation not permitted")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void writeCommandPacket(int type, byte[] payload) throws IOException {
@@ -1095,6 +1471,9 @@ public final class PtpIpTransport implements CameraTransport {
     public synchronized void close() {
         Thread reader = eventReaderThread;
         eventReaderThread = null;
+        // 不主动发 CloseSession：实测那样做会让相机随后关掉自己的 PTP/IP 监听
+        // （下一次连接直接 ECONNREFUSED），且与「相机侧只保留一次会话、手机侧多次连接」
+        // 的目标相反。改为保留相机会话，重连时由 OpenSession 的 SessionAlreadyOpen 复用。
         abortTransport();
         if (reader != null && reader != Thread.currentThread()) reader.interrupt();
         commandInput = null;
@@ -1109,6 +1488,7 @@ public final class PtpIpTransport implements CameraTransport {
         transactionId = 1;
         cameraName = "PTP/IP Camera";
         vendor = CameraVendor.UNKNOWN;
+        canonRemoteModeReady = false;
         handleCache.clear();
     }
 
@@ -1117,6 +1497,21 @@ public final class PtpIpTransport implements CameraTransport {
         try {
             closeable.close();
         } catch (IOException ignored) {
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** 相机以 InitFail(type 5) 拒绝了握手：仍持有旧会话，可由 connect() 重试。 */
+    private static final class InitRejectedException extends IOException {
+        InitRejectedException(String message) {
+            super(message);
         }
     }
 

@@ -73,20 +73,20 @@ public interface CameraTransport extends Closeable {
         return false;
     }
 
+    /**
+     * 最近一次 {@link #capture()} 的厂商快门逐步诊断（每步响应码与应答载荷）。
+     * 用于「快门回 OK 但相机没拍照」这类只能靠响应码判断的场景；无诊断时返回空串。
+     */
+    default String captureDiagnostics() {
+        return "";
+    }
+
     /** 发布“已连接”状态前的双通道健康屏障。 */
     void assertHealthy() throws IOException;
 
     /** 立即打断阻塞中的底层读写并释放句柄；可从任意线程调用（不等实例锁）。 */
     default void abortTransport() {
         // 默认无操作：没有需要打断的阻塞 IO 的实现可以忽略。
-    }
-
-    /**
-     * 尽力让相机释放当前会话（PTP/IP 发送 CloseSession；USB/PTP 无需）。
-     * 不释放时相机会一直持有旧会话，下一次连接握手会被直接拒绝（InitFail），
-     * 表现为「第一次能连、之后每次都失败」。只作尽力而为的收尾，不抛异常。
-     */
-    default void releaseSession() {
     }
 
     void setObjectEventListener(ObjectEventListener listener);

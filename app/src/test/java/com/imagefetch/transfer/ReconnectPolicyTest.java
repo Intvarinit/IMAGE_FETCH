@@ -12,9 +12,10 @@ public class ReconnectPolicyTest {
         assertEquals(2000L, ReconnectPolicy.backoffDelayMs(2));
         assertEquals(4000L, ReconnectPolicy.backoffDelayMs(3));
         assertEquals(8000L, ReconnectPolicy.backoffDelayMs(4));
-        assertEquals(16000L, ReconnectPolicy.backoffDelayMs(5));
-        assertEquals(30000L, ReconnectPolicy.backoffDelayMs(6));
+        assertEquals(15000L, ReconnectPolicy.backoffDelayMs(5));
+        assertEquals(25000L, ReconnectPolicy.backoffDelayMs(6));
         assertEquals(30000L, ReconnectPolicy.backoffDelayMs(7));
+        assertEquals(30000L, ReconnectPolicy.backoffDelayMs(8));
         assertEquals(30000L, ReconnectPolicy.backoffDelayMs(99));
     }
 

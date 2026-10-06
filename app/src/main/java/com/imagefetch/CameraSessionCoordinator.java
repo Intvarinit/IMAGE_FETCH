@@ -12,9 +12,10 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.net.wifi.WifiManager;
 import android.util.LruCache;
 
 import com.imagefetch.ptp.CameraStorage;
@@ -69,6 +70,9 @@ public final class CameraSessionCoordinator {
 
         /** note 为相册导出结果（含失败原因）；界面上必须与文件名一起显示，否则会被覆盖掉。 */
         void onFileSaved(File file, long bytes, long elapsedMillis, String note);
+
+        /** 一批下载结束（含失败/取消）：界面据此清掉图片栏里已下载图片的选中状态。 */
+        void onDownloadFinished();
 
         void onError(String message, Throwable error);
     }
@@ -145,6 +149,8 @@ public final class CameraSessionCoordinator {
     private volatile TransferControl control;
     /** 相册导出失败是否已提示过（每次拍摄/下载开始时复位）。 */
     private volatile boolean exportFailureReported;
+    /** 最近一次手动断开时相机侧会话的释放结果（诊断用，会随下一次连接失败一起展示）。 */
+    private volatile String lastSessionRelease = "";
 
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override public void run() {
@@ -198,7 +204,7 @@ public final class CameraSessionCoordinator {
                     CameraTransport active = transport;
                     if (active instanceof PtpIpTransport) {
                         seedCameraWifiNetwork();
-                        Network network = cameraWifiNetwork;
+                        Network network = liveCameraWifiNetwork();
                         sessionNetwork = network;
                         ((PtpIpTransport) active).setSocketFactory(
                                 network != null ? network.getSocketFactory() : null);
@@ -260,11 +266,48 @@ public final class CameraSessionCoordinator {
                 (ConnectivityManager) this.context.getSystemService(Context.CONNECTIVITY_SERVICE);
         this.wifiManager =
                 (WifiManager) this.context.getSystemService(Context.WIFI_SERVICE);
+        // 持久化发起方 GUID：同一台手机每次握手复用同一身份，相机有机会把它识别为
+        // 「同一设备」从而允许替换旧连接（P6 实验）。首次生成后固定不变。
+        wifiTransport.setInitiatorGuid(loadOrCreateInitiatorGuid(this.context));
         // 只有 PTP/IP 有 event 通道；USB 的新对象发现走句柄差集轮询。
         wifiTransport.setObjectEventListener((storageId, objectHandle) -> {
             NewPhotoResolver resolver = activeResolver;
             if (resolver != null) resolver.onObjectAdded(storageId, objectHandle);
         });
+    }
+
+    /** 与 MainActivity 共用的偏好文件名。 */
+    private static final String PREFS_NAME = "image_fetch_prefs";
+    /** 持久化发起方 GUID 的键（存 32 位十六进制串）。 */
+    private static final String PREF_INITIATOR_GUID = "ptpip_initiator_guid";
+
+    /**
+     * 读取持久化的 PTP/IP 发起方 GUID；首次运行时随机生成 16 字节并落盘。
+     * 落盘失败（如磁盘不可写）不致命：本次仍复用内存中的值，仅退化为「本次运行内固定」。
+     */
+    private static byte[] loadOrCreateInitiatorGuid(Context context) {
+        android.content.SharedPreferences prefs =
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String stored = prefs.getString(PREF_INITIATOR_GUID, null);
+        if (stored != null && stored.length() == 32) {
+            byte[] guid = new byte[16];
+            boolean valid = true;
+            for (int i = 0; i < 16; i++) {
+                try {
+                    guid[i] = (byte) Integer.parseInt(stored.substring(i * 2, i * 2 + 2), 16);
+                } catch (NumberFormatException bad) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) return guid;
+        }
+        byte[] guid = new byte[16];
+        new java.security.SecureRandom().nextBytes(guid);
+        StringBuilder hex = new StringBuilder(32);
+        for (byte b : guid) hex.append(String.format(Locale.ROOT, "%02X", b));
+        prefs.edit().putString(PREF_INITIATOR_GUID, hex.toString()).apply();
+        return guid;
     }
 
     public File outputDirectory() {
@@ -487,7 +530,7 @@ public final class CameraSessionCoordinator {
                     listener.onStatus("枚举 Wi‑Fi 网络…");
                     seedCameraWifiNetwork();
                     registerWifiNetworkCallback();
-                    Network network = cameraWifiNetwork;
+                    Network network = liveCameraWifiNetwork();
                     sessionNetwork = network;
                     ((PtpIpTransport) active).setSocketFactory(
                             network != null ? network.getSocketFactory() : null);
@@ -518,17 +561,48 @@ public final class CameraSessionCoordinator {
                 CameraTransport active = transport;
                 closeQuietly(active);
                 if (!connectAttemptActive(generation, false)) return;
+                final String detail = connectFailureMessage(requestedKind, host, port, error);
                 mainHandler.post(() -> {
                     if (!connectAttemptActive(generation, false)) return;
                     connected = false;
                     connecting = false;
-                    listener.onError(
-                            (error.getMessage() != null ? error.getMessage() : "连接失败")
-                                    + unreachableHint(error),
-                            error);
+                    listener.onError(detail, error);
                 });
             }
         });
+    }
+
+    /**
+     * 连接失败提示 = 用户可读的原因与建议 + 真机诊断。
+     * 诊断段是排查唯一依据：网络选择、本机出口、逐次握手的异常链、上次会话释放结果，
+     * 都要能在一次真机报错里看到，不必再连 logcat。
+     */
+    private String connectFailureMessage(
+            TransportKind kind, String host, int port, Throwable error) {
+        StringBuilder text = new StringBuilder();
+        text.append(error.getMessage() != null ? error.getMessage() : "连接失败");
+        text.append(unreachableHint(error));
+        text.append("\n\n——— 诊断 ———");
+        text.append("\n传输：").append(kind == TransportKind.USB
+                ? "USB"
+                : "Wi‑Fi " + host + ":" + port);
+        text.append("\n系统：Android ").append(Build.VERSION.RELEASE)
+                .append("（SDK ").append(Build.VERSION.SDK_INT).append("）");
+        text.append("\n上次断开：")
+                .append(lastSessionRelease.isEmpty() ? "未记录" : lastSessionRelease);
+        CameraTransport active = transport;
+        if (active instanceof PtpIpTransport) {
+            text.append('\n').append(((PtpIpTransport) active).connectDiagnostics());
+        }
+        return text.toString();
+    }
+
+    /** 「拍摄超时」时附上厂商快门逐步诊断，区分「相机没拍」与「拍了没被发现」。 */
+    private String captureDiagnosticsSuffix() {
+        PtpOperationService active = operations;
+        if (active == null) return "";
+        String steps = active.transport().captureDiagnostics();
+        return steps.isEmpty() ? "" : "\n快门诊断：\n" + steps;
     }
 
     /**
@@ -538,6 +612,23 @@ public final class CameraSessionCoordinator {
      */
     static String unreachableHint(Throwable error) {
         for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            String text = cause.getMessage();
+            if (text != null && text.contains("ECONNABORTED")) {
+                return "\n\n连接过程被中断（ECONNABORTED）：TCP 握手还没完成，链路就断了。\n"
+                        + "1) 相机很可能已退出「连接智能手机」模式或进入休眠——"
+                        + "在相机上重新进入该模式；\n"
+                        + "2) 相机设置里的 Wi‑Fi 节能 / 空闲断开 / 自动关机是否开启（开启就关掉）；\n"
+                        + "3) 手机是否在连接瞬间从相机 Wi‑Fi 切回了移动数据。";
+            }
+            if (text != null
+                    && (text.contains("ECONNREFUSED") || text.contains("Connection refused"))) {
+                return "\n\n相机 Wi‑Fi 通着，但相机没有在 15740 端口监听（PTP 服务没起来）。"
+                        + "常见原因：\n"
+                        + "1) 相机刚结束上一次连接，PTP 服务还在重启——等几秒再点「连接」；\n"
+                        + "2) 相机已退出「连接智能手机」模式（相机屏上可能显示「未找到连接目标」），"
+                        + "需要在相机上重新进入该模式；\n"
+                        + "3) 部分机型需在相机菜单里确认已开启 PTP/IP（无线连接）服务。";
+            }
             boolean unreachable = cause instanceof NoRouteToHostException
                     || cause instanceof UnknownHostException
                     || (cause.getMessage() != null
@@ -623,14 +714,17 @@ public final class CameraSessionCoordinator {
         TransferControl current = control;
         if (current != null) {
             current.cancel("用户断开连接");
-            // 传输中：必须立刻打断阻塞中的读写（此时也无法再优雅释放会话）。
+            // 传输中：必须立刻打断阻塞中的读写。
             if (session != null) session.abortTransport();
+            lastSessionRelease = "传输中被强制中断（未主动释放相机侧会话）";
+        } else {
+            lastSessionRelease = "未主动释放相机侧会话（统一策略：断开只拆 TCP，保留槽位）";
         }
         executor.submit(() -> {
-            if (session != null) {
-                // 先让相机释放会话，再拆链路：否则相机侧旧会话会挡住下一次连接（InitFail）。
-                session.releaseSession();
-            }
+            // 统一策略：Wi‑Fi 断开一律不发 CloseSession(0x1003)。
+            // 实测发 CloseSession 后相机会关掉自己的 PTP/IP 监听（下次连接 ECONNREFUSED），
+            // 且 InitFail 是连接层拒绝，CloseSession 也动不了它。断开只拆 TCP，把会话槽位
+            // 留给相机的超时回收；重连时由 OpenSession 的 0x201E 复用。诊断见 lastSessionRelease。
             closeQuietly(session);
             connected = false;
             cameraName = "";
@@ -643,9 +737,14 @@ public final class CameraSessionCoordinator {
         manualDisconnect = true;
         mainHandler.removeCallbacks(heartbeatRunnable);
         mainHandler.removeCallbacks(reconnectRunnable);
-        TransferControl current = control;
-        if (current != null) current.cancel("应用退出");
         CameraTransport session = transport;
+        TransferControl current = control;
+        if (current != null) {
+            current.cancel("应用退出");
+            // 传输中：先打断阻塞读写，否则 close() 取实例锁时会干等（可能触发 ANR），
+            // 且通道正忙时也无法优雅释放会话。
+            if (session != null) session.abortTransport();
+        }
         closeQuietly(session);
         unregisterWifiNetworkCallback();
         releaseWifiLock();
@@ -657,7 +756,7 @@ public final class CameraSessionCoordinator {
         if (current != null) current.cancel("用户取消");
     }
 
-    /** 触发一次拍摄并自动取回新产生的 JPEG 原图。 */
+    /** 触发一次拍摄并自动取回新产生的 JPEG 原图（无 JPEG 时跳过，不保存 RAW）。 */
     public void captureAndFetch() {
         executor.submit(() -> {
             if (!isConnected()) {
@@ -717,27 +816,27 @@ public final class CameraSessionCoordinator {
                         item -> !item.isVideo(),
                         current);
 
+                // 只保存 JPEG：RAW（.cr2/.cr3/.nef…）等不落盘。
+                // 相机设为仅 RAW 时只提示、不报错——这不算失败，只是没有可取回的格式。
                 List<CameraStorage.Item> jpegs = new ArrayList<>();
-                List<CameraStorage.Item> raws = new ArrayList<>();
-                List<CameraStorage.Item> others = new ArrayList<>();
+                List<CameraStorage.Item> skipped = new ArrayList<>();
                 for (CameraStorage.Item item : resolution.newItems) {
                     if (item.isJpeg()) jpegs.add(item);
-                    else if (item.isRaw()) raws.add(item);
-                    else others.add(item);
+                    else skipped.add(item);
                 }
                 if (jpegs.isEmpty()) {
-                    if (!raws.isEmpty()) {
-                        throw new Exception(
-                                "本次仅发现 RAW 对象（" + names(raws)
-                                        + "）；首版仅验收 JPEG 原图。");
+                    if (!skipped.isEmpty()) {
+                        listener.onStatus("本次未发现 JPEG，仅有 " + names(skipped)
+                                + "；按设置（无 JPEG 不保存）跳过。");
+                        return;
                     }
                     throw new Exception(
-                            "超时未发现本次拍摄的新对象（可能仍在写卡、事件缺失或返回了不受支持的格式）。");
+                            "超时未发现本次拍摄的新对象（可能仍在写卡、事件缺失或返回了不受支持的格式，"
+                                    + "也可能是相机根本没执行快门）。"
+                                    + captureDiagnosticsSuffix());
                 }
-                if (!raws.isEmpty() || !others.isEmpty()) {
-                    listener.onStatus("发现 " + resolution.newItems.size()
-                            + " 个新对象；首版仅取回 JPEG，跳过 RAW/其他格式 "
-                            + names(raws) + names(others));
+                if (!skipped.isEmpty()) {
+                    listener.onStatus("跳过非 JPEG 对象：" + names(skipped));
                 }
 
                 listener.onStatus("发现新照片："
@@ -823,6 +922,7 @@ public final class CameraSessionCoordinator {
             } finally {
                 control = null;
                 lastTransferFinishedAt = System.currentTimeMillis();
+                mainHandler.post(listener::onDownloadFinished);
             }
         });
     }
@@ -978,6 +1078,20 @@ public final class CameraSessionCoordinator {
             return;
         }
         if (fallback != null) cameraWifiNetwork = fallback;
+    }
+
+    /**
+     * 取当前仍然有效的相机 Wi‑Fi 网络。网络可能已被系统切走（此时 Network 句柄失效），
+     * 再拿它 getSocketFactory().createSocket() 绑定会直接抛 EPERM；先校验一次可避免。
+     */
+    private Network liveCameraWifiNetwork() {
+        Network network = cameraWifiNetwork;
+        if (network == null || connectivityManager == null) return null;
+        try {
+            return connectivityManager.getNetworkCapabilities(network) != null ? network : null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private void unregisterWifiNetworkCallback() {

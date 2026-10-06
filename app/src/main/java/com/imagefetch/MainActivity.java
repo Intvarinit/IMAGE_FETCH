@@ -148,6 +148,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         connectButton.setOnClickListener(view -> {
             if (coordinator.isConnected()) {
                 coordinator.disconnect();
+                showReconnectHint();
                 return;
             }
             String host = hostField.getText().toString().trim();
@@ -387,6 +388,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             setBusy(false);
             updateConnectButton(false);
+            // 链路已断：清掉图片栏，避免展示已经无法下载/预览的旧缩略图。
+            gridAdapter.reset();
             statusView.setText(R.string.status_idle);
         });
     }
@@ -396,8 +399,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             setBusy(false);
             updateConnectButton(false);
-            statusView.setText("链路丢失，自动重连第 " + attempt + " 次（退避 "
-                    + delayMillis + " ms）…");
+            // 链路丢失即清空图片栏（重连成功后 onConnected 会重新读卡填充第一页）。
+            gridAdapter.reset();
+            statusView.setText("链路丢失，自动重连第 " + attempt + " 次，"
+                    + (delayMillis / 1000) + " 秒后重试…");
         });
     }
 
@@ -427,6 +432,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     @Override
+    public void onDownloadFinished() {
+        runOnUiThread(() -> {
+            setBusy(false);
+            // 下载已结束：清掉图片栏里之前的选中状态，避免看起来像还没下载。
+            gridAdapter.clearSelection();
+        });
+    }
+
+    @Override
     public void onError(String message, Throwable error) {
         runOnUiThread(() -> {
             setBusy(false);
@@ -439,6 +453,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 填充图片栏，并异步逐张拉取缩略图（与相机事务串行，不会与下载交错）。 */
     private void populate(CameraStorage.Page page) {
         gridAdapter.setItems(page.items);
+        // 翻页后回到顶端：否则上一页的滚动位置会带过来，看起来像没换页。
+        photoGrid.setSelection(0);
         coordinator.loadThumbnails(
                 new ArrayList<>(page.items),
                 (handle, jpeg) -> gridAdapter.putThumbnailJpeg(handle, jpeg));
@@ -565,6 +581,23 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         }
     }
 
+    /**
+     * 断开后的提示：相机的 PTP/IP 连接只保留一个槽位，App 断开后相机不会立刻释放，
+     * 期间新连接可能被 InitFail 拒绝。App 现在会自己等相机回收槽位（约 2 分钟内多次退避
+     * 重试），因此先让用户直接重连；只有反复失败时才需要去相机侧删连接。
+     */
+    private void showReconnectHint() {
+        new AlertDialog.Builder(this)
+                .setTitle("已断开")
+                .setMessage("已断开与相机的连接。\n\n"
+                        + "再次使用：直接点「连接」即可，App 会自动等待相机释放旧连接槽位并重试"
+                        + "（最长约 2 分钟）。\n\n"
+                        + "若多次重试仍失败，再在相机上删除（断开）当前连接目标，"
+                        + "重新进入「连接智能手机」模式后点「连接」。")
+                .setPositiveButton(android.R.string.ok, null)
+                .show();
+    }
+
     private void showError(String message, Throwable error) {
         String detail = message == null ? "未知错误" : message;
         if (error != null && error.getCause() != null
@@ -572,9 +605,20 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             detail += "\n\n" + error.getCause().getMessage();
         }
         new AlertDialog.Builder(this)
-                .setTitle("出错了")
+                // 带上版本号：便于确认报错出自哪一次构建。
+                .setTitle("出错了 · v" + versionName())
                 .setMessage(detail)
                 .setPositiveButton(android.R.string.ok, null)
                 .show();
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager()
+                    .getPackageInfo(getPackageName(), 0)
+                    .versionName;
+        } catch (Exception ignored) {
+            return "?";
+        }
     }
 }

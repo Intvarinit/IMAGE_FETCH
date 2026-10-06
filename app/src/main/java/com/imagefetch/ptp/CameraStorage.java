@@ -81,7 +81,7 @@ public final class CameraStorage {
             return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
         }
 
-        /** 首版验收格式：JPEG 原图。RAW（.cr2/.cr3/.nef/.arw 等）留待后续阶段。 */
+        /** RAW（.cr2/.cr3/.nef/.arw 等）：仅用于识别与跳过，不落盘（只保存 JPEG）。 */
         public boolean isRaw() {
             String lower = filename.toLowerCase(Locale.ROOT);
             return lower.endsWith(".cr2") || lower.endsWith(".cr3")

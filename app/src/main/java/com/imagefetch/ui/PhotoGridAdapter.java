@@ -84,6 +84,18 @@ public final class PhotoGridAdapter extends BaseAdapter {
         notifySelection();
     }
 
+    /**
+     * 链路断开：清空当前页、缩略图与选中项。
+     * 此时图片已无法再下载/预览，继续展示只会让用户误以为还能操作。
+     */
+    public void reset() {
+        items.clear();
+        thumbnails.clear();
+        selected.clear();
+        notifyDataSetChanged();
+        notifySelection();
+    }
+
     public int selectedCount() {
         return selected.size();
     }
