@@ -28,6 +28,7 @@ public final class PhotoGridAdapter extends BaseAdapter {
 
     private static final int TARGET_THUMBNAIL_PX = 256;
 
+    private final Context context;
     private final LayoutInflater inflater;
     private final List<CameraStorage.Item> items = new ArrayList<>();
     private final Map<Long, Bitmap> thumbnails = new HashMap<>();
@@ -39,6 +40,7 @@ public final class PhotoGridAdapter extends BaseAdapter {
     private SelectionListener selectionListener;
 
     public PhotoGridAdapter(Context context) {
+        this.context = context;
         this.inflater = LayoutInflater.from(context);
     }
 
@@ -62,8 +64,9 @@ public final class PhotoGridAdapter extends BaseAdapter {
         notifyDataSetChanged();
     }
 
+    /** 切换选中。非 JPEG（RAW/视频）不能下载，因此拒绝选中。 */
     public void toggle(CameraStorage.Item item) {
-        if (item == null) return;
+        if (item == null || !item.isJpeg()) return;
         if (selected.remove(item.handle) == null) selected.put(item.handle, item);
         notifyDataSetChanged();
         notifySelection();
@@ -126,10 +129,10 @@ public final class PhotoGridAdapter extends BaseAdapter {
         if (cell == null) {
             cell = inflater.inflate(R.layout.grid_item_photo, parent, false);
         }
-        CameraStorage.Item item = items.get(position);
+        final CameraStorage.Item item = items.get(position);
         ImageView thumb = cell.findViewById(R.id.thumb);
         TextView caption = cell.findViewById(R.id.caption);
-        TextView badge = cell.findViewById(R.id.selectedBadge);
+        TextView indicator = cell.findViewById(R.id.selectIndicator);
 
         Bitmap bitmap = thumbnails.get(item.handle);
         if (bitmap != null) {
@@ -140,7 +143,20 @@ public final class PhotoGridAdapter extends BaseAdapter {
         }
         caption.setText(String.format(
                 Locale.ROOT, "%s · %s", item.filename, readableSize(item.sizeBytes)));
-        badge.setVisibility(selected.containsKey(item.handle) ? View.VISIBLE : View.GONE);
+        // 右上角指示点：只有 JPEG 才可选中（RAW/视频不能下载，索性不给选择入口）。
+        // 它自己消费点击（点它 = 切换选中），点缩略图其它区域仍走 GridView 的点击 = 放大预览。
+        if (item.isJpeg()) {
+            boolean checked = selected.containsKey(item.handle);
+            indicator.setVisibility(View.VISIBLE);
+            indicator.setSelected(checked);
+            indicator.setText(checked ? context.getString(R.string.selected_mark) : "");
+            indicator.setOnClickListener(view -> toggle(item));
+        } else {
+            indicator.setVisibility(View.GONE);
+            indicator.setSelected(false);
+            indicator.setText("");
+            indicator.setOnClickListener(null);
+        }
         return cell;
     }
 

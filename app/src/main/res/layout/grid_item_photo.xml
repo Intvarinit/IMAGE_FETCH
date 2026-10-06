@@ -27,18 +27,17 @@
         android:textColor="#FFFFFF"
         android:textSize="10sp" />
 
+    <!-- 选中指示点：常驻可见，点击它即切换选中（点击缩略图其它区域仍是放大预览）。 -->
     <TextView
-        android:id="@+id/selectedBadge"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:id="@+id/selectIndicator"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
         android:layout_gravity="top|end"
-        android:background="@color/accent"
-        android:paddingLeft="6dp"
-        android:paddingRight="6dp"
-        android:paddingTop="2dp"
-        android:paddingBottom="2dp"
-        android:text="@string/selected_mark"
+        android:layout_margin="4dp"
+        android:background="@drawable/select_indicator"
+        android:contentDescription="@string/select_hint"
+        android:gravity="center"
         android:textColor="#FFFFFF"
-        android:textStyle="bold"
-        android:visibility="gone" />
+        android:textSize="16sp"
+        android:textStyle="bold" />
 </FrameLayout>

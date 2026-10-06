@@ -878,7 +878,7 @@ public final class CameraSessionCoordinator {
         });
     }
 
-    /** 手动下载选中的相机对象（沿用同一去重与原子落盘流程）。 */
+    /** 手动下载选中的相机对象；与拍摄路径一致，仅 JPEG 可下载，RAW/其他格式一律跳过。 */
     public void download(List<CameraStorage.Item> items) {
         executor.submit(() -> {
             if (!isConnected()) {
@@ -893,7 +893,21 @@ public final class CameraSessionCoordinator {
             control = current;
             exportFailureReported = false;
             try {
+                List<CameraStorage.Item> jpegs = new ArrayList<>();
+                List<CameraStorage.Item> skipped = new ArrayList<>();
                 for (CameraStorage.Item item : items) {
+                    if (item.isJpeg()) jpegs.add(item);
+                    else skipped.add(item);
+                }
+                if (jpegs.isEmpty()) {
+                    listener.onStatus("所选对象不是 JPEG（" + names(skipped)
+                            + "）；按设置（无 JPEG 不保存）已跳过，未下载。");
+                    return;
+                }
+                if (!skipped.isEmpty()) {
+                    listener.onStatus("仅 JPEG 可下载，跳过：" + names(skipped));
+                }
+                for (CameraStorage.Item item : jpegs) {
                     current.throwIfCancelled();
                     listener.onStatus("下载 " + item.filename + " …");
                     PhotoTransferWorker worker =

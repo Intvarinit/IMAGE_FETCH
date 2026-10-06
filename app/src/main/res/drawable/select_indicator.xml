@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 缩略图右上角的选中指示点：未选中为半透明深色空心圆，选中后填充主题色并显示 ✓。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_selected="true">
+        <shape android:shape="oval">
+            <solid android:color="@color/accent" />
+            <stroke
+                android:width="2dp"
+                android:color="#FFFFFF" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#66000000" />
+            <stroke
+                android:width="2dp"
+                android:color="#FFFFFF" />
+        </shape>
+    </item>
+</selector>

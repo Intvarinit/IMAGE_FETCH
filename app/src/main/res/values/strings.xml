@@ -17,7 +17,11 @@
     <string name="full_scan">完整扫描</string>
     <string name="page_info">第 1 / 1 页</string>
     <string name="selected_mark">✓</string>
-    <string name="selected_count">长按图片可选中 · 已选 0 张</string>
+    <string name="selected_count">点图片右上角可选中 · 已选 0 张</string>
+    <string name="select_hint">选中此图</string>
+    <string name="format_filter_label">格式</string>
+    <string name="format_filter_jpeg">仅 JPG</string>
+    <string name="format_filter_all">全部</string>
     <string name="output_dir_label">应用内暂存</string>
     <string name="album_dir_label">系统相册</string>
     <string name="album_dir_disabled">已关闭（照片只留在应用内暂存，需自行导出）</string>

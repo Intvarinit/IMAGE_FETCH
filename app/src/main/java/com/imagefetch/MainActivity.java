@@ -50,6 +50,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final String PREFS_NAME = "image_fetch_prefs";
     private static final String PREF_EXPORT_TO_GALLERY = "export_to_gallery";
     private static final String PREF_PAGE_SIZE = "page_size";
+    private static final String PREF_JPEG_ONLY = "jpeg_only";
     private static final int[] PAGE_SIZE_OPTIONS = {20, 50, 100};
     private static final int DEFAULT_PAGE_SIZE = PAGE_SIZE_OPTIONS[0];
 
@@ -67,6 +68,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private Button nextPageButton;
     private Button fullScanButton;
     private Spinner pageSizeSpinner;
+    private Spinner formatFilterSpinner;
     private TextView pageInfoView;
     private TextView outputDirView;
     private ProgressBar progressBar;
@@ -78,6 +80,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 当前页序号（从 0 开始）与是否处于“完整扫描”模式。 */
     private int currentPage;
     private boolean fullScanMode;
+    /** 图片栏是否只显示 JPG（默认开：只有 JPG 能下载，RAW 显示出来也没法用）。 */
+    private boolean jpegOnly = true;
+    /** 最近一次读到的页（未过滤的原始数据）；切换格式过滤器时据此重渲染，不重读相机。 */
+    private CameraStorage.Page lastPage;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -96,6 +102,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         nextPageButton = findViewById(R.id.nextPage);
         fullScanButton = findViewById(R.id.fullScan);
         pageSizeSpinner = findViewById(R.id.pageSize);
+        formatFilterSpinner = findViewById(R.id.formatFilter);
         pageInfoView = findViewById(R.id.pageInfo);
         progressBar = findViewById(R.id.progress);
         statusView = findViewById(R.id.status);
@@ -106,9 +113,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         gridAdapter.setSelectionListener(count -> selectionCountView.setText(
                 count == 0 ? getString(R.string.selected_count) : "已选 " + count + " 张"));
         photoGrid.setAdapter(gridAdapter);
-        // 点击放大预览；长按切换选中（选中跨页保留，便于一次下载）。
+        // 点击缩略图放大预览；选中改由缩略图右上角的指示点完成（不再需要长按）。
         photoGrid.setOnItemClickListener(this::onGridItemClick);
-        photoGrid.setOnItemLongClickListener(this::onGridItemLongClick);
 
         coordinator = new CameraSessionCoordinator(
                 this, this::ensureUsbPermission, this);
@@ -120,6 +126,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         boolean export = preferences.getBoolean(PREF_EXPORT_TO_GALLERY, true);
         int configuredPageSize = preferences.getInt(PREF_PAGE_SIZE, DEFAULT_PAGE_SIZE);
         setUpPageSizeSpinner(configuredPageSize);
+        setUpFormatFilterSpinner(preferences.getBoolean(PREF_JPEG_ONLY, true));
 
         exportToGalleryBox.setChecked(export);
         coordinator.setExportToGallery(export);
@@ -232,24 +239,20 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private void updatePager(CameraStorage.Page page) {
         pageInfoView.setText(String.format(
                 Locale.ROOT,
-                "第 %d / %d 页 · 共 %d 张%s",
+                "第 %d / %d 页 · 共 %d 张%s%s",
                 page.pageIndex + 1,
                 page.pageCount(),
                 page.totalCount,
-                page.complete ? "（完整扫描）" : ""));
+                page.complete ? "（完整扫描）" : "",
+                // 过滤后必须说明本页实显张数，否则“共 20 张却只看到 2 张”会被当成丢图。
+                jpegOnly ? " · 本页 JPG " + gridAdapter.getCount() + " 张" : ""));
         prevPageButton.setEnabled(page.hasPrevious());
         nextPageButton.setEnabled(page.hasNext());
     }
 
-    /** 图片栏点击：放大预览。 */
+    /** 图片栏点击：放大预览（选中请点缩略图右上角的指示点）。 */
     private void onGridItemClick(AdapterView<?> parent, View view, int position, long id) {
         showPreview((CameraStorage.Item) parent.getItemAtPosition(position));
-    }
-
-    /** 图片栏长按：切换选中（选中跨页保留，可跨页勾选后一次下载）。 */
-    private boolean onGridItemLongClick(AdapterView<?> parent, View view, int position, long id) {
-        gridAdapter.toggle((CameraStorage.Item) parent.getItemAtPosition(position));
-        return true;
     }
 
     /**
@@ -295,6 +298,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     private void updatePreviewToggle(Button toggle, CameraStorage.Item item) {
+        // 非 JPEG 无法下载，选中没有意义：直接藏掉，免得选完了却下不了。
+        toggle.setVisibility(item.isJpeg() ? View.VISIBLE : View.GONE);
         toggle.setText(gridAdapter.isSelected(item.handle)
                 ? R.string.preview_toggle_unselect
                 : R.string.preview_toggle_select);
@@ -350,6 +355,39 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 preferences.edit().putInt(PREF_PAGE_SIZE, size).apply();
                 // 页边界随页大小改变：回到第一页，避免停在可能为空的尾页。
                 if (coordinator.isConnected()) goToPage(0);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
+    /**
+     * 格式过滤器：只影响图片栏显示（默认仅 JPG，因为只有 JPG 能下载）。
+     * 切换时用本地缓存的当前页重渲染，不重读相机。
+     */
+    private void setUpFormatFilterSpinner(boolean jpegOnlyConfigured) {
+        String[] labels = {
+            getString(R.string.format_filter_jpeg), getString(R.string.format_filter_all)};
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        formatFilterSpinner.setAdapter(adapter);
+        jpegOnly = jpegOnlyConfigured;
+        formatFilterSpinner.setSelection(jpegOnly ? 0 : 1);
+        formatFilterSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(
+                    AdapterView<?> parent, View view, int position, long id) {
+                boolean only = position == 0;
+                if (only == jpegOnly) return;
+                jpegOnly = only;
+                preferences.edit().putBoolean(PREF_JPEG_ONLY, only).apply();
+                if (lastPage != null) {
+                    populate(lastPage);
+                    updatePager(lastPage);
+                }
             }
 
             @Override
@@ -452,12 +490,23 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 填充图片栏，并异步逐张拉取缩略图（与相机事务串行，不会与下载交错）。 */
     private void populate(CameraStorage.Page page) {
-        gridAdapter.setItems(page.items);
+        lastPage = page;
+        List<CameraStorage.Item> visible = jpegOnly ? jpegItems(page.items) : page.items;
+        gridAdapter.setItems(visible);
         // 翻页后回到顶端：否则上一页的滚动位置会带过来，看起来像没换页。
         photoGrid.setSelection(0);
+        // 只给真正会显示的图取缩略图，RAW/视频在“仅 JPG”下不必浪费相机往返。
         coordinator.loadThumbnails(
-                new ArrayList<>(page.items),
+                new ArrayList<>(visible),
                 (handle, jpeg) -> gridAdapter.putThumbnailJpeg(handle, jpeg));
+    }
+
+    private static List<CameraStorage.Item> jpegItems(List<CameraStorage.Item> items) {
+        List<CameraStorage.Item> result = new ArrayList<>();
+        for (CameraStorage.Item item : items) {
+            if (item.isJpeg()) result.add(item);
+        }
+        return result;
     }
 
     private void setBusy(boolean busy) {
@@ -467,6 +516,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         connectUsbButton.setEnabled(!busy);
         fullScanButton.setEnabled(!busy);
         pageSizeSpinner.setEnabled(!busy);
+        formatFilterSpinner.setEnabled(!busy);
         if (busy) {
             prevPageButton.setEnabled(false);
             nextPageButton.setEnabled(false);
