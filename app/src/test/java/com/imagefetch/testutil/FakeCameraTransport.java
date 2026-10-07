@@ -5,6 +5,7 @@ import com.imagefetch.transport.CameraTransport;
 
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 内存伪 transport：供 NewPhotoResolver / PhotoTransferWorker 的行为测试使用，
@@ -24,6 +25,8 @@ public final class FakeCameraTransport implements CameraTransport {
     public int captureCalls;
     /** 最近一次 listStorage 收到的张数上限（便于断言协调器真的把设定透传下去）。 */
     public int lastMaxItems;
+    /** 最近一次 listStoragePage 收到的「仅 JPG」标志。 */
+    public boolean lastJpegOnly;
 
     /** 模拟“相机把图像直接放入机身内存”的拍摄路径（如 Nikon USB SDRAM）。 */
     public FakeCameraTransport captureHandles(long[] value) {
@@ -79,8 +82,14 @@ public final class FakeCameraTransport implements CameraTransport {
     }
 
     @Override
-    public CameraStorage.Page listStoragePage(int pageSize, int pageIndex) {
-        return CameraStorage.Page.ofItems(snapshot.items, pageSize, pageIndex);
+    public CameraStorage.Page listStoragePage(int pageSize, int pageIndex, boolean jpegOnly) {
+        lastJpegOnly = jpegOnly;
+        if (!jpegOnly) return CameraStorage.Page.ofItems(snapshot.items, pageSize, pageIndex);
+        List<CameraStorage.Item> jpegs = new ArrayList<>();
+        for (CameraStorage.Item item : snapshot.items) {
+            if (item.isJpeg()) jpegs.add(item);
+        }
+        return CameraStorage.Page.ofItems(jpegs, pageSize, pageIndex);
     }
 
     @Override

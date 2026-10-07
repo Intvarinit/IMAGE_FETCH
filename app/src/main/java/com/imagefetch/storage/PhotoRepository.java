@@ -148,6 +148,48 @@ public final class PhotoRepository {
         }
     }
 
+    /**
+     * 忘掉某个对象键。相机上的对象被删除后必须调用：相机可能把该句柄复用给新照片，
+     * 若仍留着旧键，新照片会被 {@link #isImported} 当成「已入库」而跳过下载。
+     * 只动去重索引，不碰已落盘的文件。
+     */
+    public synchronized void forget(String objectKey) {
+        if (objectKey == null || objectKey.isEmpty()) return;
+        if (!importedKeys.remove(objectKey)) return;
+        rewriteIndexExcluding(objectKey);
+    }
+
+    /** 重写索引文件，逐行保留原有 {@code key\tfilename} 记录，只删掉指定键。 */
+    private void rewriteIndexExcluding(String objectKey) {
+        if (!indexFile.isFile()) return;
+        File temp = new File(outputDirectory, INDEX_FILENAME + ".tmp");
+        try {
+            boolean removed = false;
+            try (FileOutputStream output = new FileOutputStream(temp)) {
+                for (String line : readLines(indexFile)) {
+                    int tab = line.indexOf('\t');
+                    String key = (tab >= 0 ? line.substring(0, tab) : line).trim();
+                    if (key.equals(objectKey)) {
+                        removed = true;
+                        continue;
+                    }
+                    output.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                }
+                output.getFD().sync();
+            }
+            if (!removed) {
+                temp.delete();
+                return;
+            }
+            if (!temp.renameTo(indexFile)) {
+                copy(temp, indexFile);
+                temp.delete();
+            }
+        } catch (Exception ignored) {
+            // 重写失败最多让新照片被多跳过一次去重，不影响已落盘的文件。
+        }
+    }
+
     public synchronized List<String> indexedFilenames() {
         List<String> result = new ArrayList<>();
         if (!indexFile.isFile()) return result;

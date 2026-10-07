@@ -108,6 +108,14 @@ public final class CameraSessionCoordinator {
         /** 一批下载结束（含失败/取消）：界面据此清掉图片栏里已下载图片的选中状态。 */
         void onDownloadFinished();
 
+        /**
+         * 一批删除结束：{@code deleted} 为成功数、{@code failed} 为失败数，
+         * {@code failedNames} 是失败文件与其原因（多行，无失败时为空串）。
+         * 界面据此恢复按钮、清掉选中并重读当前页。给默认空实现，便于既有实现/测试桩不必改动。
+         */
+        default void onDeleteFinished(int deleted, int failed, String failedNames) {
+        }
+
         /** 实时取景的一帧（已解码）；界面替换画面时应回收上一帧。 */
         void onLiveViewFrame(Bitmap frame);
 
@@ -470,9 +478,14 @@ public final class CameraSessionCoordinator {
      *
      * @param fullScan true = 完整扫描整卡后在内存分页（无目录深度假设，首次较慢，
      *                 结果按会话缓存，翻页瞬时）；false = 快速分页，只读当前页。
+     * @param jpegOnly true = 按 JPG 分页：每页 {@code pageSize} 张 JPG，总数也是 JPG 张数
+     *                 （不再先按全部对象切片、再由界面过滤掉 RAW/视频把页面撑空）。
      */
     public void loadStoragePage(
-            final int pageIndex, final boolean fullScan, final StoragePageCallback callback) {
+            final int pageIndex,
+            final boolean fullScan,
+            final boolean jpegOnly,
+            final StoragePageCallback callback) {
         executor.submit(() -> {
             final PtpOperationService session = operations;
             if (session == null || !isConnected()) {
@@ -488,9 +501,12 @@ public final class CameraSessionCoordinator {
                         all = session.snapshot(0).items;
                         fullScanItems = all;
                     }
-                    page = CameraStorage.Page.ofItems(all, pageSize, pageIndex);
+                    // 完整扫描的结果是全集，JPG 分页只需在内存里先筛出 JPG 再切片。
+                    List<CameraStorage.Item> source = jpegOnly ? jpegItems(all) : all;
+                    page = CameraStorage.Page.ofItems(source, pageSize, pageIndex);
                 } else {
-                    page = session.page(pageSize, pageIndex);
+                    if (jpegOnly) listener.onStatus("正在筛查 JPG（只按 JPG 分页）…");
+                    page = session.page(pageSize, pageIndex, jpegOnly);
                 }
                 final CameraStorage.Page result = page;
                 mainHandler.post(() -> callback.onLoaded(result));
@@ -499,6 +515,14 @@ public final class CameraSessionCoordinator {
                         error.getMessage() == null ? "读取存储卡失败" : error.getMessage(), error));
             }
         });
+    }
+
+    private static List<CameraStorage.Item> jpegItems(List<CameraStorage.Item> items) {
+        List<CameraStorage.Item> result = new ArrayList<>();
+        for (CameraStorage.Item item : items) {
+            if (item.isJpeg()) result.add(item);
+        }
+        return result;
     }
 
     /** 单张缩略图就绪回调；jpeg 为 null 表示该对象无缩略图或读取失败。 */
@@ -1564,6 +1588,55 @@ public final class CameraSessionCoordinator {
     private static String interruptedMessage(TransferControl control) {
         String reason = control == null ? null : control.reason();
         return reason == null ? "已取消当前操作。" : "操作已中断：" + reason;
+    }
+
+    /**
+     * 删除相机存储卡上的一组对象（<b>任意格式</b>都可删，与只下载 JPEG 的限制无关）。
+     * 逐张调用标准 {@code 0x100B DeleteObject}；单张失败不中断整批，结束后清掉句柄缓存
+     * （卡内已变）并回调 {@link Listener#onDeleteFinished}。
+     */
+    public void deleteObjects(final List<CameraStorage.Item> items) {
+        executor.submit(() -> {
+            final PtpOperationService session = operations;
+            if (session == null || !isConnected()) {
+                mainHandler.post(() -> listener.onError("请先连接相机。", null));
+                mainHandler.post(() -> listener.onDeleteFinished(0, 0, ""));
+                return;
+            }
+            if (items == null || items.isEmpty()) {
+                mainHandler.post(() -> listener.onError("未选择要删除的对象。", null));
+                mainHandler.post(() -> listener.onDeleteFinished(0, 0, ""));
+                return;
+            }
+            int deleted = 0;
+            List<String> failures = new ArrayList<>();
+            final String cameraIdentity = session.cameraIdentity();
+            for (CameraStorage.Item item : items) {
+                try {
+                    listener.onStatus("删除 " + item.filename + " …");
+                    session.delete(item.handle);
+                    // 句柄可能被相机复用给新照片：不丢掉旧去重键，新照片会被当成「已入库」跳过。
+                    repository.forget(item.objectKey(cameraIdentity));
+                    deleted++;
+                } catch (Exception error) {
+                    // 单张失败（受保护、写卡中、机型不支持）不中断整批，最后统一汇报。
+                    failures.add(item.filename + "（" + describeError(error) + "）");
+                }
+            }
+            // 卡内结构已变：句柄缓存与完整扫描缓存都要作废，否则重读会拿到已删对象。
+            invalidateStorageCache();
+            final int deletedCount = deleted;
+            final String failedNames = String.join("\n", failures);
+            mainHandler.post(() -> listener.onDeleteFinished(
+                    deletedCount, failures.size(), failedNames));
+        });
+    }
+
+    /** 异常转一句可读文案（无 message 时退回类名）。 */
+    private static String describeError(Exception error) {
+        String message = error == null ? null : error.getMessage();
+        if (message != null && !message.isEmpty()) return message;
+        return error == null ? "未知错误" : error.getClass().getSimpleName();
     }
 
     private static String names(List<CameraStorage.Item> items) {

@@ -109,6 +109,28 @@ public class PhotoRepositoryTest {
     }
 
     @Test
+    public void forgetDropsKeySoAReusedHandleIsNotSkipped() throws Exception {
+        PhotoRepository first = repository();
+        PhotoRepository.StagedFile staged = first.stage("IMG_0008.JPG", "CamA");
+        try (OutputStream output = first.openStaging(staged.staging)) {
+            output.write(new byte[]{9});
+        }
+        first.commit(staged, "CamA:1:9", 1L);
+        first.markImported("CamA:1:10", "keep.jpg");
+        assertTrue(first.isImported("CamA:1:9"));
+
+        first.forget("CamA:1:9");
+
+        assertFalse("删除相机对象后必须丢掉去重键", first.isImported("CamA:1:9"));
+        assertTrue("其它去重键不受影响", first.isImported("CamA:1:10"));
+        // 索引须持久化到磁盘：重开会话后仍不认得被删对象的键。
+        PhotoRepository reopened = repository();
+        assertFalse(reopened.isImported("CamA:1:9"));
+        assertTrue(reopened.isImported("CamA:1:10"));
+        assertEquals(Collections.singletonList("keep.jpg"), reopened.indexedFilenames());
+    }
+
+    @Test
     public void outputDirectoryIsCreatedOnDemand() throws Exception {
         File nested = new File(folder.getRoot(), "captures");
         PhotoRepository repository = new PhotoRepository(nested);

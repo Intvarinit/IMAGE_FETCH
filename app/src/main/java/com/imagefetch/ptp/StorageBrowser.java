@@ -4,6 +4,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,45 +29,137 @@ public final class StorageBrowser {
     }
 
     /**
+     * 快速分页的会话缓存：按存储卷缓存句柄列表，外加「仅 JPG」的筛查结果。
+     * 卡内结构变化后（拍摄、删除、换卡）必须 {@link #clear()}。
+     */
+    public static final class PageCache {
+        final Map<Long, List<Long>> handles = new LinkedHashMap<>();
+        JpegIndex jpegIndex;
+
+        public void clear() {
+            handles.clear();
+            jpegIndex = null;
+        }
+    }
+
+    /**
+     * JPG 索引：把「句柄越大越新」的全量句柄序列按需筛查成 JPG 序列。
+     *
+     * <p>JPG 与否只能从 ObjectInfo 的文件名判断，所以「仅 JPG」分页必须逐个取 ObjectInfo；
+     * 但只在需要时往后扫（要第 N 页才扫到第 N 页所需的量），扫描结果缓存，
+     * 因此顺序往后翻只扫一遍，且页内对象在筛查时就已解析好，取页不再额外往返。
+     */
+    private static final class JpegIndex {
+        final List<Long> orderedHandles;
+        final List<CameraStorage.Item> jpegs = new ArrayList<>();
+        int scanned;
+        boolean scannedAll;
+
+        JpegIndex(List<Long> orderedHandles) {
+            this.orderedHandles = orderedHandles;
+        }
+
+        boolean hasUnscanned() {
+            return scanned < orderedHandles.size();
+        }
+    }
+
+    /**
      * 快速分页：只列句柄 + 只对当前页取 ObjectInfo。
      *
      * <p>句柄枚举做浅层目录探测（见 {@link #collectFileHandles}），句柄列表按
-     * 存储卷缓存在 {@code handleCache} 里，翻页时不再重新遍历。
+     * 存储卷缓存在 {@code cache} 里，翻页时不再重新遍历。
      *
      * <p>跨目录统一按句柄降序排列作为“最新在前”：相机通常在全卡范围内单调
      * 分配句柄（TBC-awaiting-hardware）；若不满足，页内顺序会与拍摄时间不符。
+     *
+     * <p>{@code jpegOnly=true} 时分页范围就是 JPG 本身：每页仍取 {@code pageSize} 张 JPG
+     * （不再掺入 RAW/视频把页面撑空），总数也是 JPG 张数。
      */
     public static CameraStorage.Page loadPage(
             Invoker invoker,
             int pageSize,
             int pageIndex,
-            Map<Long, List<Long>> handleCache) throws Exception {
+            boolean jpegOnly,
+            PageCache cache) throws Exception {
         int size = Math.max(1, pageSize);
         int index = Math.max(0, pageIndex);
+        PageCache store = cache == null ? new PageCache() : cache;
 
-        List<Long> orderedHandles = new ArrayList<>();
-        for (Long storageId : storageIds(invoker)) {
-            List<Long> handles = handleCache == null ? null : handleCache.get(storageId);
-            if (handles == null) {
-                handles = collectFileHandles(invoker, storageId);
-                if (handleCache != null) handleCache.put(storageId, handles);
-            }
-            orderedHandles.addAll(handles);
+        List<Long> orderedHandles = orderedHandles(invoker, store);
+        if (!jpegOnly) {
+            return allObjectPage(invoker, orderedHandles, size, index);
         }
-        orderedHandles.sort((left, right) -> Long.compare(right, left));
+        return jpegOnlyPage(invoker, orderedHandles, store, size, index);
+    }
 
+    /** 全部对象（含 RAW/视频）分页：总数即句柄计数。 */
+    private static CameraStorage.Page allObjectPage(
+            Invoker invoker, List<Long> orderedHandles, int size, int index) throws Exception {
         int total = orderedHandles.size();
         int from = Math.min(index * size, total);
         int to = Math.min(from + size, total);
         List<CameraStorage.Item> items = new ArrayList<>();
         for (Long handle : orderedHandles.subList(from, to)) {
-            byte[] info = invoker.invoke(GET_OBJECT_INFO, new long[]{handle});
-            if (CameraStorage.isAssociation(info)) continue; // 假设不成立时也不把它当文件
-            CameraStorage.Item item = CameraStorage.parseObjectInfo(handle, info);
+            CameraStorage.Item item = objectInfo(invoker, handle);
             if (item != null) items.add(item);
         }
         sortNewestFirst(items);
-        return new CameraStorage.Page(items, index, size, total, false);
+        return new CameraStorage.Page(items, index, size, total, false, false);
+    }
+
+    /**
+     * 「仅 JPG」分页：先把句柄序列筛查成 JPG 序列，再按 JPG 序列切片，
+     * 因此每页都是实打实的 {@code size} 张 JPG。
+     */
+    private static CameraStorage.Page jpegOnlyPage(
+            Invoker invoker, List<Long> orderedHandles, PageCache store, int size, int index)
+            throws Exception {
+        JpegIndex jpegs = store.jpegIndex;
+        // 句柄列表变了（新增/删除/换卡）就重扫：旧索引里的切片位置已对不上。
+        if (jpegs == null || !jpegs.orderedHandles.equals(orderedHandles)) {
+            jpegs = new JpegIndex(new ArrayList<>(orderedHandles));
+            store.jpegIndex = jpegs;
+        }
+        // 扫到“够本页用”为止：少于这个量下一页必然拿不满。
+        int needed = (index + 1) * size;
+        while (jpegs.jpegs.size() < needed && jpegs.hasUnscanned()) {
+            long handle = jpegs.orderedHandles.get(jpegs.scanned++);
+            CameraStorage.Item item = objectInfo(invoker, handle);
+            if (item != null && item.isJpeg()) jpegs.jpegs.add(item);
+        }
+        jpegs.scannedAll = !jpegs.hasUnscanned();
+
+        int total = jpegs.jpegs.size();
+        // 指定的页可能已不存在（上一页筛查后才发现没那么多 JPG）：退回最后一页而不是给空页。
+        int safeIndex = index > 0 && index * size >= total ? Math.max(0, (total - 1) / size) : index;
+        int from = Math.min(safeIndex * size, total);
+        int to = Math.min(from + size, total);
+        List<CameraStorage.Item> items = new ArrayList<>(jpegs.jpegs.subList(from, to));
+        sortNewestFirst(items);
+        return new CameraStorage.Page(items, safeIndex, size, total, false, !jpegs.scannedAll);
+    }
+
+    /** 取对象的 ObjectInfo 并解析；目录（关联对象）与解析不出的都当没有。 */
+    private static CameraStorage.Item objectInfo(Invoker invoker, long handle) throws Exception {
+        byte[] info = invoker.invoke(GET_OBJECT_INFO, new long[]{handle});
+        if (CameraStorage.isAssociation(info)) return null;
+        return CameraStorage.parseObjectInfo(handle, info);
+    }
+
+    /** 全量文件句柄，按“最新在前”排序（句柄大的在前）；句柄列表按存储卷缓存。 */
+    private static List<Long> orderedHandles(Invoker invoker, PageCache cache) throws Exception {
+        List<Long> orderedHandles = new ArrayList<>();
+        for (Long storageId : storageIds(invoker)) {
+            List<Long> handles = cache.handles.get(storageId);
+            if (handles == null) {
+                handles = collectFileHandles(invoker, storageId);
+                cache.handles.put(storageId, handles);
+            }
+            orderedHandles.addAll(handles);
+        }
+        orderedHandles.sort((left, right) -> Long.compare(right, left));
+        return orderedHandles;
     }
 
     /**

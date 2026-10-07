@@ -32,12 +32,9 @@ import java.nio.ByteOrder;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
 
@@ -88,6 +85,8 @@ public final class UsbPtpTransport implements CameraTransport {
     private static final int GET_OBJECT_INFO = 0x1008;
     private static final int GET_OBJECT = 0x1009;
     private static final int GET_THUMB = 0x100a;
+    /** 标准 PTP 删除对象（ISO 15740）：参数为对象句柄 + objectFormatCode(0)。 */
+    private static final int DELETE_OBJECT = 0x100b;
     /** Nikon 扩展：等待机身就绪 / 读取机内事件 / 拍摄到机身内存。 */
     private static final int DEVICE_READY = 0x90c8;
     private static final int GET_EVENT = 0x90c7;
@@ -121,9 +120,11 @@ public final class UsbPtpTransport implements CameraTransport {
     private int transaction;
     private String cameraName = "USB/PTP Camera";
     private CameraProfile profile;
-    /** 存储卡文件句柄缓存（存储卷 → 句柄）：快速分页翻页时不必重新遍历目录。 */
-    private final Map<Long, List<Long>> handleCache =
-            Collections.synchronizedMap(new LinkedHashMap<>());
+    /**
+     * 存储卡分页缓存（存储卷 → 句柄，以及「仅 JPG」的筛查结果）：
+     * 快速分页翻页时不必重新遍历目录，JPG 筛查结果也只算一遍。
+     */
+    private final StorageBrowser.PageCache pageCache = new StorageBrowser.PageCache();
 
     public UsbPtpTransport(Context context, PermissionGate permissionGate) {
         this.context = context.getApplicationContext();
@@ -202,15 +203,15 @@ public final class UsbPtpTransport implements CameraTransport {
     }
 
     @Override
-    public synchronized CameraStorage.Page listStoragePage(int pageSize, int pageIndex)
-            throws Exception {
+    public synchronized CameraStorage.Page listStoragePage(
+            int pageSize, int pageIndex, boolean jpegOnly) throws Exception {
         ensureConnected();
-        return StorageBrowser.loadPage(this::invokeOperation, pageSize, pageIndex, handleCache);
+        return StorageBrowser.loadPage(this::invokeOperation, pageSize, pageIndex, jpegOnly, pageCache);
     }
 
     @Override
     public void invalidateStorageCache() {
-        handleCache.clear();
+        pageCache.clear();
     }
 
     private byte[] invokeOperation(int operation, long[] parameters) throws Exception {
@@ -252,6 +253,17 @@ public final class UsbPtpTransport implements CameraTransport {
         drainPayload(header, 180_000);
         if (header.code != RESPONSE_OK) throw new PtpResponseException(header.code);
         return received;
+    }
+
+    /**
+     * 删除卡内对象（标准 {@code 0x100B DeleteObject}，参数 handle + objectFormatCode=0）。
+     * 任意格式都能删，与「只下载 JPEG」的下载限制无关；非 OK 响应码由 {@code transact} 抛
+     * {@link PtpResponseException} 交由上层汇报。
+     */
+    @Override
+    public synchronized void deleteObject(long handle) throws Exception {
+        ensureConnected();
+        transact(DELETE_OBJECT, new long[]{handle, 0}, null, 15_000);
     }
 
     /**
@@ -448,7 +460,7 @@ public final class UsbPtpTransport implements CameraTransport {
         usbManager = null;
         device = null;
         profile = null;
-        handleCache.clear();
+        pageCache.clear();
     }
 
     private void closeConnectionOnly() {

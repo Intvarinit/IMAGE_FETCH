@@ -70,6 +70,8 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int OPERATION_GET_OBJECT_INFO = 0x1008;
     private static final int OPERATION_GET_OBJECT = 0x1009;
     private static final int OPERATION_GET_THUMB = 0x100a;
+    /** 标准 PTP 删除对象（ISO 15740）：参数为对象句柄 + objectFormatCode(0)。 */
+    private static final int OPERATION_DELETE_OBJECT = 0x100b;
     /** 标准 PTP 快门（ISO 15740）。EOS 机型普遍不支持，回 0x2005。 */
     private static final int OPERATION_CAPTURE = 0x100e;
     /**
@@ -360,9 +362,11 @@ public final class PtpIpTransport implements CameraTransport {
      * 不需要任何额外 PTP 往返（见 {@link #awaitObjectAdded}）。
      */
     private volatile long objectAddedSeq;
-    /** 存储卡文件句柄缓存（存储卷 → 句柄）：快速分页翻页时不必重新遍历目录。 */
-    private final Map<Long, List<Long>> handleCache =
-            Collections.synchronizedMap(new LinkedHashMap<>());
+    /**
+     * 存储卡分页缓存（存储卷 → 句柄，以及「仅 JPG」的筛查结果）：
+     * 快速分页翻页时不必重新遍历目录，JPG 筛查结果也只算一遍。
+     */
+    private final StorageBrowser.PageCache pageCache = new StorageBrowser.PageCache();
     private final String initiatorName;
     /**
      * 发起方 GUID（InitCommandRequest 的 16 字节）：持久化后每次握手复用同一身份，
@@ -1823,16 +1827,16 @@ public final class PtpIpTransport implements CameraTransport {
     }
 
     @Override
-    public synchronized CameraStorage.Page listStoragePage(int pageSize, int pageIndex)
-            throws Exception {
+    public synchronized CameraStorage.Page listStoragePage(
+            int pageSize, int pageIndex, boolean jpegOnly) throws Exception {
         ensureConnected();
-        return StorageBrowser.loadPage(this::invokeOperation, pageSize, pageIndex, handleCache);
+        return StorageBrowser.loadPage(this::invokeOperation, pageSize, pageIndex, jpegOnly, pageCache);
     }
 
     @Override
     public void invalidateStorageCache() {
-        synchronized (handleCache) {
-            handleCache.clear();
+        synchronized (pageCache) {
+            pageCache.clear();
         }
     }
 
@@ -1858,6 +1862,22 @@ public final class PtpIpTransport implements CameraTransport {
                 new long[]{handle},
                 output,
                 progress);
+    }
+
+    /**
+     * 删除卡内对象（标准 {@code 0x100B DeleteObject}，参数 handle + objectFormatCode=0）。
+     * 任意格式都能删，与「只下载 JPEG」的下载限制无关。
+     *
+     * <p>动手前先排空 EOS 事件队列：{@code SetEventMode(1)} 后事件积压会让后续命令统一回
+     * {@code 0x2019}。排空失败不阻塞删除（它不是厂商命令，事件脏队列只会让相机回忙，
+     * 不排空时更容易撞上），因此这里忽略返回值。
+     */
+    @Override
+    public synchronized void deleteObject(long handle) throws Exception {
+        ensureConnected();
+        drainEosEvents();
+        int code = command(OPERATION_DELETE_OBJECT, transactionId++, new long[]{handle, 0});
+        if (code != RESPONSE_OK) throw rejected(code);
     }
 
     /**
@@ -2698,7 +2718,7 @@ public final class PtpIpTransport implements CameraTransport {
         canonEosMEncodingLearned = false;
         // 新会话下相机自己的对焦状态已重置，别把上一次的「可能还在对焦」带过来。
         canonAfMaybeRunning = false;
-        handleCache.clear();
+        pageCache.clear();
     }
 
     private static void closeQuietly(Closeable closeable) {

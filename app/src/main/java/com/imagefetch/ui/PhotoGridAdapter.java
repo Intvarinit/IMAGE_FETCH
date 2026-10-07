@@ -64,9 +64,12 @@ public final class PhotoGridAdapter extends BaseAdapter {
         notifyDataSetChanged();
     }
 
-    /** 切换选中。非 JPEG（RAW/视频）不能下载，因此拒绝选中。 */
+    /**
+     * 切换选中。任意格式都可选中：下载仍只处理 JPEG（非 JPEG 会在下载时被跳过），
+     * 但删除支持任意格式，因此不能因为「不能下载」就拒绝选中。
+     */
     public void toggle(CameraStorage.Item item) {
-        if (item == null || !item.isJpeg()) return;
+        if (item == null) return;
         if (selected.remove(item.handle) == null) selected.put(item.handle, item);
         notifyDataSetChanged();
         notifySelection();
@@ -143,20 +146,13 @@ public final class PhotoGridAdapter extends BaseAdapter {
         }
         caption.setText(String.format(
                 Locale.ROOT, "%s · %s", item.filename, readableSize(item.sizeBytes)));
-        // 右上角指示点：只有 JPEG 才可选中（RAW/视频不能下载，索性不给选择入口）。
+        // 右上角指示点：任意格式都可选中（选中可用于删除；下载只处理其中的 JPEG）。
         // 它自己消费点击（点它 = 切换选中），点缩略图其它区域仍走 GridView 的点击 = 放大预览。
-        if (item.isJpeg()) {
-            boolean checked = selected.containsKey(item.handle);
-            indicator.setVisibility(View.VISIBLE);
-            indicator.setSelected(checked);
-            indicator.setText(checked ? context.getString(R.string.selected_mark) : "");
-            indicator.setOnClickListener(view -> toggle(item));
-        } else {
-            indicator.setVisibility(View.GONE);
-            indicator.setSelected(false);
-            indicator.setText("");
-            indicator.setOnClickListener(null);
-        }
+        boolean checked = selected.containsKey(item.handle);
+        indicator.setVisibility(View.VISIBLE);
+        indicator.setSelected(checked);
+        indicator.setText(checked ? context.getString(R.string.selected_mark) : "");
+        indicator.setOnClickListener(view -> toggle(item));
         return cell;
     }
 

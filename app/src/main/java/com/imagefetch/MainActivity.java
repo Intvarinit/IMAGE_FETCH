@@ -92,6 +92,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private Button captureButton;
     private Button refreshButton;
     private Button downloadButton;
+    private Button deleteButton;
     private CheckBox exportToGalleryBox;
     private Button prevPageButton;
     private Button nextPageButton;
@@ -138,10 +139,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 当前页序号（从 0 开始）与是否处于“完整扫描”模式。 */
     private int currentPage;
     private boolean fullScanMode;
-    /** 图片栏是否只显示 JPG（默认开：只有 JPG 能下载，RAW 显示出来也没法用）。 */
+    /** 图片栏是否只显示 JPG（默认开：只有 JPG 能下载，RAW 显示出来也没法用）。
+     *  同时决定分页范围——「仅 JPG」时每页就是 {@code pageSize} 张 JPG。 */
     private boolean jpegOnly = true;
-    /** 最近一次读到的页（未过滤的原始数据）；切换格式过滤器时据此重渲染，不重读相机。 */
-    private CameraStorage.Page lastPage;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -156,6 +156,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureButton = findViewById(R.id.capture);
         refreshButton = findViewById(R.id.refresh);
         downloadButton = findViewById(R.id.download);
+        deleteButton = findViewById(R.id.delete);
         exportToGalleryBox = findViewById(R.id.exportToGallery);
         prevPageButton = findViewById(R.id.prevPage);
         nextPageButton = findViewById(R.id.nextPage);
@@ -267,6 +268,49 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             setBusy(true);
             coordinator.download(selected);
         });
+
+        deleteButton.setOnClickListener(view -> confirmDeleteSelected());
+    }
+
+    /**
+     * 删除所选：删除的是相机存储卡上的文件，删掉不可恢复，因此必须先二次确认。
+     * 与下载不同，<b>任意格式</b>都可删（CR3/RAW/视频也能选、也能删）。
+     */
+    private void confirmDeleteSelected() {
+        if (!coordinator.isConnected()) {
+            showError("请先连接相机。", null);
+            return;
+        }
+        final List<CameraStorage.Item> selected = gridAdapter.selectedItems();
+        if (selected.isEmpty()) {
+            showError("请先在图片栏点选要删除的图片。", null);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.delete_confirm_title)
+                .setMessage(getString(
+                        R.string.delete_confirm_message, selected.size(), previewNames(selected)))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.delete_confirm_action, (dialog, which) -> {
+                    statusView.setText("正在删除…");
+                    setBusy(true);
+                    coordinator.deleteObjects(selected);
+                })
+                .show();
+    }
+
+    /** 确认弹窗里只列前几个文件名，避免选中很多时弹窗被撑爆。 */
+    private static String previewNames(List<CameraStorage.Item> items) {
+        StringBuilder text = new StringBuilder();
+        int limit = Math.min(items.size(), 5);
+        for (int i = 0; i < limit; i++) {
+            if (text.length() > 0) text.append("\n");
+            text.append(items.get(i).filename);
+        }
+        if (items.size() > limit) {
+            text.append("\n… 等共 ").append(items.size()).append(" 个文件");
+        }
+        return text.toString();
     }
 
     /** 按当前模式读取指定页；快速分页只读该页，完整扫描首次整卡枚举后内存分页。 */
@@ -277,13 +321,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         coordinator.loadStoragePage(
                 target,
                 fullScanMode,
+                jpegOnly,
                 new CameraSessionCoordinator.StoragePageCallback() {
                     @Override public void onLoaded(CameraStorage.Page page) {
                         setBusy(false);
                         currentPage = page.pageIndex;
                         populate(page);
                         updatePager(page);
-                        statusView.setText("读取完成 · " + page.totalCount + " 张"
+                        statusView.setText("读取完成 · " + scopeLabel(page)
                                 + (page.complete ? "（完整扫描）" : "（快速分页）"));
                     }
 
@@ -294,16 +339,22 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 });
     }
 
+    /** 分页范围的说明文案：JPG 模式下总数是 JPG 张数，未筛查完时说明还可能更多。 */
+    private String scopeLabel(CameraStorage.Page page) {
+        if (!jpegOnly) return "共 " + page.totalCount + " 张";
+        return page.moreUnscanned
+                ? "JPG 已筛出 " + page.totalCount + " 张（还有对象未筛查）"
+                : "JPG 共 " + page.totalCount + " 张";
+    }
+
     private void updatePager(CameraStorage.Page page) {
         pageInfoView.setText(String.format(
                 Locale.ROOT,
-                "第 %d / %d 页 · 共 %d 张%s%s",
+                "第 %d / %d 页 · %s%s",
                 page.pageIndex + 1,
                 page.pageCount(),
-                page.totalCount,
-                page.complete ? "（完整扫描）" : "",
-                // 过滤后必须说明本页实显张数，否则“共 20 张却只看到 2 张”会被当成丢图。
-                jpegOnly ? " · 本页 JPG " + gridAdapter.getCount() + " 张" : ""));
+                scopeLabel(page),
+                page.complete ? "（完整扫描）" : ""));
         prevPageButton.setEnabled(page.hasPrevious());
         nextPageButton.setEnabled(page.hasNext());
     }
@@ -356,8 +407,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     private void updatePreviewToggle(Button toggle, CameraStorage.Item item) {
-        // 非 JPEG 无法下载，选中没有意义：直接藏掉，免得选完了却下不了。
-        toggle.setVisibility(item.isJpeg() ? View.VISIBLE : View.GONE);
+        // 任意格式都可选中（选中后既能删除，JPEG 还能下载），因此全部显示切换按钮。
+        toggle.setVisibility(View.VISIBLE);
         toggle.setText(gridAdapter.isSelected(item.handle)
                 ? R.string.preview_toggle_unselect
                 : R.string.preview_toggle_select);
@@ -769,8 +820,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     /**
-     * 格式过滤器：只影响图片栏显示（默认仅 JPG，因为只有 JPG 能下载）。
-     * 切换时用本地缓存的当前页重渲染，不重读相机。
+     * 格式过滤器：切换的是<b>分页范围</b>（「仅 JPG」时每页就是 pageSize 张 JPG），
+     * 所以必须重读相机——本地重渲染只会把已按另一种范围切好的页重新筛一遍，页码对不上。
      */
     private void setUpFormatFilterSpinner(boolean jpegOnlyConfigured) {
         String[] labels = {
@@ -789,10 +840,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 if (only == jpegOnly) return;
                 jpegOnly = only;
                 preferences.edit().putBoolean(PREF_JPEG_ONLY, only).apply();
-                if (lastPage != null) {
-                    populate(lastPage);
-                    updatePager(lastPage);
-                }
+                // 分页范围变了：回到第一页重读，页码/总数都按新范围算。
+                if (coordinator.isConnected()) goToPage(0);
             }
 
             @Override
@@ -928,6 +977,23 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             setBusy(false);
             // 下载已结束：清掉图片栏里之前的选中状态，避免看起来像还没下载。
             gridAdapter.clearSelection();
+        });
+    }
+
+    @Override
+    public void onDeleteFinished(int deleted, int failed, String failedNames) {
+        runOnUiThread(() -> {
+            setBusy(false);
+            gridAdapter.clearSelection();
+            if (deleted > 0) {
+                statusView.setText("已删除 " + deleted + " 个文件"
+                        + (failed > 0 ? "，失败 " + failed + " 个" : ""));
+            }
+            if (failed > 0) {
+                showError("有 " + failed + " 个文件删除失败：\n" + failedNames, null);
+            }
+            // 卡内已变：重读当前页，让删掉的文件从列表消失。
+            if (deleted > 0 && coordinator.isConnected()) goToPage(currentPage);
         });
     }
 
@@ -1083,29 +1149,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 填充图片栏，并异步逐张拉取缩略图（与相机事务串行，不会与下载交错）。 */
     private void populate(CameraStorage.Page page) {
-        lastPage = page;
-        List<CameraStorage.Item> visible = jpegOnly ? jpegItems(page.items) : page.items;
-        gridAdapter.setItems(visible);
+        gridAdapter.setItems(page.items);
         // 翻页后回到顶端：否则上一页的滚动位置会带过来，看起来像没换页。
         photoGrid.setSelection(0);
-        // 只给真正会显示的图取缩略图，RAW/视频在“仅 JPG”下不必浪费相机往返。
         coordinator.loadThumbnails(
-                new ArrayList<>(visible),
+                new ArrayList<>(page.items),
                 (handle, jpeg) -> gridAdapter.putThumbnailJpeg(handle, jpeg));
-    }
-
-    private static List<CameraStorage.Item> jpegItems(List<CameraStorage.Item> items) {
-        List<CameraStorage.Item> result = new ArrayList<>();
-        for (CameraStorage.Item item : items) {
-            if (item.isJpeg()) result.add(item);
-        }
-        return result;
     }
 
     private void setBusy(boolean busy) {
         captureButton.setEnabled(!busy);
         refreshButton.setEnabled(!busy);
         downloadButton.setEnabled(!busy);
+        deleteButton.setEnabled(!busy);
         connectUsbButton.setEnabled(!busy);
         fullScanButton.setEnabled(!busy);
         pageSizeSpinner.setEnabled(!busy);

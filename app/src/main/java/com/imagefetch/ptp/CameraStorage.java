@@ -123,6 +123,8 @@ public final class CameraStorage {
      *
      * @param complete 是否来自完整扫描。false 表示快速分页——总数为句柄计数，
      *                 顺序依赖“句柄越大越新”的通行行为（TBC-awaiting-hardware）。
+     * @param moreUnscanned 「仅 JPG」分页专用：还有对象没筛查完，{@code totalCount}
+     *                      只是目前已筛出的张数（后面可能更多）。其余情况恒为 false。
      */
     public static final class Page {
         public final List<Item> items;
@@ -130,14 +132,21 @@ public final class CameraStorage {
         public final int pageSize;
         public final int totalCount;
         public final boolean complete;
+        public final boolean moreUnscanned;
 
         public Page(
-                List<Item> items, int pageIndex, int pageSize, int totalCount, boolean complete) {
+                List<Item> items,
+                int pageIndex,
+                int pageSize,
+                int totalCount,
+                boolean complete,
+                boolean moreUnscanned) {
             this.items = Collections.unmodifiableList(new ArrayList<>(items));
             this.pageIndex = Math.max(0, pageIndex);
             this.pageSize = Math.max(1, pageSize);
             this.totalCount = Math.max(0, totalCount);
             this.complete = complete;
+            this.moreUnscanned = moreUnscanned;
         }
 
         /** 从完整扫描得到的对象列表切出指定页。 */
@@ -148,7 +157,7 @@ public final class CameraStorage {
             int from = Math.min(index * size, source.size());
             int to = Math.min(from + size, source.size());
             return new Page(
-                    new ArrayList<>(source.subList(from, to)), index, size, source.size(), true);
+                    new ArrayList<>(source.subList(from, to)), index, size, source.size(), true, false);
         }
 
         public int pageCount() {
@@ -160,7 +169,8 @@ public final class CameraStorage {
         }
 
         public boolean hasNext() {
-            return pageIndex + 1 < pageCount();
+            // 还有没筛查完的对象时，即使已到“已知最后一页”，下一页也可能有 JPG。
+            return pageIndex + 1 < pageCount() || moreUnscanned;
         }
     }
 

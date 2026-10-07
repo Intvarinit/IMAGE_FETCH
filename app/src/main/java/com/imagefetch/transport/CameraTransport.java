@@ -45,8 +45,13 @@ public interface CameraTransport extends Closeable {
     /**
      * 快速分页：只列文件句柄（浅层目录探测）并只对当前页取 ObjectInfo，
      * 大卡翻页无需整卡枚举。实现内部缓存句柄列表，翻页复用。
+     *
+     * @param jpegOnly true 时按 JPG 分页：每页 {@code pageSize} 张 JPG（不掺 RAW/视频），
+     *                 总数也是 JPG 张数。JPG 与否只能从 ObjectInfo 判断，因此实现按需
+     *                 逐个筛查并缓存结果——翻到第 N 页才扫到第 N 页所需的量。
      */
-    CameraStorage.Page listStoragePage(int pageSize, int pageIndex) throws Exception;
+    CameraStorage.Page listStoragePage(int pageSize, int pageIndex, boolean jpegOnly)
+            throws Exception;
 
     /** 存储卡结构变化后（拍摄、删除、换卡）清掉句柄缓存。 */
     default void invalidateStorageCache() {
@@ -61,6 +66,15 @@ public interface CameraTransport extends Closeable {
      */
     long downloadStorageObject(long handle, OutputStream output, ProgressListener progress)
             throws Exception;
+
+    /**
+     * 删除相机存储卡上的一个对象（标准 PTP {@code DeleteObject 0x100B}，
+     * 参数为对象句柄 + objectFormatCode=0）。删除与下载不同，<b>任意格式</b>都可删。
+     * 不支持的传输实现保持默认（抛 UnsupportedOperationException）。
+     */
+    default void deleteObject(long handle) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持删除相机文件");
+    }
 
     /**
      * 触发一次相机快门。

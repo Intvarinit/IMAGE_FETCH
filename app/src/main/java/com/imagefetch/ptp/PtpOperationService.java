@@ -57,8 +57,8 @@ public final class PtpOperationService {
     }
 
     /** 快速分页：只对当前页取 ObjectInfo，翻页复用句柄缓存。 */
-    public CameraStorage.Page page(int pageSize, int pageIndex) throws Exception {
-        return transport.listStoragePage(pageSize, pageIndex);
+    public CameraStorage.Page page(int pageSize, int pageIndex, boolean jpegOnly) throws Exception {
+        return transport.listStoragePage(pageSize, pageIndex, jpegOnly);
     }
 
     /** 存储卡结构变化后清掉句柄缓存。 */
@@ -133,6 +133,11 @@ public final class PtpOperationService {
             OutputStream output,
             CameraTransport.ProgressListener progress) throws Exception {
         return transport.downloadStorageObject(handle, output, progress);
+    }
+
+    /** 删除相机存储卡上的一个对象（标准 PTP DeleteObject 0x100B）；任意格式均可。 */
+    public void delete(long handle) throws Exception {
+        transport.deleteObject(handle);
     }
 
     public void assertHealthy() throws Exception {

@@ -10,6 +10,10 @@
     <string name="capture_and_fetch">拍摄并取回</string>
     <string name="refresh_storage">刷新存储卡</string>
     <string name="download_selected">下载所选</string>
+    <string name="delete_selected">删除所选</string>
+    <string name="delete_confirm_title">确认删除</string>
+    <string name="delete_confirm_message">将从相机存储卡删除以下 %1$d 个文件，删除后无法恢复：\n\n%2$s</string>
+    <string name="delete_confirm_action">删除</string>
     <string name="status_idle">未连接</string>
     <string name="export_to_gallery">保存到系统相册</string>
     <string name="previous_page">上一页</string>

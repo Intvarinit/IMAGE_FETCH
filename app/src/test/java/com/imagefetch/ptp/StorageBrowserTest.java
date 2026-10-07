@@ -14,7 +14,6 @@ import com.imagefetch.testutil.Bytes;
 import org.junit.Test;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -134,7 +133,7 @@ public class StorageBrowserTest {
 
         FakeCard fastCard = dcfCard(25);
         CameraStorage.Page first =
-                StorageBrowser.loadPage(fastCard.invoker(), 20, 0, new HashMap<>());
+                StorageBrowser.loadPage(fastCard.invoker(), 20, 0, false, new StorageBrowser.PageCache());
         int fastPageInfoCalls = fastCard.callCount(StorageBrowser.GET_OBJECT_INFO);
 
         assertEquals(20, first.items.size());
@@ -150,11 +149,11 @@ public class StorageBrowserTest {
     @Test
     public void handleCacheMakesPageTurnsCheap() throws Exception {
         FakeCard card = dcfCard(25);
-        Map<Long, List<Long>> cache = new HashMap<>();
-        StorageBrowser.loadPage(card.invoker(), 20, 0, cache);
+        StorageBrowser.PageCache cache = new StorageBrowser.PageCache();
+        StorageBrowser.loadPage(card.invoker(), 20, 0, false, cache);
         int afterFirstPage = card.callCount(StorageBrowser.GET_OBJECT_HANDLES);
 
-        StorageBrowser.loadPage(card.invoker(), 20, 1, cache);
+        StorageBrowser.loadPage(card.invoker(), 20, 1, false, cache);
 
         assertEquals(
                 "翻页不应重新遍历目录",
@@ -165,7 +164,7 @@ public class StorageBrowserTest {
     @Test
     public void lastPageHoldsTheRemainder() throws Exception {
         CameraStorage.Page last =
-                StorageBrowser.loadPage(dcfCard(25).invoker(), 20, 2, new HashMap<>());
+                StorageBrowser.loadPage(dcfCard(25).invoker(), 20, 2, false, new StorageBrowser.PageCache());
 
         assertEquals(10, last.items.size());
         assertTrue(last.hasPrevious());
@@ -175,7 +174,7 @@ public class StorageBrowserTest {
     @Test
     public void pageBeyondTheEndIsEmptyNotAnError() throws Exception {
         CameraStorage.Page page =
-                StorageBrowser.loadPage(dcfCard(5).invoker(), 20, 7, new HashMap<>());
+                StorageBrowser.loadPage(dcfCard(5).invoker(), 20, 7, false, new StorageBrowser.PageCache());
 
         assertTrue(page.items.isEmpty());
         assertEquals(10, page.totalCount);
@@ -192,7 +191,7 @@ public class StorageBrowserTest {
         }
 
         CameraStorage.Page page =
-                StorageBrowser.loadPage(card.invoker(), 20, 0, new HashMap<>());
+                StorageBrowser.loadPage(card.invoker(), 20, 0, false, new StorageBrowser.PageCache());
 
         assertEquals("扁平布局也必须全部找到", 12, page.totalCount);
         assertEquals(12, page.items.size());
@@ -201,7 +200,7 @@ public class StorageBrowserTest {
     @Test
     public void theNewestPageContainsTheLargestHandles() throws Exception {
         CameraStorage.Page page =
-                StorageBrowser.loadPage(dcfCard(3).invoker(), 3, 0, new HashMap<>());
+                StorageBrowser.loadPage(dcfCard(3).invoker(), 3, 0, false, new StorageBrowser.PageCache());
 
         List<String> names = new ArrayList<>();
         for (CameraStorage.Item item : page.items) names.add(item.filename);
@@ -209,6 +208,79 @@ public class StorageBrowserTest {
         assertTrue(names.contains("B_000.JPG"));
         assertTrue(names.contains("B_001.JPG"));
         assertTrue(names.contains("B_002.JPG"));
+    }
+
+    /** DCF 布局，每个目录里 JPG 与 CR3 交替（RAW+JPEG 同拍的真实样子）。 */
+    private static FakeCard mixedCard(int pairsPerFolder) {
+        FakeCard card = new FakeCard();
+        long dcim = card.folder(1L, "DCIM", ROOT);
+        long folder = card.folder(2L, "100CANON", dcim);
+        for (int index = 0; index < pairsPerFolder; index++) {
+            card.file(100L + index * 2, String.format("A_%03d.JPG", index), folder);
+            card.file(101L + index * 2, String.format("A_%03d.CR3", index), folder);
+        }
+        return card;
+    }
+
+    @Test
+    public void jpegOnlyPageHoldsAFullPageOfRealJpegs() throws Exception {
+        CameraStorage.Page page =
+                StorageBrowser.loadPage(mixedCard(10).invoker(), 4, 0, true, new StorageBrowser.PageCache());
+
+        assertEquals("每页就是 4 张 JPG，不掺 CR3", 4, page.items.size());
+        for (CameraStorage.Item item : page.items) {
+            assertTrue("仅 JPG 分页里不能出现 RAW：" + item.filename, item.isJpeg());
+        }
+        assertFalse(page.complete);
+        // 首页按需筛查：只知道“目前已筛出 4 张”，后面的对象还没看，总数还会涨。
+        assertEquals(4, page.totalCount);
+        assertTrue(page.moreUnscanned);
+        assertTrue("还有没筛查的对象，下一页必须可用", page.hasNext());
+    }
+
+    @Test
+    public void jpegOnlyLastPageHoldsTheRemainderOfJpegs() throws Exception {
+        CameraStorage.Page page =
+                StorageBrowser.loadPage(mixedCard(10).invoker(), 4, 2, true, new StorageBrowser.PageCache());
+
+        assertEquals(2, page.items.size());
+        for (CameraStorage.Item item : page.items) assertTrue(item.isJpeg());
+        assertTrue(page.hasPrevious());
+        assertFalse("已筛完全部对象就到底了", page.hasNext());
+        assertFalse(page.moreUnscanned);
+    }
+
+    @Test
+    public void jpegOnlyFirstPageDoesNotScanTheWholeCard() throws Exception {
+        FakeCard card = mixedCard(10); // 20 个文件，其中 10 张 JPG
+        StorageBrowser.loadPage(card.invoker(), 4, 0, true, new StorageBrowser.PageCache());
+
+        int infoCalls = card.callCount(StorageBrowser.GET_OBJECT_INFO);
+        // 3 次目录判定 + 若干文件筛查；远超（如整卡 20 张）就说明没按需筛查。
+        assertTrue("仅 JPG 首页不该扫完整卡，实际 ObjectInfo 调用 " + infoCalls + " 次", infoCalls <= 12);
+    }
+
+    @Test
+    public void jpegIndexIsCachedUntilTheCardChanges() throws Exception {
+        FakeCard card = mixedCard(3); // 3 JPG + 3 CR3
+        StorageBrowser.PageCache cache = new StorageBrowser.PageCache();
+
+        CameraStorage.Page first =
+                StorageBrowser.loadPage(card.invoker(), 4, 0, true, cache);
+        assertEquals("3 张 JPG 全筛完才知道", 3, first.totalCount);
+        assertFalse(first.moreUnscanned);
+        int afterFirst = card.callCount(StorageBrowser.GET_OBJECT_INFO);
+
+        // 同一页再读：筛查结果必须命中缓存，不再取 ObjectInfo。
+        StorageBrowser.loadPage(card.invoker(), 4, 0, true, cache);
+        assertEquals("筛查结果必须缓存", afterFirst, card.callCount(StorageBrowser.GET_OBJECT_INFO));
+
+        // 卡上多了个 JPG：拍摄/删除路径会作废缓存，重读必须看到新的。
+        card.file(500L, "NEW.JPG", 2L);
+        cache.clear();
+        CameraStorage.Page afterAdd =
+                StorageBrowser.loadPage(card.invoker(), 4, 0, true, cache);
+        assertEquals("作废缓存后必须重扫 JPG 索引", 4, afterAdd.totalCount);
     }
 
     @Test

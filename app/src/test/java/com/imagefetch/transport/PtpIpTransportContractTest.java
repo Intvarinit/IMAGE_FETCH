@@ -28,6 +28,9 @@ public class PtpIpTransportContractTest {
     private static final long OPEN_SESSION = 0x1002L;
     private static final long CAPTURE = 0x100eL;
     private static final long GET_OBJECT = 0x1009L;
+    private static final long DELETE_OBJECT = 0x100bL;
+    /** Canon EOS_GetEvent：删除前排空事件队列用。 */
+    private static final long GET_EVENT = 0x9116L;
     private static final long RESPONSE_OK = 0x2001L;
 
     @Test
@@ -142,6 +145,62 @@ public class PtpIpTransportContractTest {
                 assertArrayEquals(new long[]{0L, 0L}, captureParams.get());
                 assertEquals("OpenSession 后第一个事务号为 1", 1L, captureTransaction.get().longValue());
                 assertEquals("PTP/IP 拍摄后图像写入存储卡，不直接返回句柄", 0, handles.length);
+            } finally {
+                transport.close();
+            }
+        }
+    }
+
+    /** 删除必须走标准 0x100B DeleteObject，参数为句柄 + objectFormatCode(0)。 */
+    @Test
+    public void deleteObjectUsesStandardOperationWithHandleAndFormatZero() throws Exception {
+        AtomicReference<long[]> deleteParams = new AtomicReference<>();
+        try (FakePtpIpCamera camera = new FakePtpIpCamera("Fake Canon", (channel, operation, tx, params) -> {
+            if (operation == OPEN_SESSION) {
+                channel.respond(tx, RESPONSE_OK);
+            } else if (operation == GET_EVENT) {
+                // 删除前会先排空 EOS 事件队列：纯 ResponseOK 即「队列已空」。
+                channel.respond(tx, RESPONSE_OK);
+            } else if (operation == DELETE_OBJECT) {
+                deleteParams.set(params);
+                channel.respond(tx, RESPONSE_OK);
+            }
+        })) {
+            PtpIpTransport transport = new PtpIpTransport();
+            try {
+                transport.connect("127.0.0.1", camera.port());
+                transport.deleteObject(HANDLE);
+                assertArrayEquals(
+                        "DeleteObject 参数必须是句柄 + objectFormatCode=0",
+                        new long[]{HANDLE, 0L},
+                        deleteParams.get());
+            } finally {
+                transport.close();
+            }
+        }
+    }
+
+    /** 相机拒绝删除（如对象受保护）时，响应码必须作为异常上报，便于上层汇报单张失败。 */
+    @Test
+    public void deleteObjectSurfacesTheCameraRejectionCode() throws Exception {
+        try (FakePtpIpCamera camera = new FakePtpIpCamera("Fake Canon", (channel, operation, tx, params) -> {
+            if (operation == OPEN_SESSION) {
+                channel.respond(tx, RESPONSE_OK);
+            } else if (operation == GET_EVENT) {
+                channel.respond(tx, RESPONSE_OK);
+            } else if (operation == DELETE_OBJECT) {
+                channel.respond(tx, 0x2015L); // NoValidObjectInfo，代表相机拒绝删除
+            }
+        })) {
+            PtpIpTransport transport = new PtpIpTransport();
+            try {
+                transport.connect("127.0.0.1", camera.port());
+                try {
+                    transport.deleteObject(HANDLE);
+                    fail("相机拒绝时必须抛异常");
+                } catch (PtpResponseException expected) {
+                    assertEquals(0x2015, expected.responseCode);
+                }
             } finally {
                 transport.close();
             }
