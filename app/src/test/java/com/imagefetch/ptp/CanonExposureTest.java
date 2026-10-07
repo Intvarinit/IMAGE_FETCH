@@ -116,6 +116,31 @@ public class CanonExposureTest {
         assertEquals("30", CanonExposure.formatSeconds(30.0));
     }
 
+    @Test
+    public void 按相机允许值收窄取值表且保持原表顺序() {
+        List<CanonExposure.Entry> full = CanonExposure.entries(CanonExposure.Setting.APERTURE);
+        // allowed 故意乱序：结果必须仍按原表顺序（F2.8 → F8 → F22）。
+        int[] allowed = {0x0050, 0x0020, 0x0038};
+        List<CanonExposure.Entry> restricted =
+                CanonExposure.restrict(CanonExposure.Setting.APERTURE, allowed);
+        assertEquals(3, restricted.size());
+        assertEquals("2.8", restricted.get(0).label);
+        assertEquals("8", restricted.get(1).label);
+        assertEquals("22", restricted.get(2).label);
+        assertTrue("收窄只做子集，不应引入全表没有的档", full.containsAll(restricted));
+    }
+
+    @Test
+    public void 允许值为空或无命中时交回全表() {
+        List<CanonExposure.Entry> full = CanonExposure.entries(CanonExposure.Setting.ISO);
+        assertEquals("null 允许值应交回全表", full,
+                CanonExposure.restrict(CanonExposure.Setting.ISO, null));
+        assertEquals("空允许值应交回全表", full,
+                CanonExposure.restrict(CanonExposure.Setting.ISO, new int[0]));
+        assertEquals("一个都没命中也不能给空列表", full,
+                CanonExposure.restrict(CanonExposure.Setting.ISO, new int[]{0xdead}));
+    }
+
     private static int firstIndexOfLabel(List<CanonExposure.Entry> entries, String label) {
         for (int i = 0; i < entries.size(); i++) {
             if (entries.get(i).label.equals(label)) return i;

@@ -133,6 +133,35 @@ public interface CameraTransport extends Closeable {
     }
 
     /**
+     * 相机事件缓存里某个厂商属性的允许值列表（Canon {@code 0xC18A} 枚举，保持相机给的顺序）；
+     * 未知返回 {@code null}。界面据此把可选档位收窄到机身真正支持的子集。
+     */
+    default int[] supportedValues(int propertyCode) {
+        return null;
+    }
+
+    /**
+     * 读取对焦方式（Canon {@code 0xD1BA EOS_LvAfSystem}）的当前编码值。与
+     * {@link #readExposure} 同属 0xD1xx 一族，只能从事件缓存取。不支持的传输实现保持默认。
+     */
+    default long readFocusArea() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持对焦方式调整");
+    }
+
+    /** 写入对焦方式（机上编码值）。不支持的传输实现保持默认。 */
+    default void writeFocusArea(int value) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持对焦方式调整");
+    }
+
+    /**
+     * 把取景画面里的一个点设为对焦框（Canon {@code 0x915B EOS_TouchAfPosition}，
+     * <b>不触发</b>对焦）。{@code x}/{@code y} 为取景帧像素坐标。不支持的传输实现保持默认。
+     */
+    default void touchAfPosition(int x, int y) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持移动对焦框");
+    }
+
+    /**
      * 最近一次 {@link #capture()} 的厂商快门逐步诊断（每步响应码与应答载荷）。
      * 用于「快门回 OK 但相机没拍照」这类只能靠响应码判断的场景；无诊断时返回空串。
      */

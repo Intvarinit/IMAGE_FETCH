@@ -26,6 +26,15 @@
         android:textColor="#6B7280"
         android:textSize="12sp" />
 
+    <TextView
+        android:id="@+id/liveViewTapHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="@string/live_view_tap_focus_hint"
+        android:textColor="#6B7280"
+        android:textSize="11sp" />
+
     <include
         android:id="@+id/shutterRow"
         layout="@layout/view_exposure_row"
@@ -44,6 +53,29 @@
         layout="@layout/view_exposure_row"
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="52dp"
+            android:layout_height="wrap_content"
+            android:text="@string/af_mode_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <Spinner
+            android:id="@+id/afMode"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:contentDescription="@string/af_mode_label"
+            android:minWidth="120dp" />
+    </LinearLayout>
 
     <TextView
         android:layout_width="match_parent"

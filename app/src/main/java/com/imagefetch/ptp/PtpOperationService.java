@@ -108,6 +108,26 @@ public final class PtpOperationService {
         return transport.readExposure(setting);
     }
 
+    /** 相机事件缓存里某属性的允许值列表（Canon 0xC18A 枚举）；未知返回 null。 */
+    public int[] supportedValues(int propertyCode) {
+        return transport.supportedValues(propertyCode);
+    }
+
+    /** 读取对焦方式（Canon 0xD1BA）的当前编码值。 */
+    public long readFocusArea() throws Exception {
+        return transport.readFocusArea();
+    }
+
+    /** 写入对焦方式（机上编码值）。 */
+    public void writeFocusArea(int value) throws Exception {
+        transport.writeFocusArea(value);
+    }
+
+    /** 把取景画面里的一个点设为对焦框（取景帧像素坐标 x, y）；不触发对焦。 */
+    public void touchAfPosition(int x, int y) throws Exception {
+        transport.touchAfPosition(x, y);
+    }
+
     public long download(
             long handle,
             OutputStream output,

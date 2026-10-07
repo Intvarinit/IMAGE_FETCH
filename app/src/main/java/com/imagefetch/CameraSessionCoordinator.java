@@ -121,6 +121,23 @@ public final class CameraSessionCoordinator {
         void onExposureResult(CanonExposure.Setting setting, int index, String display, String error);
 
         /**
+         * 某档相机上报的可用取值（来自 0xC18A 允许值列表，已按 {@link CanonExposure#restrict}
+         * 收窄）。读取该档时先于 {@link #onExposureResult} 触发；界面据此换掉档位列表。
+         * 给默认空实现，便于既有实现/测试桩不必改动。
+         */
+        default void onExposureChoices(
+                CanonExposure.Setting setting, List<CanonExposure.Entry> choices) {
+        }
+
+        /**
+         * 对焦方式（0xD1BA）的可选值与当前值：{@code values} 为允许列表（相机顺序），
+         * {@code currentIndex} 为当前值在其中的下标（未知为 -1）；失败时 {@code values} 为 null、
+         * {@code error} 为原因。给默认空实现。
+         */
+        default void onFocusAreaResult(int[] values, int currentIndex, String error) {
+        }
+
+        /**
          * 一次「拍摄并取回」流程结束（含未取到 JPEG 与失败）。
          * 「未发现 JPEG」路径既不落盘也不报错，只发 onStatus，
          * 单靠 onFileSaved/onError 会把拍摄按钮永久留在禁用态。
@@ -136,6 +153,8 @@ public final class CameraSessionCoordinator {
     /** 拍后等待“写卡完成 + 新对象可读”的上限。 */
     private static final long CAPTURE_DISCOVERY_TIMEOUT_MS = 20000L;
     private static final long CAPTURE_POLL_INTERVAL_MS = 1000L;
+    /** Canon EOS 对焦方式属性码（0xD1BA EOS_LvAfSystem），与 transport 侧一致。 */
+    private static final int CANON_PROP_AF_METHOD = 0xd1ba;
 
     private final Context context;
     private final Listener listener;
@@ -1116,18 +1135,30 @@ public final class CameraSessionCoordinator {
             }
             try {
                 long raw = operations.readExposure(setting);
-                // 读取回的是机型自己的编码值（与写入同一套表），按表定位档位；
-                // 极少数机型可能回的是标准读数，再按标准换算兜一次。
-                int index = CanonExposure.indexOfValue(setting, (int) raw);
-                if (index < 0) index = CanonExposure.matchStandard(setting, raw);
+                // 相机上报的允许值列表（0xC18A）把可选档收窄到机身真正支持的子集；缓存为空时
+                // restrict 原样交回全表，行为与旧版一致。下标语义必须与界面/写入一致，都基于此列表。
+                List<CanonExposure.Entry> choices = CanonExposure.restrict(
+                        setting, operations.supportedValues(setting.vendorProperty));
+                int index = indexOfEntry(choices, (int) raw);
+                if (index < 0) {
+                    // 缓存里没这个值：退回全表按标准读数兜底换算；那个下标是全表的，列表也必须
+                    // 一并退回全表，否则界面拿到的下标会错位。
+                    int fallback = CanonExposure.matchStandard(setting, raw);
+                    if (fallback >= 0) {
+                        choices = CanonExposure.entries(setting);
+                        index = fallback;
+                    }
+                }
                 if (index < 0) {
                     mainHandler.post(() -> listener.onExposureResult(
                             setting, -1, null, "相机回的档位不在可选列表里"));
                     return;
                 }
+                final List<CanonExposure.Entry> resolvedChoices = choices;
                 final int resolved = index;
-                String display = CanonExposure.display(
-                        setting, CanonExposure.entries(setting).get(resolved).label);
+                String display = CanonExposure.display(setting, choices.get(index).label);
+                // 先换档位列表、再报当前值：两者都在主线程按序执行，界面拿到一致的下标。
+                mainHandler.post(() -> listener.onExposureChoices(setting, resolvedChoices));
                 mainHandler.post(() -> listener.onExposureResult(setting, resolved, display, null));
             } catch (Exception error) {
                 String message = error.getMessage() != null ? error.getMessage() : "读取失败";
@@ -1136,17 +1167,30 @@ public final class CameraSessionCoordinator {
         });
     }
 
-    /** 写入某个曝光参数的档位（{@code index} 为 {@link CanonExposure#entries} 的下标）。 */
+    /** 在给定档位列表里按机上编码值找下标；找不到返回 -1。 */
+    private static int indexOfEntry(List<CanonExposure.Entry> entries, int value) {
+        for (int i = 0; i < entries.size(); i++) {
+            if (entries.get(i).value == value) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * 写入某个曝光参数的档位（{@code index} 为「相机允许值收窄后列表」的下标，与
+     * {@link #readExposure} 及界面一致）。
+     */
     public void writeExposure(final CanonExposure.Setting setting, final int index) {
-        List<CanonExposure.Entry> entries = CanonExposure.entries(setting);
-        if (index < 0 || index >= entries.size()) return;
-        final CanonExposure.Entry entry = entries.get(index);
         executor.submit(() -> {
             if (!isConnected()) {
                 mainHandler.post(() -> listener.onExposureResult(
                         setting, -1, null, "请先连接相机。"));
                 return;
             }
+            // 下标语义与 readExposure/界面一致：都基于「相机允许值收窄后的列表」。
+            List<CanonExposure.Entry> entries = CanonExposure.restrict(
+                    setting, operations.supportedValues(setting.vendorProperty));
+            if (index < 0 || index >= entries.size()) return;
+            final CanonExposure.Entry entry = entries.get(index);
             try {
                 operations.writeExposure(setting, entry.value);
                 String display = CanonExposure.display(setting, entry.label);
@@ -1157,6 +1201,82 @@ public final class CameraSessionCoordinator {
                 // 如果不额外报一句，失败就被静默吞掉了。
                 mainHandler.post(() -> listener.onLiveViewStatus(setting.label + "写入失败：" + message));
                 mainHandler.post(() -> listener.onExposureResult(setting, -1, null, message));
+            }
+        });
+    }
+
+    /**
+     * 读取对焦方式（0xD1BA）：可选值列表（0xC18A 允许值）+ 当前值，交给面板的下拉框。
+     * 相机没给允许列表时退化为「只有当前值一个选项」，不把下拉框留空。
+     */
+    public void readFocusArea() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onFocusAreaResult(null, -1, "请先连接相机。"));
+                return;
+            }
+            try {
+                int raw = (int) operations.readFocusArea();
+                int[] allowed = operations.supportedValues(CANON_PROP_AF_METHOD);
+                if (allowed == null || allowed.length == 0) {
+                    allowed = new int[]{raw};
+                }
+                int index = -1;
+                for (int i = 0; i < allowed.length; i++) {
+                    if (allowed[i] == raw) {
+                        index = i;
+                        break;
+                    }
+                }
+                final int[] values = allowed;
+                final int current = index;
+                mainHandler.post(() -> listener.onFocusAreaResult(values, current, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "读取对焦方式失败";
+                mainHandler.post(() -> listener.onFocusAreaResult(null, -1, message));
+            }
+        });
+    }
+
+    /**
+     * 写入对焦方式。{@code value} 是机上编码值，取自 {@link #readFocusArea()} 回调里的列表
+     * （界面上是下拉框选项对应的原始值）。
+     */
+    public void writeFocusArea(final int value) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onLiveViewStatus("请先连接相机。"));
+                return;
+            }
+            try {
+                operations.writeFocusArea(value);
+                mainHandler.post(() -> listener.onLiveViewStatus(
+                        "对焦方式已切换为 0x" + String.format(Locale.ROOT, "%04X", value & 0xffff)));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "对焦方式写入失败";
+                mainHandler.post(() -> listener.onLiveViewStatus("对焦方式写入失败：" + message));
+            }
+        });
+    }
+
+    /**
+     * 把取景画面里的一个点设为对焦框（0x915B，<b>只移动对焦框、不触发对焦</b>）。
+     * 坐标由界面按取景帧像素坐标换算好再传进来。
+     */
+    public void touchAfPosition(final int x, final int y) {
+        executor.submit(() -> {
+            if (!isConnected() || !liveViewActive) {
+                mainHandler.post(() -> listener.onLiveViewStatus("实时取景未运行，无法移动对焦框。"));
+                return;
+            }
+            try {
+                operations.touchAfPosition(x, y);
+                mainHandler.post(() -> listener.onLiveViewStatus(
+                        "对焦框已移到取景区 (" + x + ", " + y
+                                + ")（0x915B；需相机为单点对焦方式才会响应）"));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "移动对焦框失败";
+                mainHandler.post(() -> listener.onLiveViewStatus("移动对焦框失败：" + message));
             }
         });
     }

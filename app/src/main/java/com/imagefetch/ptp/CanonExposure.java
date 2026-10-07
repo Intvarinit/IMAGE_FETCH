@@ -195,6 +195,32 @@ public final class CanonExposure {
         return SELECTABLE.get(setting);
     }
 
+    /**
+     * 按相机上报的允许值列表收窄取值表：沿用原表顺序，只留下 {@code value} 出现在
+     * {@code allowed} 里的档。
+     *
+     * <p>相机上报的允许值列表来自 {@code 0xC18A EOS_AvailListChanged} 事件（见
+     * transport 的事件缓存），本机型的机身支持的档位只是本表的一个子集（例如 M50 II 没有那么
+     * 高的 ISO、也没有 f/91）。{@code allowed} 为 null/空、或没有任何一档命中时一律交回**原表**
+     * ——绝不把空列表交给界面（否则档位行会变成不可选）。相机给的顺序不参与结果顺序，仍以本表为准。
+     */
+    public static List<Entry> restrict(Setting setting, int[] allowed) {
+        List<Entry> full = entries(setting);
+        if (allowed == null || allowed.length == 0) return full;
+        List<Entry> result = new ArrayList<>();
+        for (Entry entry : full) {
+            if (containsValue(allowed, entry.value)) result.add(entry);
+        }
+        return result.isEmpty() ? full : Collections.unmodifiableList(result);
+    }
+
+    private static boolean containsValue(int[] values, int target) {
+        for (int value : values) {
+            if (value == target) return true;
+        }
+        return false;
+    }
+
     /** 约定默认档（读取失败时用）：1/125、F4、ISO 100。 */
     public static int defaultIndex(Setting setting) {
         switch (setting) {

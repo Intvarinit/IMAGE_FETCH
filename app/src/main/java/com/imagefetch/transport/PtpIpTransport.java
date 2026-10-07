@@ -153,8 +153,46 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int CANON_EVF_OUTPUT_TFT = 0x01;
     /** 取景模式属性（写 1 = 开）。 */
     private static final int CANON_PROP_EVF_MODE = 0xd1b1;
+    /**
+     * Canon EOS 对焦方式属性 {@code 0xD1BA EOS_LvAfSystem}（整体 AF 方法：单点/区域等）。
+     * 与曝光三要素同属 0xD1xx 一族——没有同步读接口，当前值只能从 0x9116 事件缓存取、
+     * 经 0x9110 写入（见 {@link #readFocusArea()} / {@link #writeFocusArea(int)}）。
+     */
+    private static final int CANON_PROP_AF_METHOD = 0xd1ba;
 
-    private static final int OPERATION_GET_DEVICE_PROP_VALUE = 0x1015;
+    /**
+     * Canon EOS 请相机把某个 {@code 0xD1xx} 属性的当前值**推送**到事件队列
+     * （{@code 0x9127 EOS_RequestDevicePropValue}，1 个参数 = 属性码）。
+     *
+     * <p>EOS 的 0xD1xx 属性没有同步读接口——标准 {@code 0x1015 GetDevicePropValue} 对它
+     * 一律回 {@code 0x2005 DevicePropNotSupported}，旧版读路径因此永远读不到值。正确做法是
+     * 发这条请求走普通事务（与 0x9116 排空同一种事务，不是裸读），相机随后以 {@code 0xC189}
+     * 事件推回当前值，再从事件块里解析——libgphoto2 的
+     * {@code _ptp_canon_eos_requestdevicepropvalue}（config.c:8837 附近）也是这么做的。
+     */
+    private static final int CANON_REQUEST_DEVICE_PROP_VALUE = 0x9127;
+    /**
+     * Canon EOS 触摸对焦框定位 {@code 0x915B EOS_TouchAfPosition(type, x, y)}：无数据段、
+     * 3 个参数（ptp.h:5082）。libgphoto2 注释坐标是取景帧像素、约 64px 粒度（config.c:8861）；
+     * {@code type} 的语义上游从未定义，这里取 0。
+     */
+    private static final int CANON_TOUCH_AF_POSITION = 0x915b;
+
+    /** 事件块 TLV 记录类型：属性当前值变化（{@code 0xC189 EOS_PropValueChanged}）。 */
+    private static final int CANON_EVENT_PROP_VALUE_CHANGED = 0xc189;
+    /** 事件块 TLV 记录类型：属性允许值列表变化（{@code 0xC18A EOS_AvailListChanged}）。 */
+    private static final int CANON_EVENT_AVAIL_LIST_CHANGED = 0xc18a;
+    /** 0xC18A 记录里 {@code propxtype=3} 才表示「枚举」；1/7 等是别的类型，不能当枚举解。 */
+    private static final int CANON_PROPX_TYPE_ENUM = 3;
+
+    /**
+     * 等相机把某个 0xD1xx 属性的当前值推到事件队列时的排空轮数上限与间隔。EOS「偶尔会先回一批
+     * 空事件，多半是主机问得太快」，libgphoto2 因此用 10 次 × 50ms 重试（config.c:429-436）。
+     */
+    private static final int CANON_PROP_PUSH_ATTEMPTS = 10;
+    private static final long CANON_PROP_PUSH_INTERVAL_MS = 50L;
+    /** 等待属性推送的总预算：兜住最坏时长，避免命令锁被占太久。 */
+    private static final long CANON_PROP_PUSH_BUDGET_MS = 1000L;
 
     /** 0x9153 的固定参数（libgphoto2 抓包值：0x00200000, 0, 0）。 */
     private static final long CANON_VIEWFINDER_PARAMETER = 0x0020_0000L;
@@ -842,6 +880,9 @@ public final class PtpIpTransport implements CameraTransport {
             } catch (Exception failure) {
                 return "0x9116 GetEvent 排空失败：" + describe(failure);
             }
+            // 顺手把这一块里的 0xC189/0xC18A 事件收进缓存：0xD1xx 属性的当前值与允许值列表
+            // 只能从这里攒（见 harvestEosEventBlock）。
+            harvestEosEventBlock(block, canonPropValues, canonPropEnums);
             if (isEmptyEosEventBlock(block)) return null;
         }
         // 撞上限说明事件还在往外冒，队列**没排干净**。这里必须报出来：返回 null 会被上层
@@ -876,6 +917,7 @@ public final class PtpIpTransport implements CameraTransport {
                 // 队列已空（相机回纯 ResponseOK）：本轮没读到按钮事件。
                 return null;
             }
+            harvestEosEventBlock(block, canonPropValues, canonPropEnums);
             if (block.length < 8) return null;
             Integer button = parseButtonEvent(block);
             if (button != null) return button;
@@ -894,6 +936,75 @@ public final class PtpIpTransport implements CameraTransport {
             if (digit >= 0 && digit <= 9) return digit;
         }
         return null;
+    }
+
+    /**
+     * 把一段 {@code 0x9116 GetEvent} 数据段里的 TLV 记录收进两个缓存。记录序列为
+     * {@code [u32 size][u32 code][payload…]}，{@code size} **含** 8 字节头
+     * （libgphoto2 {@code ptp_unpack_EOS_events}，ptp-pack.c:1869-1899）。
+     *
+     * <p>只关心两类：{@code 0xC189} 属性当前值（收进 {@code values}）与 {@code 0xC18A}
+     * 属性允许值列表（收进 {@code enums}，仅 {@code propxtype==3} 的枚举）。相机积攒很久的
+     * 事件块里会混着属性描述等其它记录，逐个跳过即可。终止条件与 libgphoto2 对齐：记录头不足
+     * 8 字节、{@code size==8 && code==0}（相机的「没有更多事件」标记，ptp-pack.c:1881）、
+     * 或声明长度越界，都立刻停止而不报错——截断/未知记录一律忽略。
+     *
+     * <p>做成 {@code static} 且只操作传入的两个 Map，便于脱离 socket 单测（见 EosEventHarvestTest）。
+     */
+    static void harvestEosEventBlock(
+            byte[] block, Map<Integer, Long> values, Map<Integer, int[]> enums) {
+        if (block == null) return;
+        int offset = 0;
+        while (offset + 8 <= block.length) {
+            long size = u32(block, offset);
+            long code = u32(block, offset + 4);
+            if (size < 8 || (size == 8 && code == 0) || offset + size > block.length) break;
+            int recordSize = (int) size;
+            if (code == CANON_EVENT_PROP_VALUE_CHANGED) {
+                int property = recordProperty(block, offset, recordSize);
+                long value = propValueOf(block, offset, recordSize);
+                if (property >= 0 && value >= 0) values.put(property, value);
+            } else if (code == CANON_EVENT_AVAIL_LIST_CHANGED) {
+                int property = recordProperty(block, offset, recordSize);
+                int[] allowed = propEnumOf(block, offset, recordSize);
+                if (property >= 0 && allowed != null) enums.put(property, allowed);
+            }
+            offset += recordSize;
+        }
+    }
+
+    /** TLV 记录里的属性码（payload +0x08）；记录太短返回 -1。 */
+    private static int recordProperty(byte[] block, int offset, int size) {
+        return size >= 0x0c ? (int) u32(block, offset + 0x08) : -1;
+    }
+
+    /**
+     * 0xC189 记录的属性当前值（payload +0x0c）。曝光/ISO/AF 方法都是 DataType
+     * {@code PTP_DTC_UINT16}（ptp-pack.c:2214-2216），故只取低 16 位；先按 4 字节值读
+     * （多数固件按 u32 对齐），实在只有 2 字节时才读 u16。太短返回 -1。
+     */
+    private static long propValueOf(byte[] block, int offset, int size) {
+        if (size >= 0x10) return u32(block, offset + 0x0c) & 0xffffL;
+        if (size >= 0x0e) return u16(block, offset + 0x0c) & 0xffffL;
+        return -1;
+    }
+
+    /**
+     * 0xC18A 记录的允许值列表（payload +0x08 属性码、+0x0c propxtype、+0x10 个数、
+     * +0x14 起每项 4 字节且值在低 2 字节，libgphoto2 stride 4，ptp-pack.c:2073）。
+     * 只有 {@code propxtype==3} 才是枚举，1/7 等其它类型返回 {@code null} 忽略；
+     * 个数为 0、声明长度不足或数组越界时同样返回 {@code null}。
+     */
+    private static int[] propEnumOf(byte[] block, int offset, int size) {
+        if (size < 0x14) return null;
+        if (u32(block, offset + 0x0c) != CANON_PROPX_TYPE_ENUM) return null;
+        long count = u32(block, offset + 0x10);
+        if (count <= 0 || count > 0x1000 || size < 0x14 + 4 * count) return null;
+        int[] allowed = new int[(int) count];
+        for (int index = 0; index < count; index++) {
+            allowed[index] = u16(block, offset + 0x14 + 4 * index);
+        }
+        return allowed;
     }
 
     /**
@@ -1120,6 +1231,18 @@ public final class PtpIpTransport implements CameraTransport {
      */
     private boolean canonAfMaybeRunning;
 
+    /**
+     * 事件缓存：{@code 0xC189 EOS_PropValueChanged} 推来的「属性当前值」（属性码 → 机上编码值）。
+     * EOS 的 0xD1xx 属性没有同步读接口，当前值只能从 0x9116 事件块里攒——见
+     * {@link #harvestEosEventBlock}。只在 synchronized 方法里读写，锁即 transport 实例锁。
+     */
+    private final Map<Integer, Long> canonPropValues = new LinkedHashMap<>();
+    /**
+     * 事件缓存：{@code 0xC18A EOS_AvailListChanged} 推来的「属性允许值列表」
+     * （属性码 → 取值数组，保持相机给的顺序）。界面用它把曝光档位收窄到机身真正支持的子集。
+     */
+    private final Map<Integer, int[]> canonPropEnums = new LinkedHashMap<>();
+
 
     /**
      * 单次自动对焦（{@code 0x9154 EOS_DoAf}，无参数）。对焦过程由相机完成，本方法在相机
@@ -1131,6 +1254,12 @@ public final class PtpIpTransport implements CameraTransport {
         ensureCanonRemoteMode();
         // 事件积压会让相机对厂商命令统一回 0x2019 DeviceBusy，对焦就会「看起来没用」。
         drainEosEvents();
+        // 上一次对焦（或拍摄，快门本身就带 AF）留下的对焦驱动若还没结束，这一次 0x9154
+        // 会被相机直接拒掉。真机症状正是「自动对焦只有第一次生效，之后必须先调一次三要素
+        // 才能对焦」——调档位会走 writeExposure → cancelCanonAutofocus() 把对焦停掉，
+        // 于是下一次对焦又能动了。libgphoto2 把 DoAf 与 AfCancel 配成同一个 toggle
+        // （config.c:8419-8431），这里照做。
+        cancelCanonAutofocus();
         int response = command(CANON_DO_AF, transactionId++, new long[0]);
         // 0x2019 是「暂时忙」而不是不支持，退避重试几次再判定失败。上一版把 DeviceBusy
         // 当成功直接返回，表现就是「按了对焦没反应」——错误被静默吞掉了。
@@ -1257,27 +1386,139 @@ public final class PtpIpTransport implements CameraTransport {
      * 读取曝光参数的当前编码值，取值与 {@link #writeExposure} 同一套 {@link CanonExposure} 表值，
      * 由调用方用 {@link CanonExposure#indexOfValue} 换算成档位。
      *
-     * <p>按厂商属性码走标准 {@code 0x1015 GetDevicePropValue}。EOS 对 0xD1xx 一族属性的读取很挑剔，
-     * 相机不认时只回一个正常的拒绝响应（0x2005）——会话不受影响，上层把该档显示成「—」，
-     * 用户仍可手动选择档位。
+     * <p>EOS 的 0xD1xx 属性没有同步读接口：标准 {@code 0x1015 GetDevicePropValue} 对它一律回
+     * {@code 0x2005 DevicePropNotSupported}，旧版按 0x1015 读的路径因此永远读不到值（面板从不与
+     * 机身同步）。正确做法是从 {@code 0x9116 GetEvent} 事件块里取 {@code 0xC189} 推送的当前值；
+     * 缓存里没有时再补发一次 {@code 0x9127 RequestDevicePropValue} 请相机推。
+     * libgphoto2 走的正是这条路：{@code ptp_canon_eos_getdevicepropdesc} 直接从 eos 事件派生的
+     * 属性描述缓存里取值（ptp.c:3757-3769），一般 PTP 路径对 Canon 厂商属性段也一律改走这个缓存、
+     * 查不到就回 {@code PTP_RC_DevicePropNotSupported}（ptp.c:4760-4779）；缓存的填充靠
+     * {@code ptp_check_eos_events}（ptp.c:3733-3743），开机后先 request 一批属性再反复 check
+     * （config.c:400-436）。
      *
-     * <p>读之前先排空事件队列（0x9116）：不排空时相机对厂商命令统一回 0x2019 DeviceBusy。
-     * 排空走的是 {@link #commandWithData} 的正常事务，队列为空时相机回纯 ResponseOK，
-     * 这条路径已被上一版真机验证不会串包——与早期直接裸读 0x9127/0x9116 的写法不同。
+     * <p>读之前先 {@code ensureCanonRemoteMode()}（相机只在 SetEventMode(1) 之后才推这些属性），
+     * 再排空一次事件队列（不排空时相机对厂商命令统一回 0x2019 DeviceBusy）。
      */
     @Override
     public synchronized long readExposure(CanonExposure.Setting setting) throws Exception {
         ensureConnected();
-        // 同 writeExposure：事件积压时读取也会被回 DeviceBusy，档位就会显示成「—」。
+        ensureCanonRemoteMode();
+        return readCanonProperty(setting.vendorProperty, setting.label);
+    }
+
+    /**
+     * 取一个 {@code 0xD1xx} 属性的当前值：先看事件缓存，没有就发 {@code 0x9127} 请相机推一次，
+     * 然后在若干轮 0x9116 排空里等它出现；等不到抛中文错误（不丢裸响应码给用户）。
+     *
+     * <p>为什么要等若干轮：libgphoto2 在 config.c:429-436 明确写了 EOS「偶尔会先回一批空事件，
+     * 多半是主机问得太快」，于是它用 10 次 × 50ms 的 {@code ptp_check_eos_events} 重试等属性到齐。
+     * 这里照做，并用一个总预算兜住等待时长，避免把命令锁占太久。
+     */
+    private long readCanonProperty(int propertyCode, String label) throws Exception {
         drainEosEvents();
-        byte[] data = commandWithData(
-                OPERATION_GET_DEVICE_PROP_VALUE,
+        Long cached = canonPropValues.get(propertyCode);
+        if (cached != null) return cached;
+        // 缓存里没有：请相机把该属性推一次（这条请求自己被拒也不影响后面的等待）。
+        requestCanonProperty(propertyCode);
+        String drainFailure = null;
+        long deadline = System.currentTimeMillis() + CANON_PROP_PUSH_BUDGET_MS;
+        for (int attempt = 0; attempt < CANON_PROP_PUSH_ATTEMPTS; attempt++) {
+            String failure = drainEosEvents();
+            if (failure != null) drainFailure = failure;
+            cached = canonPropValues.get(propertyCode);
+            if (cached != null) return cached;
+            if (attempt + 1 >= CANON_PROP_PUSH_ATTEMPTS) break;
+            if (System.currentTimeMillis() >= deadline) break;
+            Thread.sleep(CANON_PROP_PUSH_INTERVAL_MS);
+        }
+        throw new IOException("相机没有推送 " + label + "（0x"
+                + Integer.toHexString(propertyCode) + "）的当前值"
+                + (drainFailure == null ? "" : "\n" + drainFailure));
+    }
+
+    /**
+     * {@code 0x9127}：请相机把某属性的当前值推到事件队列。走普通事务（不是裸读），该请求自身
+     * 不带数据段，相机通常只回纯 ResponseOK——故用 {@link #commandWithData} 并对「纯响应」这种
+     * 正常情形放行（与 {@link #drainEosEvents()} 判空是同一种写法）。
+     *
+     * <p>这条请求是尽力而为：相机明确应答了（哪怕是 0x2005 之类的拒绝）说明通道正常，值也可能
+     * 已经推来了，所以一律吞掉；真读不到由 {@link #readCanonProperty} 报统一的中文错误，
+     * 不把裸响应码丢给用户。
+     */
+    private void requestCanonProperty(int propertyCode) {
+        try {
+            commandWithData(
+                    CANON_REQUEST_DEVICE_PROP_VALUE,
+                    transactionId++,
+                    new long[]{propertyCode});
+        } catch (PtpResponseException answered) {
+            // 相机应答即可，拒绝不影响后面的等待。
+        } catch (Exception ignored) {
+            // 超时等失败同样不影响：值可能已经推到队列里，后面照常排空。
+        }
+    }
+
+    /**
+     * 读取对焦方式（{@code 0xD1BA EOS_LvAfSystem}）的当前编码值。取值路径与
+     * {@link #readExposure} 相同：0xD1xx 只能从 0x9116 事件缓存的 {@code 0xC189} 取，
+     * 缓存没有就补一次 0x9127。
+     */
+    @Override
+    public synchronized long readFocusArea() throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        return readCanonProperty(CANON_PROP_AF_METHOD, "对焦方式");
+    }
+
+    /**
+     * 写入对焦方式（{@code 0xD1BA}，机上编码值）。序列与 {@link #writeExposure} 完全一致：
+     * 先排空事件、停掉可能还在跑的对焦驱动，再经 0x9110 写入并对 0x2019 DeviceBusy 退避重试，
+     * 重试仍失败就重建遥控态后补写一次。
+     */
+    @Override
+    public synchronized void writeFocusArea(int value) throws Exception {
+        ensureConnected();
+        String drainFailure = drainEosEvents();
+        cancelCanonAutofocus();
+        int code = writeCanonPropertyRetrying(CANON_PROP_AF_METHOD, value & 0xffffL);
+        if (code == RESPONSE_DEVICE_BUSY) {
+            rebuildCanonStateAfterBusy();
+            code = writeCanonProperty(CANON_PROP_AF_METHOD, value & 0xffffL);
+        }
+        if (code != RESPONSE_OK) {
+            throw new IOException("对焦方式写入被相机拒绝（0x9110 属性 d1ba，值 0x"
+                    + Integer.toHexString(value & 0xffff) + "）：" + hexCode(code)
+                    + (drainFailure == null ? "" : "\n" + drainFailure), rejected(code));
+        }
+    }
+
+    /**
+     * 把取景画面里的一个点设为对焦框（{@code 0x915B EOS_TouchAfPosition}，<b>不触发</b>对焦）。
+     * {@code x}/{@code y} 是取景帧像素坐标（config.c:8861）；{@code type} 语义上游未定义，取 0。
+     */
+    @Override
+    public synchronized void touchAfPosition(int x, int y) throws Exception {
+        ensureConnected();
+        drainEosEvents();
+        int response = command(
+                CANON_TOUCH_AF_POSITION,
                 transactionId++,
-                new long[]{setting.vendorProperty});
-        if (data.length >= 4) return u32(data, 0);
-        if (data.length >= 2) return u16(data, 0);
-        throw new IOException("相机没有返回属性 0x"
-                + Integer.toHexString(setting.vendorProperty) + " 的值");
+                new long[]{0L, x & 0xffff_ffffL, y & 0xffff_ffffL});
+        if (response != RESPONSE_OK) {
+            throw new IOException("相机拒绝了对焦框移动（0x915B）：" + hexCode(response),
+                    rejected(response));
+        }
+        drainEosEvents();
+    }
+
+    /**
+     * 事件缓存里某个属性的允许值列表（0xC18A 枚举，保持相机顺序）；未知返回 {@code null}。
+     * 返回副本，避免调用方改动缓存。
+     */
+    @Override
+    public synchronized int[] supportedValues(int propertyCode) {
+        int[] allowed = canonPropEnums.get(propertyCode);
+        return allowed == null ? null : allowed.clone();
     }
 
     /** 0x9110 写厂商属性，返回响应码（由调用方决定哪些码可以容忍）。 */

@@ -41,6 +41,8 @@
     <string name="exposure_plus">+</string>
     <string name="exposure_unknown">—</string>
     <string name="exposure_hint">点数值直接选档，−/+ 逐档调整</string>
+    <string name="af_mode_label">对焦方式</string>
+    <string name="live_view_tap_focus_hint">点按预览可移动对焦框（只移动、不触发对焦；需相机为单点对焦方式才会响应）</string>
     <string name="pick_wifi">选择 Wi&#8209;Fi</string>
     <string name="pick_wifi_hint">已打开系统 Wi&#8209;Fi 设置；连上相机热点后回到本页即可连接。</string>
     <string name="session_notification_title">IMAGE_FETCH</string>

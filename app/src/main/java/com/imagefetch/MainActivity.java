@@ -11,6 +11,7 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.net.wifi.WifiInfo;
@@ -20,6 +21,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
@@ -113,6 +115,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private Button captureAutofocusButton;
     /** 取景画面尺寸下拉框（相机端推流分辨率）；面板关闭后置空。 */
     private Spinner liveViewSizeSpinner;
+    /** 对焦方式（0xD1BA）下拉框；面板关闭后置空。 */
+    private Spinner afModeSpinner;
+    /** 对焦方式下拉框各项对应的机上编码值（与选项同序）；未读到时为 null。 */
+    private int[] afModeValues;
+    /**
+     * 下拉框当前由程序设定的对焦方式编码值。选中回调可能是异步到达的（setAdapter/setSelection
+     * 之后才触发），用它把「程序填充」与「用户点选」区分开——否则刚读回来的当前值会被当成
+     * 用户选择又写回相机。
+     */
+    private int lastAppliedAfValue;
     private final List<ExposureRow> exposureRows = new ArrayList<>();
     /** 当前显示的取景帧；换帧后延迟回收，避免渲染线程仍在读它。 */
     private Bitmap liveViewBitmap;
@@ -377,6 +389,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureShootButton = content.findViewById(R.id.captureShoot);
         captureAutofocusButton = content.findViewById(R.id.captureAutofocus);
         liveViewSizeSpinner = content.findViewById(R.id.liveViewSize);
+        afModeSpinner = content.findViewById(R.id.afMode);
 
         // 取景是 3:2 画面：给黑底定一个固定高度，换帧时弹窗高度才不会跟着抖动。
         // 比例不能太大——预览是弹窗里最高的一块，占满后下面的档位行和拍摄按钮会被挤出
@@ -384,6 +397,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         ViewGroup.LayoutParams imageParams = liveViewImage.getLayoutParams();
         imageParams.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.28f);
         liveViewImage.setLayoutParams(imageParams);
+
+        // 点按预览只移动对焦框、不触发对焦（用户明确要求：对焦另走「自动对焦」按钮）。
+        liveViewImage.setOnTouchListener((view, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_UP) {
+                moveFocusPointAt(event.getX(), event.getY());
+            }
+            return true;
+        });
 
         exposureRows.clear();
         exposureRows.add(bindExposureRow(
@@ -399,6 +420,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             coordinator.autofocus();
         });
         setUpLiveViewSizeSpinner();
+        setUpAfModeSpinner();
 
         captureDialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.capture_panel_title)
@@ -408,9 +430,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureDialog.setOnDismissListener(ignored -> closeCapturePanel());
         captureDialog.show();
 
-        // 先读三档当前值再开取景：开取景的退避重试最多会占用 executor 数秒，
+        // 先读三档当前值与对焦方式再开取景：开取景的退避重试最多会占用 executor 数秒，
         // 排在后面会让参数迟迟显示不出来。
         for (ExposureRow row : exposureRows) coordinator.readExposure(row.setting);
+        coordinator.readFocusArea();
         coordinator.startLiveView();
     }
 
@@ -429,6 +452,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureShootButton = null;
         captureAutofocusButton = null;
         liveViewSizeSpinner = null;
+        afModeSpinner = null;
+        afModeValues = null;
+        lastAppliedAfValue = 0;
         exposureRows.clear();
         // 先撤掉延迟回收任务，再回收当前帧；被撤掉的旧帧交给 GC 即可。
         deferredRecycle.removeCallbacksAndMessages(null);
@@ -474,9 +500,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private ExposureRow bindExposureRow(View parent, int rowId, CanonExposure.Setting setting) {
         View row = parent.findViewById(rowId);
         ((TextView) row.findViewById(R.id.rowLabel)).setText(setting.label);
+        // 先按全表显示，读到相机允许值列表（onExposureChoices）后再收窄。
         List<CanonExposure.Entry> entries = CanonExposure.entries(setting);
-        ExposureRow result = new ExposureRow(
-                setting, row.findViewById(R.id.rowValue), entries.size());
+        ExposureRow result = new ExposureRow(setting, row.findViewById(R.id.rowValue), entries);
         // 先按约定默认档显示，读到相机真实值后再覆盖。
         int fallback = CanonExposure.defaultIndex(setting);
         result.index = fallback < 0 ? 0 : fallback;
@@ -486,6 +512,67 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         row.findViewById(R.id.rowMinus).setOnClickListener(view -> stepExposure(result, -1));
         row.findViewById(R.id.rowPlus).setOnClickListener(view -> stepExposure(result, 1));
         return result;
+    }
+
+    /**
+     * 对焦方式下拉框：选项来自相机上报的 0xD1BA 允许值列表（读完才填），切换后写回 0xD1BA。
+     * 标签里的编码是原始机上值——0xD1BA 的语义 libgphoto2 未定义，暂不做中文命名，
+     * 等真机把编码与「单点/区域」等对应起来再改。
+     */
+    private void setUpAfModeSpinner() {
+        if (afModeSpinner == null) return;
+        // 先放一个占位项，等 onFocusAreaResult 拿到真实列表再替换。
+        setAfSpinnerPlaceholder("读取中…");
+        afModeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (afModeValues == null) return;
+                if (position < 0 || position >= afModeValues.length) return;
+                int value = afModeValues[position];
+                // 与程序当前设定一致说明只是填充/重复选中，不需要写回相机。
+                if (value == lastAppliedAfValue) return;
+                lastAppliedAfValue = value;
+                coordinator.writeFocusArea(value);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
+    /** 用真实可选值填充下拉框（{@code selectedIndex < 0} 表示选第一项）。 */
+    private void setAfSpinnerItems(int[] values, int selectedIndex) {
+        if (afModeSpinner == null) return;
+        String[] labels = new String[values.length];
+        for (int i = 0; i < values.length; i++) labels[i] = afModeLabel(values[i]);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        afModeSpinner.setAdapter(adapter);
+        int selected = (selectedIndex >= 0 && selectedIndex < values.length) ? selectedIndex : 0;
+        afModeSpinner.setSelection(selected);
+        lastAppliedAfValue = values[selected];
+    }
+
+    /** 下拉框占位/不可用项（此时不设 afModeValues，选中回调会直接忽略）。 */
+    private void setAfSpinnerPlaceholder(String label) {
+        if (afModeSpinner == null) return;
+        afModeValues = null;
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, new String[]{label});
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        afModeSpinner.setAdapter(adapter);
+    }
+
+    /**
+     * 对焦方式选项标签：{@code 方式 N（0xXXXX）}，N 与 XXXX 都是原始机上编码。
+     * 0xD1BA 的取值语义 libgphoto2 未定义（不能想当然命名为「面部+追踪」之类），
+     * 这里只做中性标注，等真机上把编码对应清楚再换成中文名。
+     */
+    private static String afModeLabel(int value) {
+        int code = value & 0xffff;
+        return "方式 " + code + "（0x" + String.format(Locale.ROOT, "%04X", code) + "）";
     }
 
     /** −/+ 逐档微调：本地档位立刻推进，写入合并到停止点击之后。 */
@@ -506,11 +593,11 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
      * 从档位列表直选时立即写入。
      */
     private void applyExposureSelection(ExposureRow row, int index, boolean debounce) {
+        if (index < 0 || index >= row.entries.size()) return;
         row.index = index;
         // 用户手选的档位是权威值：立刻钉住，之后任何读取结果都不得把它刷回「—」。
         row.pinned = true;
-        List<CanonExposure.Entry> entries = CanonExposure.entries(row.setting);
-        row.value.setText(CanonExposure.display(row.setting, entries.get(index).label));
+        row.value.setText(CanonExposure.display(row.setting, row.entries.get(index).label));
         // 上一次还没发出去的合并写入作废：只有最后一次点击算数。
         if (row.pendingWrite != null) {
             debounceHandler.removeCallbacks(row.pendingWrite);
@@ -538,7 +625,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 档位列表直选：跨多档比连点 −/+ 快，且只产生一次写入。 */
     private void showExposurePicker(ExposureRow row) {
-        List<CanonExposure.Entry> entries = CanonExposure.entries(row.setting);
+        List<CanonExposure.Entry> entries = row.entries;
         String[] labels = new String[entries.size()];
         for (int i = 0; i < entries.size(); i++) {
             labels[i] = CanonExposure.display(row.setting, entries.get(i).label);
@@ -585,7 +672,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final class ExposureRow {
         final CanonExposure.Setting setting;
         final TextView value;
-        final int count;
+        /**
+         * 该档当前可选的取值列表。先按全表显示，收到相机允许值列表（onExposureChoices）后
+         * 收窄到机身支持的子集；{@code index} 就是它的下标（与协调器一致）。
+         */
+        List<CanonExposure.Entry> entries;
+        /** 可选档位数，跟随 {@link #entries}；−/+ 的边界判定用它。 */
+        int count;
         int index;
         /** 已排期但还没发给相机的写入（−/+ 合并用）；空闲时为 null。 */
         Runnable pendingWrite;
@@ -596,10 +689,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
          */
         boolean pinned;
 
-        ExposureRow(CanonExposure.Setting setting, TextView value, int count) {
+        ExposureRow(
+                CanonExposure.Setting setting,
+                TextView value,
+                List<CanonExposure.Entry> entries) {
             this.setting = setting;
             this.value = value;
-            this.count = count;
+            this.entries = entries;
+            this.count = entries.size();
         }
     }
 
@@ -864,6 +961,69 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             row.pinned = true;
             row.value.setText(display);
         });
+    }
+
+    @Override
+    public void onExposureChoices(
+            CanonExposure.Setting setting, List<CanonExposure.Entry> choices) {
+        runOnUiThread(() -> {
+            ExposureRow row = rowFor(setting);
+            if (row == null || choices == null || choices.isEmpty()) return;
+            // 换列表前先记住当前下标指向的「机上编码值」：收窄后下标含义变了，
+            // 必须按值重新定位，否则之后的 −/+ 与直选会写到另一个档位。
+            int currentValue = (row.index >= 0 && row.index < row.entries.size())
+                    ? row.entries.get(row.index).value
+                    : -1;
+            row.entries = choices;
+            row.count = choices.size();
+            int mapped = -1;
+            for (int i = 0; i < choices.size(); i++) {
+                if (choices.get(i).value == currentValue) {
+                    mapped = i;
+                    break;
+                }
+            }
+            row.index = mapped >= 0 ? mapped : Math.min(Math.max(row.index, 0), row.count - 1);
+            // 已有本地选择（用户手选过，或有排期中写入）时只换列表不改显示，
+            // 与 onExposureResult 的「不盖掉用户选择」保持一致。
+            if (row.pinned || row.pendingWrite != null) return;
+            row.value.setText(CanonExposure.display(setting, choices.get(row.index).label));
+        });
+    }
+
+    @Override
+    public void onFocusAreaResult(int[] values, int currentIndex, String error) {
+        runOnUiThread(() -> {
+            if (afModeSpinner == null) return;
+            if (error != null || values == null || values.length == 0) {
+                setAfSpinnerPlaceholder("（不可用）");
+                return;
+            }
+            afModeValues = values;
+            setAfSpinnerItems(values, currentIndex);
+        });
+    }
+
+    /**
+     * 把预览控件上的点按位置换算成取景帧像素坐标并下发 0x915B，只移动对焦框、不触发对焦。
+     *
+     * <p>预览用 {@code fitCenter}：画面按比例缩放后居中，控件坐标 ≠ 帧像素坐标。这里把
+     * ImageView 的显示矩阵求逆（image→view 反过来），把点映射回帧坐标系；映射后落在帧外的
+     * （黑边）直接忽略，避免把对焦框推到画面外。
+     */
+    private void moveFocusPointAt(float viewX, float viewY) {
+        if (liveViewImage == null || liveViewBitmap == null) return;
+        Matrix inverse = new Matrix();
+        if (!liveViewImage.getImageMatrix().invert(inverse)) return;
+        float[] point = {viewX, viewY};
+        inverse.mapPoints(point);
+        int frameWidth = liveViewBitmap.getWidth();
+        int frameHeight = liveViewBitmap.getHeight();
+        int x = Math.round(point[0]);
+        int y = Math.round(point[1]);
+        // 落在图像外（fitCenter 的黑边）时忽略：相机只认画面内的坐标。
+        if (x < 0 || y < 0 || x >= frameWidth || y >= frameHeight) return;
+        coordinator.touchAfPosition(x, y);
     }
 
     @Override
