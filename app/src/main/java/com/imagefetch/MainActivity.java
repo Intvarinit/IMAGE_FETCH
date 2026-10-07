@@ -416,9 +416,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 面板收起：停取景、丢掉画面引用（否则整个 Activity 会被这几张位图拖住）。 */
     private void closeCapturePanel() {
-        coordinator.stopLiveView();
         // 还有合并中没发出去的档位调整：立刻补发，别让用户以为改好了其实没生效。
         for (ExposureRow row : exposureRows) flushPendingExposureWrite(row);
+        // 拆取景必须排在补发之后：写档位需要在遥控态里进行，一旦写入遇到 0x2019 会触发
+        // 状态重建（ensureCanonRemoteMode），把相机重新拽回遥控态——正好抵消 stopLiveView
+        // 刚做完的「交还机身」收尾，用户看到的就是「面板关了但相机还不能自由使用」。
+        coordinator.stopLiveView();
         debounceHandler.removeCallbacksAndMessages(null);
         captureDialog = null;
         liveViewImage = null;

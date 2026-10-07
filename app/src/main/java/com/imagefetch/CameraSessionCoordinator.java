@@ -1063,8 +1063,14 @@ public final class CameraSessionCoordinator {
         long now = System.currentTimeMillis();
         if (gotFrame) {
             pump.lastFrameAt = now;
-        } else if (now - pump.lastFrameAt >= LIVE_VIEW_STALL_RESTART_MS
+        } else if (liveViewActive && generation == liveViewGeneration
+                && now - pump.lastFrameAt >= LIVE_VIEW_STALL_RESTART_MS
                 && now - pump.lastRestartAt >= LIVE_VIEW_STALL_RESTART_MS) {
+            // 先确认循环仍有效：面板关闭（stopLiveView）会把 liveViewActive 置 false 并作废代际，
+            // 但在途的这一帧还要等 operations.liveViewFrame() 返回才走到这里。若不复查就重发
+            // 开启序列，它会经 ensureCanonRemoteMode() 把相机**重新拽回遥控态**——那就正好抵消
+            // 了 stopLiveView 里刚做完的「交还机身」收尾，表现为「关了面板相机还是不能自由使用」。
+            //
             // 一帧都没出：相机可能对开启写入回了 OK 却没真正切到取景输出。先重发开启序列；
             // 仍不出图就再补一次半按唤醒——实测「先拍一张后取景才出画面」，说明取景输出要经过
             // 一次释放周期才真正启动，而半按只测光/对焦、不会拍照。

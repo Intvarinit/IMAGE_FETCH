@@ -122,6 +122,17 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int CANON_TERMINATE_VIEWFINDER = 0x9152;
     /** Canon EOS 单次自动对焦（无参数，ptp.h:5057 EOS_DoAf）。需取景已开启。 */
     private static final int CANON_DO_AF = 0x9154;
+    /**
+     * 停止正在进行的自动对焦（无参数，ptp.h:440 附近 {@code EOS_AfCancel}）。
+     *
+     * <p>libgphoto2 在拆掉拍摄准备时的**第一步**就是它，注释写得很直白：
+     * "just in case we had autofocus running"（config.c:574-577）。
+     * 对焦驱动没结束前相机会对 {@code 0x9110} 属性写入统一回 {@code 0x2019 DeviceBusy}——
+     * 实测症状正是「按过一次对焦（或拍过一张，快门本身走的就是 AF）之后三要素再也写不进去」，
+     * 以及「关闭遥控面板后机身屏幕点不亮、按键无响应」：退出序列里那些命令全被 0x2019 挡掉，
+     * 而它们各自兜了异常，于是整段收尾静默失败。
+     */
+    private static final int CANON_EOS_AF_CANCEL = 0x9160;
     /** Canon EOS 取景帧（data-in；数据段是 TLV 块序列）。 */
     private static final int CANON_GET_VIEW_FINDER_DATA = 0x9153;
     /**
@@ -694,6 +705,8 @@ public final class PtpIpTransport implements CameraTransport {
                         + (button >= 4 ? "（全按成功）" : "（全按未成功，可能未对上焦）"));
             }
             if (press.code != RESPONSE_OK) throw rejected(press.code);
+            // 快门本身就带 AF：拍完对焦驱动可能还在跑，之后写属性前要先停掉它。
+            canonAfMaybeRunning = true;
             return;
         }
 
@@ -757,6 +770,8 @@ public final class PtpIpTransport implements CameraTransport {
                             + captureStepsSuffix(),
                     rejected(press.code));
         }
+        // 快门本身就带 AF：拍完对焦驱动可能还在跑，之后写属性前要先停掉它。
+        canonAfMaybeRunning = true;
         if (baseline >= 0 && waitForNewObject(baseline)) {
             recordCaptureStep("已确认产生新对象");
         }
@@ -965,6 +980,8 @@ public final class PtpIpTransport implements CameraTransport {
             ensureCanonRemoteMode();
             // 反复开关取景时队列里会残留事件，不清掉下面的命令会回 0x2019。
             drainEosEvents();
+            // 对焦驱动还在跑时取景属性同样写不进去（0x2019），先停掉它。
+            cancelCanonAutofocus();
             // 真正启动取景推流要用专用命令（libgphoto2 config.c:9177-9180 的首选路径）。
             // 只写属性时相机往往要等一次释放周期才开始出画面——这正是「要先拍一张，
             // 取景才正常」的原因。失败不致命，属性写入仍会兜底。
@@ -993,6 +1010,11 @@ public final class PtpIpTransport implements CameraTransport {
         // 关取景前先排空事件：积压时下面每一步都会被回 0x2019，机身屏就点不亮
         // ——「关闭遥控拍摄后相机没恢复显示」正是这个原因。
         drainEosEvents();
+        // 但光排空事件还不够：对焦驱动若还在跑，下面这一整串收尾命令（含最后的解锁 UI
+        // 与恢复模式转盘）会**逐个**被回 0x2019，而它们各自兜了异常，于是整段静默失败——
+        // 真机症状就是「关掉遥控面板后机身屏点不亮、按键无响应」。libgphoto2 拆拍摄准备
+        // 的第一步正是停对焦（config.c:574-577）。
+        cancelCanonAutofocus();
         // 0x9152 只在相机能力集里有它时才有效；本机型没有，固定回 0x2005，属预期噪音。
         try {
             command(CANON_TERMINATE_VIEWFINDER, transactionId++, new long[0]);
@@ -1034,6 +1056,9 @@ public final class PtpIpTransport implements CameraTransport {
     public synchronized void pauseLiveViewForCapture(LiveViewSize size) throws Exception {
         ensureConnected();
         drainEosEvents();
+        // libgphoto2 拆拍摄准备的第一步：停掉可能还在跑的对焦（config.c:574-577）。
+        // 不停对焦时下面的 EVFOutputDevice 写入会被回 0x2019，而全按快门紧跟其后。
+        cancelCanonAutofocus();
         // 拍摄要求画面上游真正停住，这里必须写 0——libgphoto2 的内存拍摄路径也是先把
         // EVFOutputDevice 清 0（EOS M 的 camera_unprepare_canon_eos_capture，config.c:582-583）。
         // 与「关面板」的区别：不动遥控态、不做交还机身的收尾，拍完立刻恢复取景。
@@ -1087,6 +1112,13 @@ public final class PtpIpTransport implements CameraTransport {
     private int lastEvfOutputValue = -1;
     /** 最近一次写入 {@code 0xD1B1 EVFMode} 的取值；-1 表示本会话还没写过。同上，供自愈用。 */
     private int lastEvfModeValue = -1;
+    /**
+     * 「相机的对焦驱动可能还在跑」。按过 {@code 0x9154}、或按过快门（快门本身就带 AF）之后置位，
+     * 发过 {@code 0x9160 EOS_AfCancel} 后清零。之所以要记这个状态，是因为「停对焦」这一步
+     * 只在**接下来要动相机**时才有必要（写属性、退出取景）——每次调用都无脑发一遍会白搭一次
+     * 往返，而曝光三档是逐档点击的。
+     */
+    private boolean canonAfMaybeRunning;
 
 
     /**
@@ -1111,10 +1143,32 @@ public final class PtpIpTransport implements CameraTransport {
             throw new IOException("相机拒绝了对焦命令（0x9154 EOS_DoAf）：" + hexCode(response),
                     rejected(response));
         }
+        // 相机的对焦驱动这时还在跑，后续任何 0x9110 写入都会被回 0x2019。记下来，
+        // 等下一次真要动相机时先发 0x9160 停对焦（对齐 libgphoto2 config.c:574-577）。
+        canonAfMaybeRunning = true;
         // 对焦后必须再排空一次：libgphoto2 的 _put_Canon_EOS_AFDrive 在 0x9154 成功后紧跟
         // ptp_check_eos_events（config.c:8428-8429「Get the next set of event data」）。
         // 对焦过程本身会产生一批事件，不读走就卡住后面的命令，表现为「按了没反应」。
         drainEosEvents();
+    }
+
+    /**
+     * 若相机的对焦驱动可能还在跑，先发 {@code 0x9160 EOS_AfCancel} 停掉它再继续。
+     *
+     * <p>这是 libgphoto2 拆拍摄准备的第一步（config.c:574-577，注释 "just in case we had
+     * autofocus running"）。不停对焦时相机对 {@code 0x9110} 属性写入统一回
+     * {@code 0x2019 DeviceBusy}，而且退出取景那一串收尾命令会被逐个挡掉（它们各自兜异常，
+     * 于是整段静默失败）——表现就是「按过对焦/拍过一张后三要素写不进去」与「关了面板机身屏
+     * 还不回来」。只在置位后发一次，失败也不再重试：机型不支持时相机会自行结束对焦驱动。
+     */
+    private void cancelCanonAutofocus() {
+        if (!canonAfMaybeRunning) return;
+        canonAfMaybeRunning = false;
+        try {
+            command(CANON_EOS_AF_CANCEL, transactionId++, new long[0]);
+        } catch (Exception ignored) {
+            // 能力集里没有 0x9160 的机型会回 0x2005；不影响后续步骤。
+        }
     }
 
     /**
@@ -1173,6 +1227,10 @@ public final class PtpIpTransport implements CameraTransport {
         // 要留到最后一起报——否则「队列没排干净」会被写成「属性写入被相机拒绝」，让人
         // 一直往档位/机型上找原因。刚对过焦时正是这种情形：0x9154 会连推一批属性事件。
         String drainFailure = drainEosEvents();
+        // 排空事件还不够：对焦驱动本身没结束的话，0x9110 一律回 0x2019（不是队列脏，
+        // 是相机在 AF）。libgphoto2 只要动相机就先停对焦（config.c:574-577）——这一步
+        // 正是「按过一次对焦/拍过一张之后三要素再也写不进去」的解药。
+        cancelCanonAutofocus();
         // 取景中相机繁忙时 0x9110 会瞬时回 0x2019，退避重试几次（libgphoto2 同样把 0x9110 的
         // DeviceBusy 当「暂时忙」，config.c:355）。
         int code = writeCanonPropertyRetrying(setting.vendorProperty, value & 0xffffL);
@@ -2383,6 +2441,8 @@ public final class PtpIpTransport implements CameraTransport {
         cameraModel = "";
         vendor = CameraVendor.UNKNOWN;
         canonRemoteModeReady = false;
+        // 新会话下相机自己的对焦状态已重置，别把上一次的「可能还在对焦」带过来。
+        canonAfMaybeRunning = false;
         handleCache.clear();
     }
 
