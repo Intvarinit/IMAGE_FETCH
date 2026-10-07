@@ -441,9 +441,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private void closeCapturePanel() {
         // 还有合并中没发出去的档位调整：立刻补发，别让用户以为改好了其实没生效。
         for (ExposureRow row : exposureRows) flushPendingExposureWrite(row);
-        // 拆取景必须排在补发之后：写档位需要在遥控态里进行，一旦写入遇到 0x2019 会触发
-        // 状态重建（ensureCanonRemoteMode），把相机重新拽回遥控态——正好抵消 stopLiveView
-        // 刚做完的「交还机身」收尾，用户看到的就是「面板关了但相机还不能自由使用」。
+        // 拆取景必须排在补发之后：补发档位要趁相机还在遥控态（写属性需要这个状态），
+        // 反了的话档位会写进已经收回画面的相机，白写一次。
+        // 这里刻意不拆会话：真机（EOS RP）实测「手机能调参、机身同时也能操作」，用户要求
+        // 关面板时保持连接，不再重连。
         coordinator.stopLiveView();
         debounceHandler.removeCallbacksAndMessages(null);
         captureDialog = null;
@@ -516,8 +517,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /**
      * 对焦方式下拉框：选项来自相机上报的 0xD1BA 允许值列表（读完才填），切换后写回 0xD1BA。
-     * 标签里的编码是原始机上值——0xD1BA 的语义 libgphoto2 未定义，暂不做中文命名，
-     * 等真机把编码与「单点/区域」等对应起来再改。
+     * 标签按 libgphoto2 的取值名表给出，见 {@link #afModeLabel(int)}。
      */
     private void setUpAfModeSpinner() {
         if (afModeSpinner == null) return;
@@ -566,13 +566,35 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     /**
-     * 对焦方式选项标签：{@code 方式 N（0xXXXX）}，N 与 XXXX 都是原始机上编码。
-     * 0xD1BA 的取值语义 libgphoto2 未定义（不能想当然命名为「面部+追踪」之类），
-     * 这里只做中性标注，等真机上把编码对应清楚再换成中文名。
+     * 0xD1BA 取值的中文标签，下标即机型编码。<br>
+     * 取值名表取自 libgphoto2 {@code camlibs/ptp2/config.c:2977-2994 canon_eos_afmethod}
+     * （0..14，配置项名 {@code "AF Method"}，config.c:12231），括号里保留该表的原始 token
+     * 便于对照；中文措辞按佳能机身菜单习惯翻译。M50 Mark II 上报的可选值为
+     * {@code {2, 10, 1, 4}}（LiveFace / LiveSpotAF / Live / LiveZone），与机身菜单的四项一致。
      */
+    private static final String[] AF_METHOD_LABELS = {
+            "快速对焦（Quick）",                        // 0
+            "单点自动对焦（Live）",                      // 1
+            "面部+追踪（LiveFace）",                     // 2
+            "多点自动对焦（LiveMulti）",                 // 3
+            "区域自动对焦（LiveZone）",                  // 4
+            "单点扩展·十字（LiveSingleExpandCross）",     // 5
+            "单点扩展·周围（LiveSingleExpandSurround）",  // 6
+            "大区域·横（LiveZoneLargeH）",               // 7
+            "大区域·纵（LiveZoneLargeV）",               // 8
+            "捕捉对焦（LiveCatchAF）",                   // 9
+            "定点自动对焦（LiveSpotAF）",                // 10
+            "灵活区域 1（FlexibleZoneAF1）",             // 11
+            "灵活区域 2（FlexibleZoneAF2）",             // 12
+            "灵活区域 3（FlexibleZoneAF3）",             // 13
+            "全区域自动对焦（WholeAreaAF）",             // 14
+    };
+
+    /** 对焦方式选项标签；陌生编码如实显示十六进制，不猜名字。 */
     private static String afModeLabel(int value) {
         int code = value & 0xffff;
-        return "方式 " + code + "（0x" + String.format(Locale.ROOT, "%04X", code) + "）";
+        if (code < AF_METHOD_LABELS.length) return AF_METHOD_LABELS[code];
+        return "未知方式 0x" + String.format(Locale.ROOT, "%04X", code);
     }
 
     /** −/+ 逐档微调：本地档位立刻推进，写入合并到停止点击之后。 */
@@ -930,7 +952,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     @Override
     public void onLiveViewStatus(String message) {
         runOnUiThread(() -> {
-            if (liveViewStatusView != null) liveViewStatusView.setText(message);
+            // 面板已经收起时，取景状态（含「交还机身」的收尾结果）改发到主界面状态栏——
+            // 否则「面板关了但相机还在遥控态」这类提示会落在已经消失的视图上，用户看不到。
+            if (liveViewStatusView != null) {
+                liveViewStatusView.setText(message);
+            } else if (statusView != null) {
+                statusView.setText(message);
+            }
         });
     }
 

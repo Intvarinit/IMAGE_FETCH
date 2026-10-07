@@ -1001,9 +1001,10 @@ public final class CameraSessionCoordinator {
     /**
      * 关闭实时取景。可从主线程直接调用（例如对话框关闭时）。
      *
-     * <p>即使取景没开着也照发一次关闭序列：它同时负责把机身屏还回去
-     * （EVFMode=0 → SetRemoteMode(0)/(1)，见 PtpIpTransport#setLiveViewEnabled），
-     * 用户要求「关闭面板时恢复相机显示」，所以不能提前返回。
+     * <p>即使取景没开着也照发一次关闭序列：把画面输出从 PC 收回机身屏
+     * （EVFOutputDevice=0x01，见 PtpIpTransport#stopLiveViewOutput），让取景干净结束。
+     * 该序列**不退出遥控态**——真机（EOS RP）实测留在遥控态时手机能调参、机身也能操作，
+     * 所以关面板时保持连接、不拆会话。
      */
     public void stopLiveView() {
         invalidateLiveView();
@@ -1013,7 +1014,9 @@ public final class CameraSessionCoordinator {
             } catch (Exception ignored) {
                 // 关闭失败不影响会话；断开连接时相机会自行退出取景。
             }
-            mainHandler.post(() -> listener.onLiveViewStatus("实时取景已关闭，相机显示已恢复"));
+            // 关面板只收回画面输出、留在遥控态（见 PtpIpTransport#stopLiveViewOutput）：
+            // 真机实测这样机身按键照样可用，手机也能继续调参，所以这里如实说「已关闭」即可。
+            mainHandler.post(() -> listener.onLiveViewStatus("实时取景已关闭"));
         });
     }
 

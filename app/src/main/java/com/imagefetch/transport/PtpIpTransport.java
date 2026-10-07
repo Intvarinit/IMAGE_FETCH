@@ -225,9 +225,17 @@ public final class PtpIpTransport implements CameraTransport {
      */
     private static final long[] HALF_RELEASE = {1};
     private static final long[] FULL_RELEASE = {2};
-    /** 全按后判定「是否真的拍到」的探测窗口与间隔。 */
-    private static final long CANON_SHOT_VERIFY_MS = 5000L;
-    private static final long CANON_SHOT_VERIFY_INTERVAL_MS = 500L;
+    /**
+     * 全按后等「相机上报新对象」的窗口与轮询间隔。
+     *
+     * <p>判据是相机自己推的 {@code 0x4002 ObjectAdded} 事件（PTP/IP 事件通道，由 event reader
+     * 线程计数），**不再**枚举存储卡句柄：原先每 500ms 枚举一次整卡句柄、最多 10 次，
+     * 用户侧的感受就是「按一下快门等 8 秒」。这里只是给「机型记忆」一个判据，拍摄成败
+     * 本来由上层 {@code NewPhotoResolver} 判定（事件 + 句柄差集，超时 20s），所以窗口可以短：
+     * 事件没来就按「未确认」处理，不影响拍摄结果。
+     */
+    private static final long CANON_SHOT_EVENT_WAIT_MS = 2000L;
+    private static final long CANON_SHOT_EVENT_POLL_MS = 100L;
     /**
      * 全按被拒 {@code 0x2019 DeviceBusy} 时的重试次数与退避基数。
      * libgphoto2 对 {@code PTP_RC_DeviceBusy} 的处理就是重试（library.c:6484
@@ -335,13 +343,23 @@ public final class PtpIpTransport implements CameraTransport {
     private boolean canonRemoteModeReady;
     /**
      * 是否已由实测确认本机走 EOS M 快门编码。机型串读不到时会误选普通 EOS 编码（全按恒回
-     * {@code 0x2019}），一旦按 {@code (3,0)} 试成功就记在这里。这是相机的固有属性，
-     * 重连不复位。
+     * {@code 0x2019}），这时按 {@code (3,0)} 试一次可能成功。
+     *
+     * <p>置位判据只能是「<b>确认拍到了新对象</b>」，不能只看响应码：真机 EOS RP（普通 EOS）
+     * 会**接受** {@code (3,0)} 并回 {@code 0x2001}，却根本不释放快门——据此记住机型就会让整个
+     * 会话只用 {@code (3,0)}，表现为「快门回 OK 却没拍到」。会话结束（{@link #close()}）时复位：
+     * 真机可能换台相机连，带着上一台的结论会让新会话一路走错分支。
      */
     private volatile boolean canonEosMEncodingLearned;
     /** 最近一次 capture() 的厂商快门逐步诊断（每步响应码与应答载荷）。 */
     private final StringBuilder captureSteps = new StringBuilder();
     private volatile ObjectEventListener objectEventListener;
+    /**
+     * 相机上报过的 {@code 0x4002 ObjectAdded} 次数（event reader 线程递增）。
+     * 快门路径靠「按快门前后的计数有没有变」判断这次全按是否真的产生了新对象——
+     * 不需要任何额外 PTP 往返（见 {@link #awaitObjectAdded}）。
+     */
+    private volatile long objectAddedSeq;
     /** 存储卡文件句柄缓存（存储卷 → 句柄）：快速分页翻页时不必重新遍历目录。 */
     private final Map<Long, List<Long>> handleCache =
             Collections.synchronizedMap(new LinkedHashMap<>());
@@ -720,7 +738,11 @@ public final class PtpIpTransport implements CameraTransport {
 
         // Canon 对两代机型的快门是两套编码，libgphoto2 用 is_canon_eos_m() 二选一，绝不混用
         // （library.c:6136-6262）：EOS M 系列只发一条 RemoteReleaseOn(3, 0)（按钮值 3）；
-        // 普通 EOS 才是半按 (1,0) + 全按 (2,0)。本机实测普通 EOS 的 (2,0) 恒回 0x2019。
+        // 普通 EOS 才是半按 (1,0) + 全按 (2,0)。判据只能是机型串：真机 EOS RP 会对 (3,0) 回
+        // 0x2001 却根本不释放快门，光看响应码分不出用的是哪套编码（见 close() 的机型记忆注释）。
+        // 按快门前记下事件计数，拍完靠「它有没有变」判断这次全按到底有没有拍出东西。
+        long objectSeqBefore = objectAddedSeq;
+
         if (isCanonEosMSeries()) {
             ReleaseResult press = releaseCommand(CANON_REMOTE_RELEASE_ON, EOS_M_FULL_PRESS);
             recordCaptureStep(stepText("0x9128 RemoteReleaseOn(3,0) 全按（EOS M 编码）", press));
@@ -745,6 +767,17 @@ public final class PtpIpTransport implements CameraTransport {
             if (press.code != RESPONSE_OK) throw rejected(press.code);
             // 快门本身就带 AF：拍完对焦驱动可能还在跑，之后写属性前要先停掉它。
             canonAfMaybeRunning = true;
+            // 「回 OK」不等于「真拍了」：真机实测 EOS RP（普通 EOS）会**接受** (3,0) 并回
+            // 0x2001，却根本不释放快门——只按响应码认机型就会把这个会话永久带偏。
+            // 所以机型记忆必须以「相机上报了新对象」为准，没拍到就把它撤回，下次拍摄改走
+            // 普通 EOS 编码。
+            if (awaitObjectAdded(objectSeqBefore)) {
+                recordCaptureStep("已确认产生新对象（EOS M 编码）");
+            } else {
+                recordCaptureStep("按 EOS M 编码全按后未收到新对象事件：机型判定可能落空，"
+                        + "已撤回机型记忆，下次拍摄改按普通 EOS 编码");
+                canonEosMEncodingLearned = false;
+            }
             return;
         }
 
@@ -759,7 +792,6 @@ public final class PtpIpTransport implements CameraTransport {
 
         // 全按：用 libgphoto2 实证过的 (2, 0)。只发一次在部分机型上会被瞬时拒绝，
         // 故对 DeviceBusy 退避重试——这是「相机还在忙」而非「不支持」。
-        long baseline = probeMaxObjectHandle();
         ReleaseResult press = releaseCommand(CANON_REMOTE_RELEASE_ON, FULL_PRESS);
         recordCaptureStep(stepText("0x9128 RemoteReleaseOn(2,0) 全按", press));
         for (int retry = 1; press.code == RESPONSE_DEVICE_BUSY
@@ -769,9 +801,9 @@ public final class PtpIpTransport implements CameraTransport {
             press = releaseCommand(CANON_REMOTE_RELEASE_ON, FULL_PRESS);
             recordCaptureStep(stepText("0x9128 RemoteReleaseOn(2,0) 全按重试 " + retry, press));
         }
-        // 「半按被接受、全按恒忙」正是本机 EOS M 的签名（机型串没读到时会误走普通 EOS 编码，
-        // 那种情况下把 0x2019 当「相机忙」重试多少次都不会成）。按 EOS M 的 (3,0) 再试一次，
-        // 成功就把机型记下来，以后直接走 EOS M 分支。
+        // 「半按被接受、全按恒忙」可能是 EOS M 机身（按钮值 3），也可能只是普通 EOS 瞬时忙
+        // （写卡/退出取景）。两种情形在响应码上分不开，所以这里只**试**一次 (3,0)，不记机型；
+        // 要不要记住由下面的「发现新对象」决定。
         boolean usedEosMEncoding = false;
         if (press.code == RESPONSE_DEVICE_BUSY && half.code == RESPONSE_OK) {
             ReleaseResult eosMPress = retryWithEosMEncoding();
@@ -810,18 +842,22 @@ public final class PtpIpTransport implements CameraTransport {
         }
         // 快门本身就带 AF：拍完对焦驱动可能还在跑，之后写属性前要先停掉它。
         canonAfMaybeRunning = true;
-        if (baseline >= 0 && waitForNewObject(baseline)) {
+        if (awaitObjectAdded(objectSeqBefore)) {
             recordCaptureStep("已确认产生新对象");
+            // 只有真拍到才认机型：光看响应码会把「普通 EOS 瞬时忙 + 恰好接受 (3,0)」
+            // 误记成 EOS M，之后每次拍摄都只用 (3,0)——真机（EOS RP）上就是「回 OK 却不拍」。
+            if (usedEosMEncoding) canonEosMEncodingLearned = true;
         }
     }
 
     /**
-     * 普通 EOS 编码失败后的兜底：改按 EOS M 的 {@code RemoteReleaseOn(3,0)} 再试一次，
-     * 成功即置 {@link #canonEosMEncodingLearned}，后续拍摄与遥控模式取值都按 EOS M 走。
+     * 普通 EOS 编码失败后的兜底：改按 EOS M 的 {@code RemoteReleaseOn(3,0)} 再试一次。
      *
-     * <p>只在「半按被接受、全按恒回 {@code 0x2019}」这个签名下调用——那是本机 EOS M 的实测
-     * 特征（机身只认按钮值 3），普通 EOS 不会这样。失败返回 {@code null}，调用方保留原始的
-     * 响应码与诊断，不让回退看起来像主因。
+     * <p>只在「半按被接受、全按回 {@code 0x2019}」这个签名下调用。这个签名**不足以判定机型**：
+     * 普通 EOS 瞬时忙（写卡、刚退出取景）时也会出现，而真机 EOS RP 恰好会接受 (3,0) 并回
+     * {@code 0x2001}——据此记住机型就会让整个会话只用 (3,0)，表现为「快门回 OK 却没拍到」。
+     * 所以这里只负责试一次并返回响应；是否记录机型由调用方在**确认拍到新对象**后决定。
+     * 失败返回 {@code null}，调用方保留原始的响应码与诊断，不让回退看起来像主因。
      */
     private ReleaseResult retryWithEosMEncoding() {
         try {
@@ -829,7 +865,6 @@ public final class PtpIpTransport implements CameraTransport {
             recordCaptureStep(stepText(
                     "0x9128 RemoteReleaseOn(3,0) 全按（按 EOS M 编码回退）", press));
             if (press.code != RESPONSE_OK) return null;
-            canonEosMEncodingLearned = true;
             try {
                 ReleaseResult released =
                         releaseCommand(CANON_REMOTE_RELEASE_OFF, EOS_M_FULL_RELEASE);
@@ -1008,38 +1043,23 @@ public final class PtpIpTransport implements CameraTransport {
     }
 
     /**
-     * 轮询存储卡句柄最大值，判断这次全按是否真的产生了新对象。
-     * 这是「相机回了 OK 但没拍」唯一能自证的办法。
+     * 等相机上报「新增对象」事件（{@code 0x4002 ObjectAdded}，由 event reader 线程递增
+     * {@link #objectAddedSeq}）。
+     *
+     * <p>这是「相机回了 OK 但没拍」能在传输层自证的最省事办法：事件是相机自己推的，不需要
+     * 任何额外 PTP 往返。原先靠轮询整卡句柄（每 500ms 一次全卡枚举、最多 10 次）判定，
+     * 正是「按一下快门等 8 秒」的主要来源。
+     *
+     * <p>事件不来（部分机型在 PTP/IP 下不推这条）时按「未确认」处理：本次拍摄的成败由上层
+     * {@code NewPhotoResolver}（事件 + 句柄差集，超时 20s）判定，这里的结果只影响机型记忆与诊断。
      */
-    private boolean waitForNewObject(long baselineHandle) {
-        long deadline = System.currentTimeMillis() + CANON_SHOT_VERIFY_MS;
+    private boolean awaitObjectAdded(long startSequence) {
+        long deadline = System.currentTimeMillis() + CANON_SHOT_EVENT_WAIT_MS;
         while (System.currentTimeMillis() < deadline) {
-            sleepQuietly(CANON_SHOT_VERIFY_INTERVAL_MS);
-            long current = probeMaxObjectHandle();
-            if (current > baselineHandle) return true;
+            if (objectAddedSeq != startSequence) return true;
+            sleepQuietly(CANON_SHOT_EVENT_POLL_MS);
         }
         return false;
-    }
-
-    /** 存储卡上最大的对象句柄；探测失败返回 -1（不抛，避免掩盖真正的快门问题）。 */
-    private long probeMaxObjectHandle() {
-        try {
-            // 拍摄会新增对象，必须让分页句柄缓存失效后再枚举，否则看不到新句柄。
-            invalidateStorageCache();
-            StorageBrowser.loadPage(this::invokeOperation, 1, 0, handleCache);
-            long max = 0;
-            synchronized (handleCache) {
-                for (List<Long> handles : handleCache.values()) {
-                    for (Long handle : handles) {
-                        if (handle != null && handle > max) max = handle;
-                    }
-                }
-            }
-            return max;
-        } catch (Exception error) {
-            recordCaptureStep("句柄探测失败（不影响发快门）：" + describe(error));
-            return -1;
-        }
     }
 
     /**
@@ -1076,8 +1096,11 @@ public final class PtpIpTransport implements CameraTransport {
      * （library.c:3622-3662）：EVFMode=1 → EVFOutputDevice=PC → KeepDeviceOn。
      *
      * <p>{@code size} 写进 0xD1B0 的输出位（2/4/8 = Large/Medium/Small），相机据此决定推给 App 的
-     * 帧分辨率——这是真正降低传输分辨率的地方，App 端只是收什么画什么。
-     * 与 libgphoto2 不同的是这里不保留 TFT 位：取景时机身屏让给 App。
+     * 帧分辨率——这是真正降低传输分辨率的地方，App 端只是收什么画什么。写入时保留 TFT 位
+     * （机身屏一起亮），与 libgphoto2 改画面尺寸的做法一致（config.c:2669-2670）。
+     *
+     * <p>{@code enabled=false}（关面板）只把画面输出收回机身屏，**不退出遥控态**——
+     * 理由与真机证据见 {@link #stopLiveViewOutput()}。
      *
      * <p>Movie 模式下写 EVFMode 会回 DeviceBusy 但可以继续，故容忍该响应码。
      * 这里不做 libgphoto2 的「先读再写」优化：0xD1xx 属性只能从 0x9116 事件缓存里读，
@@ -1118,13 +1141,10 @@ public final class PtpIpTransport implements CameraTransport {
             keepDeviceOn();
             return;
         }
-        // 关取景前先排空事件：积压时下面每一步都会被回 0x2019，机身屏就点不亮
-        // ——「关闭遥控拍摄后相机没恢复显示」正是这个原因。
+        // 关取景前先排空事件：积压时下面每一步都会被回 0x2019，机身屏就点不亮。
         drainEosEvents();
-        // 但光排空事件还不够：对焦驱动若还在跑，下面这一整串收尾命令（含最后的解锁 UI
-        // 与恢复模式转盘）会**逐个**被回 0x2019，而它们各自兜了异常，于是整段静默失败——
-        // 真机症状就是「关掉遥控面板后机身屏点不亮、按键无响应」。libgphoto2 拆拍摄准备
-        // 的第一步正是停对焦（config.c:574-577）。
+        // 对焦驱动若还在跑，属性写入会被回 0x2019（libgphoto2 拆拍摄准备的第一步正是停对焦，
+        // config.c:574-577）。
         cancelCanonAutofocus();
         // 0x9152 只在相机能力集里有它时才有效；本机型没有，固定回 0x2005，属预期噪音。
         try {
@@ -1132,35 +1152,41 @@ public final class PtpIpTransport implements CameraTransport {
         } catch (Exception ignored) {
             // 机型不支持就跳过，退出取景靠下面的属性回退。
         }
+        // 把画面输出从 PC 收回，只留机身屏（bit0）：这就是「面板关了、画面还给机身」的全部动作。
+        stopLiveViewOutput();
+    }
+
+    /**
+     * 关面板时收回 PC 画面输出：{@code 0x9110 EVFOutputDevice = 0x01}（只留 TFT 位）。
+     *
+     * <p><b>为什么写 0x01 而不是 0</b>：bit0 表示「画面输出到机身屏」，写纯输出位会让机身屏黑掉；
+     * libgphoto2 改画面尺寸时也是「替换输出位、保留 TFT 标志」（config.c:2669-2670）。
+     *
+     * <p><b>为什么不再跑那套「交还机身」收尾</b>（{@code SetRemoteMode(0)} + {@code SetEventMode(0)}
+     * + {@code ResetUILock} + {@code SetModeDialDisable(0)}，即 config.c:571-605 的
+     * camera_unprepare_canon_eos_capture 加 library.c:3287-3297 的 camera_exit）：那套是给
+     * **马上要断开连接**的会话用的收尾——libgphoto2 收尾之后必然关掉 PTP/IP 会话，真正让相机
+     * 离开遥控态的是随后的断开。我们按要求保持连接，断开这一步永远不发生，于是相机被留在
+     * 「会话还开着、遥控态却已退出」的半状态：真机（EOS RP）上就是**机身按键无响应、屏幕显示
+     * busy**。反过来，实测留在遥控态时手机能调参、机身也能操作——这正是要保留的状态，所以这里
+     * 只收回画面输出，{@link #canonRemoteModeReady} 也保持不变（遥控态与事件模式都还开着，
+     * 下次开面板不必重发）。
+     *
+     * <p>只发一次、不做退避重试：失败不致命（最坏情况是机身屏这一会儿没画面），而相机写卡时
+     * 每次重试要白等几百毫秒，关面板不该因此卡住。
+     */
+    private void stopLiveViewOutput() {
+        lastEvfOutputValue = CANON_EVF_OUTPUT_TFT;
         try {
-            // 输出位收成「只给机身屏」(0x01)，不清 0：真机实测清 0 之后相机进入
-            // 「拒绝一切 0x9110 属性写入（三档全写不进去）+ 机身 UI 锁死报 busy」的状态，
-            // 留一个输出位相机的预览上游就不会被硬切断，属性写入通道保持可用。
-            lastEvfOutputValue = CANON_EVF_OUTPUT_TFT;
-            lastLiveViewStopCode = writeCanonPropertyRetrying(
+            lastLiveViewStopCode = writeCanonProperty(
                     CANON_PROP_EVF_OUTPUT_DEVICE, CANON_EVF_OUTPUT_TFT);
-            lastEvfModeValue = 0;
-            writeCanonProperty(CANON_PROP_EVF_MODE, 0);
-        } catch (Exception ignored) {
-            // 属性写入失败不致命：点屏靠下面的 SetRemoteMode。
+        } catch (Exception error) {
+            lastLiveViewStopCode = -1;
         }
-        // 取景期间机身屏由 PC 遥控态接管，退出取景后必须显式把显示切回来，否则相机屏会一直
-        // 黑着，直到断开整条连接。严格照 libgphoto2 的退出顺序（library.c:3287-3292 +
-        // config.c:596-602）：SetRemoteMode(0) → SetRemoteMode(1) → SetEventMode(0) →
-        // SetRemoteMode(1)。最后那次 SetRemoteMode(1) 才是真正点屏的一步（注释
-        // "this switches the display back on ..."）。每步各自兜异常：前一步失败不能把
-        // 真正点屏的那步带崩。
-        quietCommand(CANON_SET_REMOTE_MODE, 0);
-        quietCommand(CANON_SET_REMOTE_MODE, 1);
-        quietCommand(CANON_SET_EVENT_MODE, 0);
-        quietCommand(CANON_SET_REMOTE_MODE, 1);
-        // 把机身控制权还回去：遥控态会锁住机身 UI，退出时按 libgphoto2 的收尾
-        // （library.c:3294-3297）解锁 UI 并恢复模式转盘，否则相机会「屏亮着但按不动、
-        // 一直显示 busy」。
-        quietCommandNoArgs(CANON_EOS_RESET_UI_LOCK);
-        quietCommand(CANON_SET_MODE_DIAL_DISABLE, 0);
-        // 事件模式刚被关掉，下次开取景必须重新进入遥控态。
-        canonRemoteModeReady = false;
+        if (lastLiveViewStopCode != RESPONSE_OK) {
+            recordCaptureStep("关取景 EVFOutputDevice=0x01 未成功 → "
+                    + (lastLiveViewStopCode < 0 ? "发送失败/超时" : hexCode(lastLiveViewStopCode)));
+        }
     }
 
     @Override
@@ -1191,24 +1217,6 @@ public final class PtpIpTransport implements CameraTransport {
             // EVFMode 写失败同样不致命：取景推流会在拍完恢复时重新打开。
         }
         drainEosEvents();
-    }
-
-    /** 发一条无参数、失败也不影响后续步骤的厂商命令。 */
-    private void quietCommandNoArgs(int operation) {
-        try {
-            command(operation, transactionId++, new long[0]);
-        } catch (Exception ignored) {
-            // 机型不支持时跳过。
-        }
-    }
-
-    /** 发一条「失败也不影响后续步骤」的厂商命令（点屏序列用，各自兜异常）。 */
-    private void quietCommand(int operation, long parameter) {
-        try {
-            command(operation, transactionId++, new long[]{parameter});
-        } catch (Exception ignored) {
-            // 机型不支持时跳过；断开连接后相机会自行恢复显示。
-        }
     }
 
     /** 最近一次开启取景时 {@code 0x9151} 的响应码；-1 表示本会话还没开过。仅供诊断。 */
@@ -2328,6 +2336,9 @@ public final class PtpIpTransport implements CameraTransport {
         int eventCode = u16(data, 8);
         if (eventCode != EVENT_OBJECT_ADDED) return;
         if (data.length < 22) return; // 需要 StorageID + ObjectHandle 两个参数
+        // 计数与业务监听器无关：没有传输任务时监听器也为 null，但快门路径仍要能靠它判断
+        // 「这次全按有没有拍出东西」。
+        objectAddedSeq++;
         ObjectEventListener listener = objectEventListener;
         if (listener == null) return;
         long storageId = u32(data, 14);
@@ -2682,6 +2693,9 @@ public final class PtpIpTransport implements CameraTransport {
         cameraModel = "";
         vendor = CameraVendor.UNKNOWN;
         canonRemoteModeReady = false;
+        // 机型记忆也要清：真机可能换台相机连（EOS M ↔ 普通 EOS），带着上一台的编码会让
+        // 新会话一路走错分支——症状正是「快门回 OK 却没拍到」。下一会话重新按机型串判定。
+        canonEosMEncodingLearned = false;
         // 新会话下相机自己的对焦状态已重置，别把上一次的「可能还在对焦」带过来。
         canonAfMaybeRunning = false;
         handleCache.clear();
