@@ -13,12 +13,15 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.wifi.WifiManager;
+import android.net.wifi.WifiNetworkSpecifier;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.LruCache;
 
 import com.imagefetch.ptp.CameraStorage;
+import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.PtpOperationService;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.storage.PhotoRepository;
@@ -41,8 +44,11 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 会话编排：连接（含相机 Wi‑Fi 精确路由）→ 拍摄 → 发现新对象 → 流式取回 → 落盘去重；
@@ -54,6 +60,34 @@ public final class CameraSessionCoordinator {
     public enum TransportKind {
         WIFI,
         USB
+    }
+
+    /**
+     * 连接保活的三态（M2）。刻意做成<b>派生值</b>而不是独立字段：真正的状态仍由
+     * {@code connected}/{@code reconnecting}/{@code manualDisconnect}/{@code suspended}
+     * 承载，避免出现两份互相打架的真相。
+     *
+     * <ul>
+     *   <li>{@link #HOLD}：应用在前台，心跳正常保活。</li>
+     *   <li>{@link #SUSPEND}：应用退到后台，停掉心跳探测省电，但保留 TCP socket
+     *       与相机侧会话；回到前台立刻补一次探测。</li>
+     *   <li>{@link #RELEASE}：用户手动断开或退出应用，彻底释放。</li>
+     * </ul>
+     */
+    public enum HoldState {
+        HOLD,
+        SUSPEND,
+        RELEASE
+    }
+
+    /**
+     * HOLD 状态推导（纯函数，便于契约测试）。
+     * {@code manualDisconnect} 优先级最高；既没连上也不在重连 → 视为已释放。
+     */
+    static HoldState holdStateOf(
+            boolean connected, boolean reconnecting, boolean manualDisconnect, boolean suspended) {
+        if (manualDisconnect || (!connected && !reconnecting)) return HoldState.RELEASE;
+        return suspended ? HoldState.SUSPEND : HoldState.HOLD;
     }
 
     public interface Listener {
@@ -73,6 +107,28 @@ public final class CameraSessionCoordinator {
 
         /** 一批下载结束（含失败/取消）：界面据此清掉图片栏里已下载图片的选中状态。 */
         void onDownloadFinished();
+
+        /** 实时取景的一帧（已解码）；界面替换画面时应回收上一帧。 */
+        void onLiveViewFrame(Bitmap frame);
+
+        /** 实时取景状态（已开启/已关闭/中断原因）。 */
+        void onLiveViewStatus(String message);
+
+        /**
+         * 曝光参数结果：读取或写入成功时 {@code index >= 0}、{@code display} 为文案；
+         * 失败时 {@code index < 0}、{@code error} 为原因。
+         */
+        void onExposureResult(CanonExposure.Setting setting, int index, String display, String error);
+
+        /**
+         * 一次「拍摄并取回」流程结束（含未取到 JPEG 与失败）。
+         * 「未发现 JPEG」路径既不落盘也不报错，只发 onStatus，
+         * 单靠 onFileSaved/onError 会把拍摄按钮永久留在禁用态。
+         */
+        void onCaptureFinished();
+
+        /** 一次自动对焦流程结束（成功或失败）；界面据此恢复「自动对焦」按钮。 */
+        void onAutofocusFinished();
 
         void onError(String message, Throwable error);
     }
@@ -101,10 +157,31 @@ public final class CameraSessionCoordinator {
     private static final int PREVIEW_MAX_PX = 1600;
     /** 拍摄前基线只需覆盖最新的若干张，不必整卡枚举。 */
     private static final int CAPTURE_BASELINE_ITEMS = 60;
+    /** 实时取景取帧间隔（约 10fps，与 libgphoto2 的取景循环同量级）。 */
+    private static final long LIVE_VIEW_FRAME_INTERVAL_MS = 100L;
+    /** 相机「这一帧还没准备好」时的退避间隔。 */
+    private static final long LIVE_VIEW_RETRY_INTERVAL_MS = 300L;
+    /** 取景被「拍摄序列」挂起时的轮询间隔：只检查标志位，不碰相机。 */
+    private static final long LIVE_VIEW_SUSPEND_POLL_MS = 50L;
+    /**
+     * 取景开启序列的失败重试次数/退避步长。实测相机（刚连上或刚拍完时）会拒绝 EVF 属性写入，
+     * 重试几次才真正切进取景；早先只试一次，失败后面板就一直黑着，非拍一张不能恢复。
+     */
+    private static final int LIVE_VIEW_ENABLE_ATTEMPTS = 5;
+    private static final long LIVE_VIEW_ENABLE_BACKOFF_MS = 400L;
+    /** 连续多少次取帧抛异常才判定取景真的断了（单次异常多为相机忙，重试即可）。 */
+    private static final int LIVE_VIEW_MAX_CONSECUTIVE_ERRORS = 3;
+    /**
+     * 这么久一帧都拿不到就重发一次开启序列：相机可能对写入回了 OK 却没真正切到取景输出，
+     * 只靠重复取帧永远不会出画面。
+     */
+    private static final long LIVE_VIEW_STALL_RESTART_MS = 4000L;
     /** 相机不回 PONG 时的保活周期：真实命令往返比 PING 重，放慢到 30s。 */
     private static final long COMMAND_PROBE_INTERVAL_MS = 30000L;
     /** 传输结束后的冷却期：相机可能仍在写卡，期间不做保活判定。 */
     private static final long TRANSFER_COOLDOWN_MS = 10000L;
+    /** 等待用户在弹出的系统对话框里加入相机 Wi‑Fi 的上限（含用户取消/密码错）。 */
+    private static final long SPECIFIER_TIMEOUT_MS = 45_000L;
     /** 最近一次传输结束时刻（含失败），用于心跳冷却。 */
     private volatile long lastTransferFinishedAt;
     /** 完整扫描结果缓存：同一会话内翻页复用，避免每页重扫整卡。 */
@@ -127,8 +204,17 @@ public final class CameraSessionCoordinator {
 
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback wifiNetworkCallback;
+    /** WifiNetworkSpecifier 的请求句柄：与 wifiNetworkCallback 互斥，两者不同时注册。 */
+    private volatile ConnectivityManager.NetworkCallback specifierNetworkCallback;
+    /** 等待系统对话框结果的闸门；executor 线程阻塞在此，回调在主线程放行。 */
+    private volatile CountDownLatch specifierLatch;
+    /** specifier 回调加入成功时写入的网络；未加入时为 null。 */
+    private final AtomicReference<Network> specifierResult = new AtomicReference<>();
     private Network cameraWifiNetwork;
     private Network sessionNetwork;
+    /** 相机 Wi‑Fi 名称/密码；SSID 为空表示不改网络，沿用系统已连的那条。 */
+    private volatile String cameraSsid = "";
+    private volatile String cameraPassphrase = "";
     /** 会话期间持有：避免息屏/待机时 Wi‑Fi 无线电休眠导致传输中断。 */
     private final WifiManager wifiManager;
     private WifiManager.WifiLock wifiLock;
@@ -138,6 +224,8 @@ public final class CameraSessionCoordinator {
     private volatile boolean connecting;
     private volatile boolean reconnecting;
     private volatile boolean manualDisconnect;
+    /** 应用已退到后台：停心跳探测但保留链路与传输（见 {@link HoldState#SUSPEND}）。 */
+    private volatile boolean suspended;
     private final HeartbeatMonitor heartbeat =
             new HeartbeatMonitor(ReconnectPolicy.OFFLINE_THRESHOLD);
     private volatile int reconnectAttempt;
@@ -147,6 +235,21 @@ public final class CameraSessionCoordinator {
 
     private volatile NewPhotoResolver activeResolver;
     private volatile TransferControl control;
+    /** 实时取景是否正在取帧；断开/关闭时置 false。 */
+    private volatile boolean liveViewActive;
+    /** 取景循环代际：每次开/关都自增，让在途的取帧任务自然退出。 */
+    private volatile long liveViewGeneration;
+    /** 当前取景画面尺寸（相机端推流分辨率）；由面板下拉框切换。 */
+    private volatile LiveViewSize liveViewSize = LiveViewSize.LARGE;
+    /** 正在跑的取景循环；拍摄期间会暂时断开取景，拍完用它重置「无画面」计时，避免误报停滞。 */
+    private volatile LiveViewPump activePump;
+    /**
+     * 拍摄序列进行中：取帧先让开，别在暂停取景与按快门之间往相机插帧请求。
+     * 取帧循环本身跑在独占线程上（见 {@link #startLiveView}），刻意不复用
+     * {@link #executor}——那条单线程还要跑界面操作与拍摄，取帧任务一旦排在前面，
+     * 每次点击都得先等一帧拉完，这就是「面板打开时整体都卡」的根因。
+     */
+    private volatile boolean liveViewSuspended;
     /** 相册导出失败是否已提示过（每次拍摄/下载开始时复位）。 */
     private volatile boolean exportFailureReported;
     /** 最近一次手动断开时相机侧会话的释放结果（诊断用，会随下一次连接失败一起展示）。 */
@@ -154,7 +257,8 @@ public final class CameraSessionCoordinator {
 
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override public void run() {
-            if (!connected || reconnecting || manualDisconnect) return;
+            // suspended：应用在后台，本 tick 不探测也不重排 → 后台零保活流量。
+            if (!connected || reconnecting || manualDisconnect || suspended) return;
             final CameraTransport active = transport;
             if (active == null || !active.supportsHeartbeat()) return;
             if (!(active instanceof PtpIpTransport)) return;
@@ -178,7 +282,8 @@ public final class CameraSessionCoordinator {
                 }
                 final boolean alive = ok;
                 mainHandler.post(() -> {
-                    if (!connected || manualDisconnect
+                    // suspended：挂起瞬间可能还有一帧在途的探测结果，此时不能据此判离线。
+                    if (!connected || manualDisconnect || suspended
                             || heartbeatGeneration != connectionGeneration) return;
                     if (heartbeat.recordProbeResult(alive)) {
                         enterReconnecting();
@@ -198,16 +303,15 @@ public final class CameraSessionCoordinator {
             if (!reconnecting || manualDisconnect) return;
             connecting = true;
             final long generation = ++connectionGeneration;
-            registerWifiNetworkCallback();
             executor.submit(() -> {
                 try {
                     CameraTransport active = transport;
                     if (active instanceof PtpIpTransport) {
-                        seedCameraWifiNetwork();
-                        Network network = liveCameraWifiNetwork();
-                        sessionNetwork = network;
-                        ((PtpIpTransport) active).setSocketFactory(
-                                network != null ? network.getSocketFactory() : null);
+                        bindWifiNetwork((PtpIpTransport) active, generation, true);
+                        if (!connectAttemptActive(generation, true)) {
+                            closeQuietly(active);
+                            return;
+                        }
                     }
                     String name = active.connect(cameraHost, cameraPort);
                     if (!connectAttemptActive(generation, true)) {
@@ -230,7 +334,6 @@ public final class CameraSessionCoordinator {
                         listener.onConnected(name);
                         acquireWifiLock();
                         startHeartbeat();
-                        registerWifiNetworkCallback();
                     });
                 } catch (Exception error) {
                     CameraTransport active = transport;
@@ -510,6 +613,8 @@ public final class CameraSessionCoordinator {
      */
     public void connect(TransportKind requestedKind, String host, int port) {
         manualDisconnect = false;
+        // 新会话从活跃态起步：上一次退后台留下的挂起标记不能带过来。
+        suspended = false;
         reconnecting = false;
         connecting = true;
         heartbeat.reset();
@@ -528,12 +633,11 @@ public final class CameraSessionCoordinator {
                     listener.onStatus("枚举 USB 相机…");
                 } else {
                     listener.onStatus("枚举 Wi‑Fi 网络…");
-                    seedCameraWifiNetwork();
-                    registerWifiNetworkCallback();
-                    Network network = liveCameraWifiNetwork();
-                    sessionNetwork = network;
-                    ((PtpIpTransport) active).setSocketFactory(
-                            network != null ? network.getSocketFactory() : null);
+                    bindWifiNetwork((PtpIpTransport) active, generation, false);
+                    if (!connectAttemptActive(generation, false)) {
+                        closeQuietly(active);
+                        return;
+                    }
                     listener.onStatus("建立 PTP/IP 双通道…");
                 }
                 String name = active.connect(host, port);
@@ -649,6 +753,8 @@ public final class CameraSessionCoordinator {
         CameraTransport active = requestedKind == TransportKind.USB ? usbTransport : wifiTransport;
         transport = active;
         operations = new PtpOperationService(active);
+        // 换传输即换会话，取景状态不能再沿用。
+        invalidateLiveView();
         // 句柄在同一相机的不同会话间可复用，跨会话沿用旧缓存可能张冠李戴。
         thumbnailCache.evictAll();
         previewCache.evictAll();
@@ -698,15 +804,47 @@ public final class CameraSessionCoordinator {
         }
     }
 
+    // ── 连接保活 HOLD 三态（前台活跃 / 后台暂缓 / 释放） ──
+
+    /** 当前 HOLD 状态（派生值，语义见 {@link HoldState}）。 */
+    public HoldState holdState() {
+        return holdStateOf(connected, reconnecting, manualDisconnect, suspended);
+    }
+
+    /**
+     * 应用退到后台：停掉心跳探测（省电，也避免后台一次网络抖动就误判离线），
+     * 但不拆链路——socket、相机侧会话、WifiLock 全部保留，传输/拍摄/取景照常继续。
+     * 回到前台由 {@link #resumeHold()} 重新武装探测。
+     */
+    public void suspendHold() {
+        if (manualDisconnect) return;
+        suspended = true;
+        mainHandler.removeCallbacks(heartbeatRunnable);
+    }
+
+    /**
+     * 应用回到前台：立刻补一次探测（0 延迟复用既有心跳，不新增探测路径）。
+     * 不显式重置心跳计数：探测成功自身会清零，失败则与挂起前的历史合并，能更快判定真离线。
+     */
+    public void resumeHold() {
+        if (!suspended) return;
+        suspended = false;
+        if (connected && !reconnecting && !manualDisconnect) startHeartbeat(0L);
+    }
+
     /** 手动断开：不触发自动重连。 */
     public void disconnect() {
         connectionGeneration++;
+        // 取景循环必须先停：断开后相机会退出取景，残留的取帧任务只会反复报错。
+        invalidateLiveView();
         manualDisconnect = true;
+        suspended = false;
         reconnecting = false;
         connecting = false;
         mainHandler.removeCallbacks(heartbeatRunnable);
         mainHandler.removeCallbacks(reconnectRunnable);
         unregisterWifiNetworkCallback();
+        unregisterSpecifierCallback();
         releaseWifiLock();
         cameraWifiNetwork = null;
         sessionNetwork = null;
@@ -735,6 +873,8 @@ public final class CameraSessionCoordinator {
 
     public void shutdown() {
         manualDisconnect = true;
+        suspended = false;
+        invalidateLiveView();
         mainHandler.removeCallbacks(heartbeatRunnable);
         mainHandler.removeCallbacks(reconnectRunnable);
         CameraTransport session = transport;
@@ -747,6 +887,7 @@ public final class CameraSessionCoordinator {
         }
         closeQuietly(session);
         unregisterWifiNetworkCallback();
+        unregisterSpecifierCallback();
         releaseWifiLock();
         executor.shutdownNow();
     }
@@ -754,6 +895,289 @@ public final class CameraSessionCoordinator {
     public void cancelCurrent() {
         TransferControl current = control;
         if (current != null) current.cancel("用户取消");
+    }
+
+    // ── 实时取景与曝光参数（Canon EOS） ──
+
+    /**
+     * 作废正在跑的取景循环（断开、重连、切换传输、退出应用）。
+     * 直接改标志位而不经 executor：这些路径可能正被在途的相机 IO 占着线程，
+     * 排队等它反而会拖住断开；{@code liveViewGeneration} 自增即可让在途帧任务自行退出。
+     */
+    private void invalidateLiveView() {
+        liveViewActive = false;
+        liveViewGeneration++;
+        activePump = null;
+        liveViewSuspended = false;
+    }
+
+    /**
+     * 开启实时取景预览。取帧循环跑在独占线程上（见下），与界面/拍摄共用的是传输层的
+     * 命令锁：谁先拿到锁谁发命令，不会交错。
+     *
+     * <p>开启序列要退避重试几次：相机刚连上或刚拍完时可能拒绝 EVF 属性写入，只试一次会让
+     * 面板一直黑着（实测非要先拍一张才能出画面）。
+     */
+    public void startLiveView() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onLiveViewStatus("请先连接相机。"));
+                return;
+            }
+            if (liveViewActive) return;
+            long generation = liveViewGeneration;
+            LiveViewSize size = liveViewSize;
+            Exception lastError = null;
+            for (int attempt = 1; attempt <= LIVE_VIEW_ENABLE_ATTEMPTS; attempt++) {
+                if (!isConnected() || generation != liveViewGeneration) return;
+                try {
+                    operations.setLiveViewEnabled(true, size);
+                    lastError = null;
+                    break;
+                } catch (Exception error) {
+                    lastError = error;
+                    if (attempt < LIVE_VIEW_ENABLE_ATTEMPTS) {
+                        sleepQuietly(LIVE_VIEW_ENABLE_BACKOFF_MS * attempt);
+                    }
+                }
+            }
+            if (lastError != null) {
+                String message = lastError.getMessage() != null
+                        ? lastError.getMessage() : "实时取景开启失败";
+                mainHandler.post(() -> listener.onLiveViewStatus(message));
+                return;
+            }
+            liveViewActive = true;
+            long activeGeneration = ++liveViewGeneration;
+            mainHandler.post(() -> listener.onLiveViewStatus("实时取景已开启"));
+            LiveViewPump pump = new LiveViewPump();
+            activePump = pump;
+            // 取帧循环走独占线程：绝不再往共享 executor 里递归提交，否则每条界面命令
+            // 都要排在待取的那一帧后面。停止靠 liveViewActive/generation 标志位。
+            Thread thread = new Thread(
+                    () -> pumpLiveViewLoop(activeGeneration, pump), "imagefetch-liveview");
+            thread.setDaemon(true);
+            thread.start();
+        });
+    }
+
+    /**
+     * 切换取景画面尺寸（相机端推流分辨率）。取景进行中时立刻改写 0xD1B0 的输出位，
+     * 下一帧起就是新分辨率；未开取景时只记下来，下次开取景生效。
+     */
+    public void setLiveViewSize(LiveViewSize size) {
+        if (size == null || size == liveViewSize) return;
+        liveViewSize = size;
+        if (!liveViewActive) return;
+        executor.submit(() -> {
+            if (!liveViewActive || !isConnected()) return;
+            try {
+                operations.setLiveViewEnabled(true, size);
+            } catch (Exception ignored) {
+                // 改尺寸失败不影响正在进行的取景：继续按原分辨率推画面。
+            }
+        });
+    }
+
+    /**
+     * 关闭实时取景。可从主线程直接调用（例如对话框关闭时）。
+     *
+     * <p>即使取景没开着也照发一次关闭序列：它同时负责把机身屏还回去
+     * （EVFMode=0 → SetRemoteMode(0)/(1)，见 PtpIpTransport#setLiveViewEnabled），
+     * 用户要求「关闭面板时恢复相机显示」，所以不能提前返回。
+     */
+    public void stopLiveView() {
+        invalidateLiveView();
+        executor.submit(() -> {
+            try {
+                operations.setLiveViewEnabled(false, liveViewSize);
+            } catch (Exception ignored) {
+                // 关闭失败不影响会话；断开连接时相机会自行退出取景。
+            }
+            mainHandler.post(() -> listener.onLiveViewStatus("实时取景已关闭，相机显示已恢复"));
+        });
+    }
+
+    /** 取帧循环的可变状态；同一时刻只有一个循环在跑（由 generation 保证）。 */
+    private static final class LiveViewPump {
+        int consecutiveErrors;
+        /** 已经因为「收不到帧」重发过几次开启序列。 */
+        int stallRestarts;
+        long lastFrameAt = System.currentTimeMillis();
+        long lastRestartAt = System.currentTimeMillis();
+    }
+
+    /**
+     * 取帧循环主体（独占线程）：只要代际没被作废就一直取帧。
+     *
+     * <p>被「拍摄序列」挂起时只轮询标志位，完全不碰相机——暂停取景与按快门之间插一帧
+     * 请求只会让相机更忙。
+     */
+    private void pumpLiveViewLoop(long generation, LiveViewPump pump) {
+        while (liveViewActive && generation == liveViewGeneration) {
+            if (liveViewSuspended) {
+                if (!sleepQuietly(LIVE_VIEW_SUSPEND_POLL_MS)) return;
+                continue;
+            }
+            if (!pumpLiveViewFrame(generation, pump)) return;
+        }
+    }
+
+    /**
+     * 取一帧并休眠。用 {@code generation} 判断自己是否已被关闭/重连作废；
+     * 返回 {@code false} 表示循环该结束了。
+     *
+     * <p>不把单次取帧异常当成断开：相机忙时抛一次很常见，连续
+     * {@code LIVE_VIEW_MAX_CONSECUTIVE_ERRORS} 次才算真的中断。若长时间一帧都拿不到
+     * （相机对开启写入回了 OK 却没真正切开取景输出），重发一次开启序列。
+     */
+    private boolean pumpLiveViewFrame(long generation, LiveViewPump pump) {
+        if (!liveViewActive || generation != liveViewGeneration) return false;
+        long delay = LIVE_VIEW_FRAME_INTERVAL_MS;
+        boolean gotFrame = false;
+        try {
+            byte[] jpeg = operations.liveViewFrame();
+            if (jpeg == null) {
+                // 相机还没准备好这一帧：正常情况，退避后再来。
+                delay = LIVE_VIEW_RETRY_INTERVAL_MS;
+            } else {
+                gotFrame = true;
+                pump.consecutiveErrors = 0;
+                Bitmap frame = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+                if (frame != null) {
+                    mainHandler.post(() -> listener.onLiveViewFrame(frame));
+                }
+            }
+        } catch (Exception error) {
+            pump.consecutiveErrors++;
+            if (pump.consecutiveErrors >= LIVE_VIEW_MAX_CONSECUTIVE_ERRORS) {
+                // 连续失败基本等同于链路故障：停掉循环，把原因交给界面，重连由心跳负责。
+                liveViewActive = false;
+                String message = error.getMessage() != null ? error.getMessage() : "实时取景中断";
+                mainHandler.post(() -> listener.onLiveViewStatus("实时取景中断：" + message));
+                return false;
+            }
+            delay = LIVE_VIEW_RETRY_INTERVAL_MS;
+        }
+
+        long now = System.currentTimeMillis();
+        if (gotFrame) {
+            pump.lastFrameAt = now;
+        } else if (now - pump.lastFrameAt >= LIVE_VIEW_STALL_RESTART_MS
+                && now - pump.lastRestartAt >= LIVE_VIEW_STALL_RESTART_MS) {
+            // 一帧都没出：相机可能对开启写入回了 OK 却没真正切到取景输出。先重发开启序列；
+            // 仍不出图就再补一次半按唤醒——实测「先拍一张后取景才出画面」，说明取景输出要经过
+            // 一次释放周期才真正启动，而半按只测光/对焦、不会拍照。
+            pump.lastRestartAt = now;
+            pump.lastFrameAt = now;
+            pump.stallRestarts++;
+            try {
+                operations.setLiveViewEnabled(true, liveViewSize);
+                if (pump.stallRestarts > 1) operations.wakeForLiveView();
+            } catch (Exception ignored) {
+                // 重发失败不额外报错：下面的取帧会继续退避重试。
+            }
+            String hint = pump.stallRestarts > 1
+                    ? "实时取景无画面，已尝试半按唤醒相机…"
+                    : "实时取景无画面，正在重发开启序列…";
+            mainHandler.post(() -> listener.onLiveViewStatus(hint));
+        }
+
+        if (!sleepQuietly(delay)) {
+            // 退出应用/断开时会打断取景线程，直接结束循环即可。
+            return false;
+        }
+        return liveViewActive && generation == liveViewGeneration;
+    }
+
+    /** 睡一会儿；被打断返回 false（取景循环据此退出）。 */
+    private static boolean sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+            return true;
+        } catch (InterruptedException interrupted) {
+            return false;
+        }
+    }
+
+    /** 读取某个曝光参数的当前档位；读不到时回调里给出原因（相机可能不推送该值）。 */
+    public void readExposure(final CanonExposure.Setting setting) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onExposureResult(
+                        setting, -1, null, "请先连接相机。"));
+                return;
+            }
+            try {
+                long raw = operations.readExposure(setting);
+                // 读取回的是机型自己的编码值（与写入同一套表），按表定位档位；
+                // 极少数机型可能回的是标准读数，再按标准换算兜一次。
+                int index = CanonExposure.indexOfValue(setting, (int) raw);
+                if (index < 0) index = CanonExposure.matchStandard(setting, raw);
+                if (index < 0) {
+                    mainHandler.post(() -> listener.onExposureResult(
+                            setting, -1, null, "相机回的档位不在可选列表里"));
+                    return;
+                }
+                final int resolved = index;
+                String display = CanonExposure.display(
+                        setting, CanonExposure.entries(setting).get(resolved).label);
+                mainHandler.post(() -> listener.onExposureResult(setting, resolved, display, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "读取失败";
+                mainHandler.post(() -> listener.onExposureResult(setting, -1, null, message));
+            }
+        });
+    }
+
+    /** 写入某个曝光参数的档位（{@code index} 为 {@link CanonExposure#entries} 的下标）。 */
+    public void writeExposure(final CanonExposure.Setting setting, final int index) {
+        List<CanonExposure.Entry> entries = CanonExposure.entries(setting);
+        if (index < 0 || index >= entries.size()) return;
+        final CanonExposure.Entry entry = entries.get(index);
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onExposureResult(
+                        setting, -1, null, "请先连接相机。"));
+                return;
+            }
+            try {
+                operations.writeExposure(setting, entry.value);
+                String display = CanonExposure.display(setting, entry.label);
+                mainHandler.post(() -> listener.onExposureResult(setting, index, display, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "写入失败";
+                // 写入失败必须让用户看见：界面上档位会保持在用户选的值（不回退成「—」），
+                // 如果不额外报一句，失败就被静默吞掉了。
+                mainHandler.post(() -> listener.onLiveViewStatus(setting.label + "写入失败：" + message));
+                mainHandler.post(() -> listener.onExposureResult(setting, -1, null, message));
+            }
+        });
+    }
+
+    /**
+     * 触发一次单次自动对焦（Canon EOS {@code 0x9154 EOS_DoAf}）。面板上的「自动对焦」
+     * 按钮调用；对焦需要取景已开启，所以只在面板打开、取景运行时才有意义。
+     */
+    public void autofocus() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onLiveViewStatus("请先连接相机。"));
+                mainHandler.post(listener::onAutofocusFinished);
+                return;
+            }
+            mainHandler.post(() -> listener.onLiveViewStatus("正在自动对焦…"));
+            String failure = null;
+            try {
+                operations.autofocus();
+            } catch (Exception error) {
+                failure = error.getMessage() != null ? error.getMessage() : "对焦失败";
+            }
+            final String result = failure;
+            mainHandler.post(() -> listener.onLiveViewStatus(
+                    result == null ? "自动对焦完成" : "自动对焦失败：" + result));
+            mainHandler.post(listener::onAutofocusFinished);
+        });
     }
 
     /** 触发一次拍摄并自动取回新产生的 JPEG 原图（无 JPEG 时跳过，不保存 RAW）。 */
@@ -766,7 +1190,24 @@ public final class CameraSessionCoordinator {
             TransferControl current = new TransferControl();
             control = current;
             exportFailureReported = false;
+            // 实时取景开着时机身把画面独占给 App，此时全按会被拒（实测 0x2019 DeviceBusy）。
+            // 触发快门前先退出取景，拍完再恢复；libgphoto2 的内存拍摄路径同样是在
+            // 关掉取景输出后才让相机真正释放快门的。
+            boolean resumeLiveView = liveViewActive;
+            // 恢复取景是否已经完成。快门一响就立刻恢复（见下面），finally 只兜底，
+            // 免得「暂停」状态跨过整个取回流程——那期间相机拒绝一切 0x9110 属性写入。
+            boolean liveViewResumed = false;
             try {
+                if (resumeLiveView) {
+                    // 取帧先让开：暂停取景与按快门之间不该再往相机插帧请求。
+                    liveViewSuspended = true;
+                    listener.onStatus("暂停实时取景以释放快门…");
+                    try {
+                        operations.pauseLiveViewForCapture(liveViewSize);
+                    } catch (Exception ignored) {
+                        // 退出取景失败也照拍：真失败会体现在快门响应码里。
+                    }
+                }
                 listener.onStatus("读取拍摄前句柄快照…");
                 CameraStorage.Snapshot baseline = operations.snapshot(CAPTURE_BASELINE_ITEMS);
                 NewPhotoResolver resolver = new NewPhotoResolver(
@@ -776,6 +1217,13 @@ public final class CameraSessionCoordinator {
 
                 listener.onStatus("触发相机快门…");
                 long[] directHandles = operations.capture();
+
+                // 快门已经松开，取景不必再等文件取回：暂停期间相机停在 EVFOutputDevice=0
+                // 的状态，此时任何 0x9110 属性写入（快门/光圈/ISO）都会被回 0x2019——
+                // 「刚拍完就改参数报忙」就是这么来的。下载要花好几秒，必须先把取景还回去。
+                if (resumeLiveView) {
+                    liveViewResumed = resumeLiveViewAfterCapture(1) == null;
+                }
 
                 if (directHandles.length > 0) {
                     // 相机把图像直接放进机身内存（Nikon USB SDRAM 路径）：句柄已知，
@@ -874,8 +1322,51 @@ public final class CameraSessionCoordinator {
                 lastTransferFinishedAt = System.currentTimeMillis();
                 // 快门可能已改变卡内对象，句柄缓存与完整扫描缓存都不能再用。
                 invalidateStorageCache();
+                // 兜底恢复：正常情况下上面「快门一响就恢复」已经做完了，只有那次失败
+                // （或快门抛异常没走到那一步）才轮到这里重试一次。失败必须报出来——
+                // 相机停在 EVFOutputDevice=0 时不接受任何 0x9110 属性写入。
+                if (resumeLiveView && !liveViewResumed && liveViewActive && isConnected()) {
+                    String failure = resumeLiveViewAfterCapture(2);
+                    if (failure != null) {
+                        String message = failure;
+                        mainHandler.post(() -> listener.onStatus(
+                                "恢复实时取景失败，参数调整可能被相机拒绝：" + message));
+                    }
+                }
+                LiveViewPump pump = activePump;
+                if (pump != null) pump.lastFrameAt = System.currentTimeMillis();
+                // 恢复序列走完才放开取帧，免得帧请求插在相机切回取景输出的中间。
+                liveViewSuspended = false;
+                // 「未发现 JPEG」等分支不落盘也不报错，必须靠这条回调让界面恢复按钮。
+                mainHandler.post(listener::onCaptureFinished);
             }
         });
+    }
+
+    /**
+     * 拍摄后把实时取景还回去，失败返回原因（调用方报给用户）。
+     *
+     * <p>这一步不能静默吞掉：{@code pauseLiveViewForCapture} 会把 {@code EVFOutputDevice}
+     * 清成 0，相机停在那个状态时会拒绝一切 {@code 0x9110} 属性写入（快门/光圈/ISO 三档
+     * 全报 {@code 0x2019}），必须把「没恢复成功」告诉用户，而不是让他对着「参数写不进去」
+     * 猜原因。调用方在快门刚响时只试一次（那时相机在写卡，试多了纯等），全部取回结束后
+     * 再兜底多试一轮。
+     *
+     * @param attempts 最多尝试几次
+     */
+    private String resumeLiveViewAfterCapture(int attempts) {
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                operations.setLiveViewEnabled(true, liveViewSize);
+                return null;
+            } catch (Exception error) {
+                if (attempt == attempts) {
+                    return error.getMessage() != null ? error.getMessage() : "相机拒绝了取景开启";
+                }
+                sleepQuietly(LIVE_VIEW_ENABLE_BACKOFF_MS);
+            }
+        }
+        return null;
     }
 
     /** 手动下载选中的相机对象；与拍摄路径一致，仅 JPEG 可下载，RAW/其他格式一律跳过。 */
@@ -989,12 +1480,15 @@ public final class CameraSessionCoordinator {
     private void enterReconnecting() {
         if (!connected || reconnecting || manualDisconnect) return;
         connectionGeneration++;
+        // 重连期间相机会退出取景：先停循环，重连成功后由界面重新开启。
+        invalidateLiveView();
         reconnecting = true;
         connected = false;
         heartbeat.reset();
         reconnectAttempt = 0;
         mainHandler.removeCallbacks(heartbeatRunnable);
         unregisterWifiNetworkCallback();
+        unregisterSpecifierCallback();
         // 绑定网络随会话作废；候选缓存保留，供紧接的自动重连复用。
         sessionNetwork = null;
         TransferControl current = control;
@@ -1028,6 +1522,140 @@ public final class CameraSessionCoordinator {
     }
 
     // ── 相机 Wi‑Fi 精确路由（移植自 ZENCHE MainActivity） ──
+
+    /** 写入相机 Wi‑Fi 凭据；SSID 为空表示不改网络，沿用系统已连的那条（connect 前调用）。 */
+    public void setCameraWifiCredentials(String ssid, String passphrase) {
+        cameraSsid = ssid == null ? "" : ssid.trim();
+        cameraPassphrase = passphrase == null ? "" : passphrase;
+    }
+
+    /**
+     * 是否用 {@link WifiNetworkSpecifier} 精确加入相机 AP（纯函数，便于契约测试）：
+     * 仅 SDK 29+ 且填写了非空 SSID 时才走系统对话框，低版本 / 留空回退自动选网。
+     */
+    static boolean shouldUseSpecifier(int sdkInt, String ssid) {
+        return sdkInt >= Build.VERSION_CODES.Q && isValidSsid(ssid);
+    }
+
+    /** SSID 是否有效：非 null 且去掉首尾空白后非空。 */
+    static boolean isValidSsid(String ssid) {
+        return ssid != null && !ssid.trim().isEmpty();
+    }
+
+    /**
+     * 为当前会话绑定相机 Wi‑Fi 网络，并把 socket 工厂注入传输层。
+     * 填了 SSID 且系统支持时优先弹「加入网络」对话框精确加入；用户取消 / 超时 / 密码错
+     * 只回退到自动选网，不判失败。两条路径都只在拿到「首选网络」时注入其 SocketFactory，
+     * 拿不到就交由传输层走默认路由。
+     *
+     * <p>在 executor 线程上执行；等待系统对话框会短暂阻塞该线程。
+     */
+    private void bindWifiNetwork(PtpIpTransport active, long generation, boolean reconnect) {
+        if (shouldUseSpecifier(Build.VERSION.SDK_INT, cameraSsid)
+                && connectAttemptActive(generation, reconnect)) {
+            listener.onStatus("正在加入相机 Wi‑Fi「" + cameraSsid + "」…");
+            // 先清掉上一次会话可能残留的回调/闸门，再武装本次的闸门。
+            unregisterSpecifierCallback();
+            CountDownLatch latch = new CountDownLatch(1);
+            specifierResult.set(null);
+            specifierLatch = latch;
+            mainHandler.post(() -> requestSpecifierNetwork(latch));
+            Network joined = awaitSpecifierNetwork(latch, SPECIFIER_TIMEOUT_MS);
+            specifierLatch = null;
+            if (joined != null) {
+                // cameraWifiNetwork 已由 onAvailable 置好；这里只补会话绑定与 socket 工厂。
+                sessionNetwork = joined;
+                active.setSocketFactory(joined.getSocketFactory());
+                return;
+            }
+            unregisterSpecifierCallback();
+            if (!connectAttemptActive(generation, reconnect)) return;
+            listener.onStatus("未加入相机 Wi‑Fi，改用系统已连网络…");
+        }
+        seedCameraWifiNetwork();
+        registerWifiNetworkCallback();
+        Network network = liveCameraWifiNetwork();
+        sessionNetwork = network;
+        active.setSocketFactory(network != null ? network.getSocketFactory() : null);
+    }
+
+    /** 弹出系统「加入相机 Wi‑Fi」对话框并发起请求；必须在主线程调用。 */
+    private void requestSpecifierNetwork(CountDownLatch latch) {
+        ConnectivityManager manager = connectivityManager;
+        if (manager == null || manualDisconnect) {
+            latch.countDown();
+            return;
+        }
+        final long callbackGeneration = connectionGeneration;
+        ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network network) {
+                // 只有仍是本次会话、且回调未过期时才认领这个网络；否则让 bindWifiNetwork 走回退。
+                if (callbackGeneration == connectionGeneration
+                        && specifierNetworkCallback == this) {
+                    cameraWifiNetwork = network;
+                    sessionNetwork = network;
+                    specifierResult.set(network);
+                }
+                latch.countDown();
+            }
+
+            @Override public void onUnavailable() {
+                // 用户取消 / 超时 / 密码错：由 bindWifiNetwork 走回退，不在此判失败。
+                latch.countDown();
+            }
+
+            @Override public void onLost(Network network) {
+                // specifier 模式下不注册通用回调，网络丢失只能靠这里感知。
+                if (callbackGeneration != connectionGeneration) return;
+                mainHandler.post(() -> {
+                    Network bound = sessionNetwork != null ? sessionNetwork : cameraWifiNetwork;
+                    if (cameraWifiNetwork != null && cameraWifiNetwork.equals(network)) {
+                        cameraWifiNetwork = null;
+                    }
+                    if (bound == null || !bound.equals(network)) return;
+                    if (specifierNetworkCallback == this && connected && !manualDisconnect) {
+                        listener.onStatus("相机 Wi‑Fi 网络已丢失。");
+                        enterReconnecting();
+                    }
+                });
+            }
+        };
+        specifierNetworkCallback = callback;
+        NetworkRequest request;
+        try {
+            WifiNetworkSpecifier.Builder specifier =
+                    new WifiNetworkSpecifier.Builder().setSsid(cameraSsid);
+            // 空密码视为开放网络；密码格式不合法时 setWpa2Passphrase 会抛，交由外层回退。
+            if (!cameraPassphrase.isEmpty()) specifier.setWpa2Passphrase(cameraPassphrase);
+            request = new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .setNetworkSpecifier(specifier.build())
+                    .build();
+        } catch (Exception ignored) {
+            specifierNetworkCallback = null;
+            latch.countDown();
+            return;
+        }
+        try {
+            // 三参重载自 API 26 起可用：超时后系统回调 onUnavailable，无需自己计时。
+            manager.requestNetwork(request, callback, (int) SPECIFIER_TIMEOUT_MS);
+        } catch (Exception ignored) {
+            specifierNetworkCallback = null;
+            latch.countDown();
+        }
+    }
+
+    /** 等系统对话框结果（executor 线程阻塞，回调在主线程放行）；超时/中断返回 null。 */
+    private Network awaitSpecifierNetwork(CountDownLatch latch, long timeoutMillis) {
+        try {
+            if (!latch.await(timeoutMillis, TimeUnit.MILLISECONDS)) return null;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        return specifierResult.get();
+    }
 
     private void registerWifiNetworkCallback() {
         if (wifiNetworkCallback != null || connectivityManager == null) return;
@@ -1116,6 +1744,21 @@ public final class CameraSessionCoordinator {
             connectivityManager.unregisterNetworkCallback(callback);
         } catch (Exception ignored) {
         }
+    }
+
+    private void unregisterSpecifierCallback() {
+        ConnectivityManager.NetworkCallback callback = specifierNetworkCallback;
+        specifierNetworkCallback = null;
+        if (callback != null && connectivityManager != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(callback);
+            } catch (Exception ignored) {
+            }
+        }
+        // 可能正有 connectAttempt 阻塞在闸门上：立刻放行，避免断开/退出被拖住。
+        CountDownLatch latch = specifierLatch;
+        specifierLatch = null;
+        if (latch != null) latch.countDown();
     }
 
     /**

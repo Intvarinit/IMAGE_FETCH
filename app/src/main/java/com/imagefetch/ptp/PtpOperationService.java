@@ -74,6 +74,40 @@ public final class PtpOperationService {
         return transport.capture();
     }
 
+    /** 开关实时取景（Canon EOS 厂商路径）。 */
+    public void setLiveViewEnabled(boolean enabled, LiveViewSize size) throws Exception {
+        transport.setLiveViewEnabled(enabled, size);
+    }
+
+    /** 只为「拍摄」临时退出取景：彻底关掉取景输出，拍完由调用方恢复。 */
+    public void pauseLiveViewForCapture(LiveViewSize size) throws Exception {
+        transport.pauseLiveViewForCapture(size);
+    }
+
+    public void wakeForLiveView() throws Exception {
+        transport.wakeForLiveView();
+    }
+
+    /** 取一帧实时取景 JPEG；相机未就绪时返回 null。 */
+    public byte[] liveViewFrame() throws Exception {
+        return transport.liveViewFrame();
+    }
+
+    /** 触发一次单次自动对焦（Canon EOS 厂商路径）。 */
+    public void autofocus() throws Exception {
+        transport.autofocus();
+    }
+
+    /** 写入曝光参数（机上编码值）。 */
+    public void writeExposure(CanonExposure.Setting setting, int value) throws Exception {
+        transport.writeExposure(setting, value);
+    }
+
+    /** 读取曝光参数的当前编码值；交给 {@link CanonExposure#indexOfValue} 换算成档位。 */
+    public long readExposure(CanonExposure.Setting setting) throws Exception {
+        return transport.readExposure(setting);
+    }
+
     public long download(
             long handle,
             OutputStream output,

@@ -13,9 +13,15 @@ import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -28,6 +34,8 @@ import android.widget.Spinner;
 import android.widget.TextView;
 
 import com.imagefetch.ptp.CameraStorage;
+import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.ui.PhotoGridAdapter;
 
@@ -46,11 +54,17 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final String USB_PERMISSION_ACTION = "com.imagefetch.USB_PERMISSION";
     private static final long USB_PERMISSION_TIMEOUT_MS = 35_000L;
     private static final int REQUEST_WRITE_STORAGE = 0x70;
+    private static final int REQUEST_NOTIFICATIONS = 0x71;
+    private static final int REQUEST_NEARBY_WIFI = 0x72;
+    private static final int REQUEST_WIFI_PICKER = 0x73;
 
     private static final String PREFS_NAME = "image_fetch_prefs";
     private static final String PREF_EXPORT_TO_GALLERY = "export_to_gallery";
     private static final String PREF_PAGE_SIZE = "page_size";
     private static final String PREF_JPEG_ONLY = "jpeg_only";
+    private static final String PREF_CAMERA_SSID = "camera_ssid";
+    private static final String PREF_CAMERA_PASSWORD = "camera_password";
+    private static final String PREF_LIVE_VIEW_SIZE = "live_view_size";
     private static final int[] PAGE_SIZE_OPTIONS = {20, 50, 100};
     private static final int DEFAULT_PAGE_SIZE = PAGE_SIZE_OPTIONS[0];
 
@@ -58,6 +72,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private SharedPreferences preferences;
     private EditText hostField;
     private EditText portField;
+    /**
+     * 相机 Wi‑Fi 凭据只持久化、不在界面上显示：用户到系统 Wi‑Fi 页面自己选网，
+     * 名称回来后自动记下。为空表示不改网络，仍用系统已连上的那条。
+     */
+    private Button pickWifiButton;
+    /** 是否刚跳去过系统 Wi‑Fi 设置：回来时据此做一次名称回填并给出提示。 */
+    private boolean wifiPickerLaunched;
+    /** 因缺「定位」权限而暂缓的「选择 Wi‑Fi」跳转，授权回调后补发。 */
+    private boolean pendingWifiPicker;
+    /** 因缺「附近的设备」权限而暂缓的 Wi‑Fi 连接，授权回调后补发。 */
+    private boolean pendingWifiConnect;
+    /** 本次会话是否由 Wi‑Fi 发起（连接成功后据此反写 Wi‑Fi 名称；USB 会话与本机 Wi‑Fi 无关）。 */
+    private boolean wifiSession;
     private Button connectButton;
     private Button connectUsbButton;
     private Button captureButton;
@@ -77,6 +104,25 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private GridView photoGrid;
     private PhotoGridAdapter gridAdapter;
 
+    /** 遥控拍摄面板（点「拍摄并取回」打开）；关闭后置空。 */
+    private AlertDialog captureDialog;
+    private ImageView liveViewImage;
+    private TextView liveViewStatusView;
+    private Button captureShootButton;
+    /** 面板上的「自动对焦」按钮；对焦进行中禁用，结束后恢复。关闭面板后置空。 */
+    private Button captureAutofocusButton;
+    /** 取景画面尺寸下拉框（相机端推流分辨率）；面板关闭后置空。 */
+    private Spinner liveViewSizeSpinner;
+    private final List<ExposureRow> exposureRows = new ArrayList<>();
+    /** 当前显示的取景帧；换帧后延迟回收，避免渲染线程仍在读它。 */
+    private Bitmap liveViewBitmap;
+    /** 拍摄取回进行中：面板上的快门按钮据此防重复触发。 */
+    private boolean captureRunning;
+    /** 曝光写入的合并窗口：连点 −/+ 只把最终值发给相机一次。 */
+    private static final long EXPOSURE_WRITE_DEBOUNCE_MS = 250L;
+    private final Handler deferredRecycle = new Handler(Looper.getMainLooper());
+    private final Handler debounceHandler = new Handler(Looper.getMainLooper());
+
     /** 当前页序号（从 0 开始）与是否处于“完整扫描”模式。 */
     private int currentPage;
     private boolean fullScanMode;
@@ -92,6 +138,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
         hostField = findViewById(R.id.host);
         portField = findViewById(R.id.port);
+        pickWifiButton = findViewById(R.id.pickWifi);
         connectButton = findViewById(R.id.connect);
         connectUsbButton = findViewById(R.id.connectUsb);
         captureButton = findViewById(R.id.capture);
@@ -123,6 +170,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
         // 开关与每页张数在本次启动前先恢复，再挂监听（避免恢复动作自身触发写盘）。
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        pickWifiButton.setOnClickListener(view -> openWifiPicker());
         boolean export = preferences.getBoolean(PREF_EXPORT_TO_GALLERY, true);
         int configuredPageSize = preferences.getInt(PREF_PAGE_SIZE, DEFAULT_PAGE_SIZE);
         setUpPageSizeSpinner(configuredPageSize);
@@ -164,9 +212,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 showError("请输入有效的相机地址与端口。", null);
                 return;
             }
-            setBusy(true);
-            updateConnectButton(false);
-            coordinator.connect(CameraSessionCoordinator.TransportKind.WIFI, host, port);
+            connectWifi(false);
         });
 
         connectUsbButton.setOnClickListener(view -> {
@@ -176,6 +222,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             }
             setBusy(true);
             updateConnectButton(false);
+            wifiSession = false;
             coordinator.connect(CameraSessionCoordinator.TransportKind.USB, "", 0);
         });
 
@@ -184,9 +231,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 showError("请先连接相机。", null);
                 return;
             }
-            progressBar.setProgress(0);
-            setBusy(true);
-            coordinator.captureAndFetch();
+            // 拍摄取回改为在遥控面板里触发：面板同时提供实时取景与快门/光圈/ISO 调整。
+            showCapturePanel();
         });
 
         refreshButton.setOnClickListener(view -> {
@@ -317,6 +363,243 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         return text.toString();
     }
 
+    // ── 遥控拍摄面板（实时取景 + 快门/光圈/ISO） ──
+
+    /**
+     * 打开遥控拍摄面板：实时取景预览 + 三档曝光参数 + 「拍摄并取回」。
+     * 打开即开取景并读三档当前值；关闭（含链路断开）时停取景并回收最后一帧。
+     */
+    private void showCapturePanel() {
+        if (captureDialog != null) return;
+        View content = getLayoutInflater().inflate(R.layout.dialog_capture, null);
+        liveViewImage = content.findViewById(R.id.liveViewImage);
+        liveViewStatusView = content.findViewById(R.id.liveViewStatus);
+        captureShootButton = content.findViewById(R.id.captureShoot);
+        captureAutofocusButton = content.findViewById(R.id.captureAutofocus);
+        liveViewSizeSpinner = content.findViewById(R.id.liveViewSize);
+
+        // 取景是 3:2 画面：给黑底定一个固定高度，换帧时弹窗高度才不会跟着抖动。
+        // 比例不能太大——预览是弹窗里最高的一块，占满后下面的档位行和拍摄按钮会被挤出
+        // 可视区（表现为「按钮被压缩」）。
+        ViewGroup.LayoutParams imageParams = liveViewImage.getLayoutParams();
+        imageParams.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.28f);
+        liveViewImage.setLayoutParams(imageParams);
+
+        exposureRows.clear();
+        exposureRows.add(bindExposureRow(
+                content, R.id.shutterRow, CanonExposure.Setting.SHUTTER_SPEED));
+        exposureRows.add(bindExposureRow(
+                content, R.id.apertureRow, CanonExposure.Setting.APERTURE));
+        exposureRows.add(bindExposureRow(content, R.id.isoRow, CanonExposure.Setting.ISO));
+
+        captureShootButton.setOnClickListener(view -> shootFromPanel());
+        captureAutofocusButton.setOnClickListener(view -> {
+            // 对焦要等相机执行完才回，期间禁用按钮避免连点排队。
+            captureAutofocusButton.setEnabled(false);
+            coordinator.autofocus();
+        });
+        setUpLiveViewSizeSpinner();
+
+        captureDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.capture_panel_title)
+                .setView(content)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        captureDialog.setOnDismissListener(ignored -> closeCapturePanel());
+        captureDialog.show();
+
+        // 先读三档当前值再开取景：开取景的退避重试最多会占用 executor 数秒，
+        // 排在后面会让参数迟迟显示不出来。
+        for (ExposureRow row : exposureRows) coordinator.readExposure(row.setting);
+        coordinator.startLiveView();
+    }
+
+    /** 面板收起：停取景、丢掉画面引用（否则整个 Activity 会被这几张位图拖住）。 */
+    private void closeCapturePanel() {
+        coordinator.stopLiveView();
+        // 还有合并中没发出去的档位调整：立刻补发，别让用户以为改好了其实没生效。
+        for (ExposureRow row : exposureRows) flushPendingExposureWrite(row);
+        debounceHandler.removeCallbacksAndMessages(null);
+        captureDialog = null;
+        liveViewImage = null;
+        liveViewStatusView = null;
+        captureShootButton = null;
+        captureAutofocusButton = null;
+        liveViewSizeSpinner = null;
+        exposureRows.clear();
+        // 先撤掉延迟回收任务，再回收当前帧；被撤掉的旧帧交给 GC 即可。
+        deferredRecycle.removeCallbacksAndMessages(null);
+        recycleLiveViewBitmap();
+    }
+
+    /** 链路断开/重连时主动收起面板；已经收起则什么都不做。 */
+    private void dismissCapturePanel() {
+        if (captureDialog != null && captureDialog.isShowing()) captureDialog.dismiss();
+    }
+
+    /**
+     * 取景画面尺寸下拉框：把档位序号持久化，切换后立刻改相机端推流分辨率
+     * （写 0xD1B0 的输出位，取景进行中下一帧生效）。
+     */
+    private void setUpLiveViewSizeSpinner() {
+        LiveViewSize[] sizes = LiveViewSize.values();
+        String[] labels = new String[sizes.length];
+        for (int i = 0; i < sizes.length; i++) labels[i] = sizes[i].label;
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        liveViewSizeSpinner.setAdapter(adapter);
+        LiveViewSize current = LiveViewSize.of(preferences.getInt(PREF_LIVE_VIEW_SIZE, 0));
+        liveViewSizeSpinner.setSelection(current.ordinal());
+        // 先把档位交给协调器，再打开取景：开取景时直接按这个尺寸推流。
+        coordinator.setLiveViewSize(current);
+        liveViewSizeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(
+                    AdapterView<?> parent, View view, int position, long id) {
+                LiveViewSize size = LiveViewSize.of(position);
+                preferences.edit().putInt(PREF_LIVE_VIEW_SIZE, size.ordinal()).apply();
+                coordinator.setLiveViewSize(size);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
+    private ExposureRow bindExposureRow(View parent, int rowId, CanonExposure.Setting setting) {
+        View row = parent.findViewById(rowId);
+        ((TextView) row.findViewById(R.id.rowLabel)).setText(setting.label);
+        List<CanonExposure.Entry> entries = CanonExposure.entries(setting);
+        ExposureRow result = new ExposureRow(
+                setting, row.findViewById(R.id.rowValue), entries.size());
+        // 先按约定默认档显示，读到相机真实值后再覆盖。
+        int fallback = CanonExposure.defaultIndex(setting);
+        result.index = fallback < 0 ? 0 : fallback;
+        result.value.setText(CanonExposure.display(setting, entries.get(result.index).label));
+        result.value.setOnClickListener(view -> showExposurePicker(result));
+        result.value.setContentDescription(setting.label + " 当前档位，点按可选档");
+        row.findViewById(R.id.rowMinus).setOnClickListener(view -> stepExposure(result, -1));
+        row.findViewById(R.id.rowPlus).setOnClickListener(view -> stepExposure(result, 1));
+        return result;
+    }
+
+    /** −/+ 逐档微调：本地档位立刻推进，写入合并到停止点击之后。 */
+    private void stepExposure(ExposureRow row, int delta) {
+        if (!coordinator.isConnected()) {
+            showError("请先连接相机。", null);
+            return;
+        }
+        int next = row.index + delta;
+        if (next < 0 || next >= row.count) return;
+        applyExposureSelection(row, next, true);
+    }
+
+    /**
+     * 选中一个档位。
+     * {@code debounce} 为真（−/+ 连点）时，写入合并到 250ms 后的最后一次点击——
+     * 跨 6 档只产生 1 次 0x9110 事务，不至于和取景取帧抢同一个单线程队列；
+     * 从档位列表直选时立即写入。
+     */
+    private void applyExposureSelection(ExposureRow row, int index, boolean debounce) {
+        row.index = index;
+        // 用户手选的档位是权威值：立刻钉住，之后任何读取结果都不得把它刷回「—」。
+        row.pinned = true;
+        List<CanonExposure.Entry> entries = CanonExposure.entries(row.setting);
+        row.value.setText(CanonExposure.display(row.setting, entries.get(index).label));
+        // 上一次还没发出去的合并写入作废：只有最后一次点击算数。
+        if (row.pendingWrite != null) {
+            debounceHandler.removeCallbacks(row.pendingWrite);
+            row.pendingWrite = null;
+        }
+        if (!debounce) {
+            coordinator.writeExposure(row.setting, index);
+            return;
+        }
+        Runnable write = () -> {
+            row.pendingWrite = null;
+            coordinator.writeExposure(row.setting, row.index);
+        };
+        row.pendingWrite = write;
+        debounceHandler.postDelayed(write, EXPOSURE_WRITE_DEBOUNCE_MS);
+    }
+
+    /** 关闭面板前把还没发出去的档位补发掉，否则用户以为改好了其实没生效。 */
+    private void flushPendingExposureWrite(ExposureRow row) {
+        if (row.pendingWrite == null) return;
+        debounceHandler.removeCallbacks(row.pendingWrite);
+        row.pendingWrite = null;
+        coordinator.writeExposure(row.setting, row.index);
+    }
+
+    /** 档位列表直选：跨多档比连点 −/+ 快，且只产生一次写入。 */
+    private void showExposurePicker(ExposureRow row) {
+        List<CanonExposure.Entry> entries = CanonExposure.entries(row.setting);
+        String[] labels = new String[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            labels[i] = CanonExposure.display(row.setting, entries.get(i).label);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(row.setting.label)
+                .setSingleChoiceItems(labels, row.index, (dialog, which) -> {
+                    applyExposureSelection(row, which, false);
+                    dialog.dismiss();
+                })
+                .setNegativeButton(R.string.close, null)
+                .show();
+    }
+
+    /** 面板上的快门：走与主界面完全相同的一次拍摄取回流程。 */
+    private void shootFromPanel() {
+        if (!coordinator.isConnected()) {
+            showError("请先连接相机。", null);
+            return;
+        }
+        if (captureRunning) return;
+        captureRunning = true;
+        if (captureShootButton != null) captureShootButton.setEnabled(false);
+        if (liveViewStatusView != null) liveViewStatusView.setText(R.string.capture_running);
+        progressBar.setProgress(0);
+        setBusy(true);
+        coordinator.captureAndFetch();
+    }
+
+    private ExposureRow rowFor(CanonExposure.Setting setting) {
+        for (ExposureRow row : exposureRows) {
+            if (row.setting == setting) return row;
+        }
+        return null;
+    }
+
+    private void recycleLiveViewBitmap() {
+        Bitmap frame = liveViewBitmap;
+        liveViewBitmap = null;
+        if (frame != null && !frame.isRecycled()) frame.recycle();
+    }
+
+    /** 面板上一行曝光参数：档位是取值表下标，不是机上编码值。 */
+    private static final class ExposureRow {
+        final CanonExposure.Setting setting;
+        final TextView value;
+        final int count;
+        int index;
+        /** 已排期但还没发给相机的写入（−/+ 合并用）；空闲时为 null。 */
+        Runnable pendingWrite;
+        /**
+         * 该档的显示值是否已「钉住」：读到过真实值、或用户手动选过档。
+         * 钉住之后，后续读取失败不再把值刷成「—」——否则用户每调一次档，
+         * 三个要素就一起变回「—」，看着像调整没生效。
+         */
+        boolean pinned;
+
+        ExposureRow(CanonExposure.Setting setting, TextView value, int count) {
+            this.setting = setting;
+            this.value = value;
+            this.count = count;
+        }
+    }
+
     /** 明确区分两处落点：应用内暂存（下载中转，导出后清理）与系统相册可见位置。 */
     private void updateStorageLabels() {
         String album = exportToGalleryBox.isChecked()
@@ -397,8 +680,42 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        // 回到前台：重新武装保活探测（HOLD 三态里 SUSPEND → HOLD）。
+        if (coordinator != null) coordinator.resumeHold();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 从系统 Wi‑Fi 设置返回：尽力把刚连上的网络名称回填进输入框；
+        // Android 13+ 未授予定位权限时读不到（系统脱敏为 <unknown ssid>），此时给一句提示。
+        if (!wifiPickerLaunched) return;
+        wifiPickerLaunched = false;
+        if (!writeBackCameraSsid() && !coordinator.isConnected()) {
+            statusView.setText(R.string.pick_wifi_hint);
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        // 退到后台：停心跳探测省电、也避免后台一次网络抖动就误判离线；
+        // 链路、WifiLock 与正在进行的传输/拍摄/取景都不受影响。
+        if (coordinator != null) coordinator.suspendHold();
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
+        // 先收起遥控面板：它持有取景位图，且停取景要在 executor 关闭之前发出。
+        dismissCapturePanel();
+        deferredRecycle.removeCallbacksAndMessages(null);
+        debounceHandler.removeCallbacksAndMessages(null);
+        recycleLiveViewBitmap();
         if (coordinator != null) coordinator.shutdown();
+        // 退出应用即结束会话，前台服务随之停止。
+        CameraConnectionService.stop(this);
         super.onDestroy();
     }
 
@@ -415,9 +732,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             setBusy(false);
             updateConnectButton(true);
             statusView.setText("已连接 · " + cameraName);
+            // 会话保活（M2）：连接成功即前台化，退到后台/息屏也不会被系统回收。
+            requestNotificationPermissionIfNeeded();
+            CameraConnectionService.start(
+                    this, getString(R.string.session_text_connected, cameraName));
             // 主流程：连上就读卡并显示图片栏第一页。
             fullScanMode = false;
             goToPage(0);
+            // Wi‑Fi 会话连上后，把实际所用的网络名称反写进输入框（密码读不回来）。
+            if (wifiSession) writeBackCameraSsid();
         });
     }
 
@@ -426,9 +749,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             setBusy(false);
             updateConnectButton(false);
+            // 链路已断：遥控面板里的取景与参数都没了意义，先收起。
+            dismissCapturePanel();
             // 链路已断：清掉图片栏，避免展示已经无法下载/预览的旧缩略图。
             gridAdapter.reset();
             statusView.setText(R.string.status_idle);
+            // 手动断开即结束会话，前台服务随之停止。
+            CameraConnectionService.stop(this);
         });
     }
 
@@ -437,10 +764,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             setBusy(false);
             updateConnectButton(false);
+            dismissCapturePanel();
             // 链路丢失即清空图片栏（重连成功后 onConnected 会重新读卡填充第一页）。
             gridAdapter.reset();
             statusView.setText("链路丢失，自动重连第 " + attempt + " 次，"
                     + (delayMillis / 1000) + " 秒后重试…");
+            // 重连期间保持前台服务运行：进程一旦被回收，退避重连就再也跑不完了。
+            CameraConnectionService.start(
+                    this, getString(R.string.session_text_reconnecting, attempt));
         });
     }
 
@@ -475,6 +806,77 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             setBusy(false);
             // 下载已结束：清掉图片栏里之前的选中状态，避免看起来像还没下载。
             gridAdapter.clearSelection();
+        });
+    }
+
+    @Override
+    public void onLiveViewFrame(Bitmap frame) {
+        runOnUiThread(() -> {
+            if (liveViewImage == null) {
+                // 面板已收起，相机还在推的帧直接丢掉。
+                if (!frame.isRecycled()) frame.recycle();
+                return;
+            }
+            Bitmap previous = liveViewBitmap;
+            liveViewBitmap = frame;
+            liveViewImage.setImageBitmap(frame);
+            // 约 10fps、每帧 MB 级：延迟回收上一帧，既不攒垃圾也不打断渲染线程的绘制。
+            if (previous != null && !previous.isRecycled()) {
+                deferredRecycle.postDelayed(previous::recycle, 300L);
+            }
+        });
+    }
+
+    @Override
+    public void onLiveViewStatus(String message) {
+        runOnUiThread(() -> {
+            if (liveViewStatusView != null) liveViewStatusView.setText(message);
+        });
+    }
+
+    @Override
+    public void onExposureResult(
+            CanonExposure.Setting setting, int index, String display, String error) {
+        runOnUiThread(() -> {
+            ExposureRow row = rowFor(setting);
+            if (row == null) return;
+            // 这一档已经有排期中的写入：此时到达的结果只反映相机旧值，
+            // 让它盖掉本地选择会把用户刚做的调整静默吞掉。
+            if (row.pendingWrite != null) return;
+            if (error != null) {
+                // 值一旦钉住（读到过真实值、或用户手动选过档）就不再回退成「—」：
+                // 读取失败只说明「问不到相机」，不代表用户刚设的值不对。
+                // 底层报错（例如 EOS 对标准属性读回 0x2005）不进取景状态栏 —— 那儿是取景状态的
+                // 显示位，三档互相覆盖只会留下一条吓人的协议错误。
+                if (row.pinned) {
+                    row.value.setContentDescription(
+                            setting.label + "：" + row.value.getText() + "（本次未能从相机复核）");
+                    return;
+                }
+                row.value.setText(R.string.exposure_unknown);
+                row.value.setContentDescription(setting.label + "当前档位未知，可点按手动选择");
+                return;
+            }
+            row.index = index;
+            row.pinned = true;
+            row.value.setText(display);
+        });
+    }
+
+    @Override
+    public void onCaptureFinished() {
+        runOnUiThread(() -> {
+            captureRunning = false;
+            if (captureShootButton != null) captureShootButton.setEnabled(true);
+            // 「本次未发现 JPEG」既落盘也不报错，只有这条回调能把按钮恢复成可用。
+            setBusy(false);
+        });
+    }
+
+    @Override
+    public void onAutofocusFinished() {
+        runOnUiThread(() -> {
+            if (captureAutofocusButton != null) captureAutofocusButton.setEnabled(true);
         });
     }
 
@@ -595,6 +997,156 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     /**
+     * Wi‑Fi 连接入口。若填了相机 Wi‑Fi 名称，加入网络需要「附近的设备」运行时权限，
+     * 先要权限再连，避免首次必然走到回退路径。
+     *
+     * @param permissionAlreadyRequested 本次点击是否已经走过一次权限申请（避免
+     *     「申请 → 回调 → 再申请」的死循环：用户拒绝后系统不会再弹窗）
+     */
+    private void connectWifi(boolean permissionAlreadyRequested) {
+        String host = hostField.getText().toString().trim();
+        int port = parsePort(portField.getText().toString().trim());
+        if (host.isEmpty() || port <= 0) {
+            showError("请输入有效的相机地址与端口。", null);
+            return;
+        }
+        // 凭据来自「选择 Wi‑Fi」后自动记下的偏好值，界面上不再有输入框。
+        String ssid = preferences.getString(PREF_CAMERA_SSID, "");
+        String password = preferences.getString(PREF_CAMERA_PASSWORD, "");
+        if (!permissionAlreadyRequested && !ssid.isEmpty() && !hasNearbyWifiPermission()) {
+            pendingWifiConnect = true;
+            requestNearbyWifiPermission();
+            return;
+        }
+        performWifiConnect(host, port, ssid, password);
+    }
+
+    /** 真正发起 Wi‑Fi 连接；填了 SSID 时由协调器尝试加入，失败会自行回退自动选网。 */
+    private void performWifiConnect(String host, int port, String ssid, String password) {
+        coordinator.setCameraWifiCredentials(ssid, password);
+        wifiSession = true;
+        setBusy(true);
+        updateConnectButton(false);
+        coordinator.connect(CameraSessionCoordinator.TransportKind.WIFI, host, port);
+    }
+
+    /**
+     * 打开系统 Wi‑Fi 设置页让用户自己选择相机热点。
+     *
+     * <p>之所以不走「App 自动读取当前 SSID 反写」：Android 13+ 读 {@link WifiInfo#getSSID()}
+     * 仍要求 {@code ACCESS_FINE_LOCATION}，而清单里它被 {@code maxSdkVersion="32"} 限定
+     * （13+ 只用 {@code NEARBY_WIFI_DEVICES(neverForLocation)}），必然读到 {@code <unknown ssid>}。
+     * 交给系统页面选网既不需要额外权限，选网成功与否也一目了然。
+     *
+     * <p>这里用完整的 {@link Settings#ACTION_WIFI_SETTINGS} 而不是 API 29+ 的
+     * {@code Settings.Panel.ACTION_WIFI} 浮层面板：后者只列最近几条热门网络、且不能滚动，
+     * 相机热点通常排在后面，根本选不到。
+     */
+    private void openWifiPicker() {
+        if (hasSsidPermissions()) {
+            launchWifiSettings();
+            return;
+        }
+        // 读当前 Wi‑Fi 名称在 13+ 仍要定位权限；先补齐再跳，回来才能把名称钉进输入框。
+        pendingWifiPicker = true;
+        requestPermissions(ssidPermissions(), REQUEST_WIFI_PICKER);
+    }
+
+    /** 跳系统 Wi‑Fi 设置页（完整的列表页，可滚动、能看到全部网络）。 */
+    private void launchWifiSettings() {
+        wifiPickerLaunched = true;
+        try {
+            startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS));
+        } catch (Exception error) {
+            wifiPickerLaunched = false;
+            showError("无法打开系统 Wi‑Fi 设置页。", error);
+        }
+    }
+
+    /** 读 SSID 所需权限：定位（14 起为「附近的设备」+定位）；NEARBY_WIFI_DEVICES 只够连网。 */
+    private String[] ssidPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.NEARBY_WIFI_DEVICES};
+        }
+        return new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+    }
+
+    private boolean hasSsidPermissions() {
+        for (String permission : ssidPermissions()) {
+            if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 把「系统当前所连的 Wi‑Fi 名称」记进偏好（尽力而为），下次进来就直接用它。
+     *
+     * <p>密码无法回填：Android 不提供读回已保存 Wi‑Fi 密码的接口。读不到名称（无定位权限、
+     * 非 Wi‑Fi 连接、系统返回 {@code <unknown ssid>}）时保持已记下的名称不动，返回 {@code false}。
+     *
+     * @return 是否确实读到并写入了名称
+     */
+    private boolean writeBackCameraSsid() {
+        String ssid = connectedWifiSsid();
+        if (ssid.isEmpty() || ssid.equals(preferences.getString(PREF_CAMERA_SSID, ""))) return false;
+        preferences.edit().putString(PREF_CAMERA_SSID, ssid).apply();
+        return true;
+    }
+
+    /** 系统当前所连 Wi‑Fi 的名称；读不到时返回空串（原样带引号的系统格式会去掉引号）。 */
+    private String connectedWifiSsid() {
+        try {
+            WifiManager manager = (WifiManager) getApplicationContext()
+                    .getSystemService(Context.WIFI_SERVICE);
+            if (manager == null) return "";
+            WifiInfo info = manager.getConnectionInfo();
+            String ssid = info == null ? null : info.getSSID();
+            if (ssid == null || ssid.isEmpty() || ssid.startsWith("<")) return "";
+            if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) {
+                ssid = ssid.substring(1, ssid.length() - 1);
+            }
+            return ssid;
+        } catch (Exception ignored) {
+            // 缺权限/系统限制时（SecurityException 等）静默跳过：这只影响一次便利性反写。
+            return "";
+        }
+    }
+
+    /**
+     * 加入相机 Wi‑Fi 所需的运行时权限：API 33+ 是「附近的设备」，
+     * 更早的版本是精确位置（清单里已用 maxSdkVersion=32 限定）。
+     */
+    private static String nearbyWifiPermission() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                ? Manifest.permission.NEARBY_WIFI_DEVICES
+                : Manifest.permission.ACCESS_FINE_LOCATION;
+    }
+
+    private boolean hasNearbyWifiPermission() {
+        return checkSelfPermission(nearbyWifiPermission()) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestNearbyWifiPermission() {
+        requestPermissions(new String[]{nearbyWifiPermission()}, REQUEST_NEARBY_WIFI);
+    }
+
+    /**
+     * Android 13+ 需要运行时授权才会显示前台服务通知。被拒不影响服务运行
+     * （只是通知不展示），所以这里不阻断任何流程。
+     */
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        requestPermissions(
+                new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
+    }
+
+    /**
      * Android 9 及以下导出到相册需要 WRITE_EXTERNAL_STORAGE；
      * Android 10+ 走分区存储，不需要任何存储权限。
      */
@@ -613,6 +1165,20 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     public void onRequestPermissionsResult(
             int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_WIFI_PICKER) {
+            pendingWifiPicker = false;
+            // 没授权也照跳：选网本身不需要权限，只是回来读不到名称，靠手填。
+            launchWifiSettings();
+            return;
+        }
+        if (requestCode == REQUEST_NEARBY_WIFI) {
+            if (!pendingWifiConnect) return;
+            pendingWifiConnect = false;
+            // 未授权也继续连接：协调器会退回到「用系统已连网络」的自动选网路径。
+            connectWifi(true);
+            return;
+        }
+        if (requestCode == REQUEST_NOTIFICATIONS) return;
         if (requestCode != REQUEST_WRITE_STORAGE) return;
         boolean granted = grantResults.length > 0
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED;

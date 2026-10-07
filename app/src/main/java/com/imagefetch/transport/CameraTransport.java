@@ -1,6 +1,8 @@
 package com.imagefetch.transport;
 
 import com.imagefetch.ptp.CameraStorage;
+import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.LiveViewSize;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -71,6 +73,63 @@ public interface CameraTransport extends Closeable {
     /** 是否支持 event 通道心跳探测（PTP/IP 支持；USB 无事件通道，返回 false）。 */
     default boolean supportsHeartbeat() {
         return false;
+    }
+
+    /**
+     * 开关实时取景预览。Canon EOS 走 0x9110 写 EVFMode/EVFOutputDevice 并 0x911D 保活；
+     * {@code size} 写入 0xD1B0 的输出位，决定相机推给 App 的帧分辨率（{@link LiveViewSize}）。
+     * 关闭时还会把机身屏重新点亮（0x9114 SetRemoteMode(1)）。
+     * 不支持的传输实现保持默认（抛 UnsupportedOperationException）。
+     */
+    default void setLiveViewEnabled(boolean enabled, LiveViewSize size) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持实时取景");
+    }
+
+    /**
+     * 只为「拍摄」临时退出取景：把取景输出彻底关掉，不做面板关闭那套交还机身的收尾，
+     * 拍完由调用方恢复取景。全按快门要求画面上游真的停住，否则会被拒 {@code 0x2019}。
+     * 默认实现退化为 {@link #setLiveViewEnabled(boolean, LiveViewSize)}。
+     */
+    default void pauseLiveViewForCapture(LiveViewSize size) throws Exception {
+        setLiveViewEnabled(false, size);
+    }
+
+    /**
+     * 半按再松开快门以唤醒相机的取景管线（不拍照）。取景长时间收不到帧时由上层调用；
+     * 不支持的传输实现保持默认（抛 UnsupportedOperationException）。
+     */
+    default void wakeForLiveView() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持实时取景");
+    }
+
+    /**
+     * 取一帧实时取景 JPEG。
+     * 相机这一帧还没准备好（ObjectNotReady / DeviceBusy）时返回 {@code null}，
+     * 上层退避后重试即可，不要当成连接故障。
+     */
+    default byte[] liveViewFrame() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持实时取景");
+    }
+
+    /**
+     * 触发一次单次自动对焦（Canon EOS {@code 0x9154 EOS_DoAf}）。对焦由相机完成，本方法
+     * 在相机返回响应后即返回。需要取景已开启。不支持的传输实现保持默认。
+     */
+    default void autofocus() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持自动对焦");
+    }
+
+    /** 写入曝光参数；{@code value} 是机上编码值，取自 {@link CanonExposure.entries}。 */
+    default void writeExposure(CanonExposure.Setting setting, int value) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持曝光参数调整");
+    }
+
+    /**
+     * 读取曝光参数的当前编码值（与 {@link #writeExposure} 同一套
+     * {@link CanonExposure#entries} 表值）；交给 {@link CanonExposure#indexOfValue} 换算成档位。
+     */
+    default long readExposure(CanonExposure.Setting setting) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持曝光参数调整");
     }
 
     /**

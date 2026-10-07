@@ -5,6 +5,18 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- 连接期间持有 WifiLock：避免息屏待机时 Wi-Fi 休眠导致大文件传输中断 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 会话保活前台服务（M2）：保住进程优先级，避免退后台时会话被系统回收 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Android 13+ 通知权限：被拒不影响前台服务运行，只是通知不展示 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 加入相机 Wi‑Fi（M4）：API 33+ 用 NEARBY_WIFI_DEVICES，并在清单里声明不用于定位 -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <!-- 定位：读当前 Wi‑Fi 名称（WifiInfo#getSSID）与扫描结果的敏感字段在 13+ 仍要求它；
+         同时兼容 API 32 及以下 WifiNetworkSpecifier 的声明要求。选网时按需申请。 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <!-- 仅 Android 9 及以下需要：API 29+ 走分区存储导出到相册，无需存储权限 -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -36,5 +48,11 @@
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/device_filter" />
         </activity>
+
+        <!-- 会话保活前台服务（M2）：只保进程 + 显示状态，不持有会话协调器 -->
+        <service
+            android:name=".CameraConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

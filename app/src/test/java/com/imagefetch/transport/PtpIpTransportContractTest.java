@@ -148,6 +148,35 @@ public class PtpIpTransportContractTest {
         }
     }
 
+    /**
+     * 上一次事务的应答迟到时（实测由 0x9154 EOS_DoAf 引发），那个包会在下一次事务的读取里
+     * 先被读到。此时必须当作过期响应丢弃、继续读本次应答，**不能**把命令通道判死——判死后
+     * 之后所有遥控命令都会立即抛出通道故障，只能靠重连恢复。
+     */
+    @Test
+    public void staleReplyFromThePreviousTransactionIsSkippedInsteadOfKillingTheChannel()
+            throws Exception {
+        try (FakePtpIpCamera camera = new FakePtpIpCamera("Fake Sony", (channel, operation, tx, params) -> {
+            if (operation == OPEN_SESSION) {
+                channel.respond(tx, RESPONSE_OK);
+            } else if (operation == CAPTURE) {
+                // 先送一个事务号更小的回包（上一次事务的迟到应答），再送本次真正的应答。
+                channel.respond(tx - 1, RESPONSE_OK);
+                channel.respond(tx, RESPONSE_OK);
+            }
+        })) {
+            PtpIpTransport transport = new PtpIpTransport();
+            try {
+                transport.connect("127.0.0.1", camera.port());
+                transport.capture();
+                // 通道未被判死：下一次遥控操作必须照常成功。
+                transport.capture();
+            } finally {
+                transport.close();
+            }
+        }
+    }
+
     @Test
     public void probeRoundTripsAndObjectAddedIsDispatchedToTheListener() throws Exception {
         try (FakePtpIpCamera camera = new FakePtpIpCamera("Fake Sony", (channel, operation, tx, params) -> {

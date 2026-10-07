@@ -31,4 +31,22 @@
     <string name="preview_toggle_unselect">取消选中</string>
     <string name="preview_loading">正在读取原图…</string>
     <string name="preview_thumbnail_only">（无原图可读，当前为缩略图）</string>
+    <string name="capture_panel_title">遥控拍摄</string>
+    <string name="live_view_hint">实时取景画面</string>
+    <string name="live_view_starting">正在开启实时取景…</string>
+    <string name="live_view_size_label">图传画质</string>
+    <string name="autofocus">自动对焦</string>
+    <string name="capture_running">正在拍摄并取回…</string>
+    <string name="exposure_minus">−</string>
+    <string name="exposure_plus">+</string>
+    <string name="exposure_unknown">—</string>
+    <string name="exposure_hint">点数值直接选档，−/+ 逐档调整</string>
+    <string name="pick_wifi">选择 Wi&#8209;Fi</string>
+    <string name="pick_wifi_hint">已打开系统 Wi&#8209;Fi 设置；连上相机热点后回到本页即可连接。</string>
+    <string name="session_notification_title">IMAGE_FETCH</string>
+    <string name="session_notification_idle">相机会话进行中</string>
+    <string name="session_channel_name">相机会话</string>
+    <string name="session_channel_description">连接相机期间保持会话不被系统回收</string>
+    <string name="session_text_connected">已连接 · %1$s</string>
+    <string name="session_text_reconnecting">自动重连中 · 第 %1$d 次</string>
 </resources>
