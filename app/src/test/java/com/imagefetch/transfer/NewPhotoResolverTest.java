@@ -124,6 +124,72 @@ public class NewPhotoResolverTest {
         }
     }
 
+    // ---------- resolveBatch：机内连续拍摄一次快门出多张 ----------
+
+    @Test
+    public void batchCollectsUntilExpectedCountReached() throws Exception {
+        FakeCameraTransport transport = new FakeCameraTransport().stageSnapshots(
+                snapshot(item(1, "OLD.JPG")),
+                snapshot(item(1, "OLD.JPG"), item(2, "A.JPG")),
+                snapshot(item(1, "OLD.JPG"), item(2, "A.JPG"), item(3, "B.JPG")),
+                snapshot(item(1, "OLD.JPG"), item(2, "A.JPG"), item(3, "B.JPG"), item(4, "C.JPG")));
+        NewPhotoResolver resolver = new NewPhotoResolver("CamA", key -> false);
+        resolver.recordBaseline(snapshot(item(1, "OLD.JPG")));
+
+        long started = System.currentTimeMillis();
+        NewPhotoResolver.Resolution result = resolveBatch(resolver, transport, 3, 5000L, 5000L);
+        long elapsed = System.currentTimeMillis() - started;
+
+        assertEquals(3, result.newItems.size());
+        assertEquals("A.JPG", result.newItems.get(0).filename);
+        assertEquals("B.JPG", result.newItems.get(1).filename);
+        assertEquals("C.JPG", result.newItems.get(2).filename);
+        assertFalse(result.discoveredByEvent);
+        assertTrue("收满即应返回，不该等 settle/超时，实际 " + elapsed + " ms", elapsed < 3000);
+    }
+
+    @Test
+    public void batchStopsAfterSettleWhenCameraDeliversFewer() throws Exception {
+        FakeCameraTransport transport = new FakeCameraTransport().stageSnapshots(
+                snapshot(item(1, "OLD.JPG")),
+                snapshot(item(1, "OLD.JPG"), item(2, "A.JPG")));
+        NewPhotoResolver resolver = new NewPhotoResolver("CamA", key -> false);
+        resolver.recordBaseline(snapshot(item(1, "OLD.JPG")));
+
+        long started = System.currentTimeMillis();
+        NewPhotoResolver.Resolution result = resolveBatch(resolver, transport, 5, 120L, 5000L);
+        long elapsed = System.currentTimeMillis() - started;
+
+        assertEquals("相机只出 1 张就交 1 张，不硬凑数量", 1, result.newItems.size());
+        assertEquals("A.JPG", result.newItems.get(0).filename);
+        assertTrue("应在 settle 内收手，而非等到超时，实际 " + elapsed + " ms", elapsed < 2500);
+    }
+
+    @Test
+    public void batchDoesNotCollectTheSameObjectTwice() throws Exception {
+        FakeCameraTransport transport = new FakeCameraTransport().stageSnapshots(
+                snapshot(item(1, "OLD.JPG"), item(2, "A.JPG")),
+                snapshot(item(1, "OLD.JPG"), item(2, "A.JPG")));
+        NewPhotoResolver resolver = new NewPhotoResolver("CamA", key -> false);
+        resolver.recordBaseline(snapshot(item(1, "OLD.JPG")));
+
+        NewPhotoResolver.Resolution result = resolveBatch(resolver, transport, 5, 80L, 5000L);
+
+        assertEquals("同一对象后续每轮都判为新，却只能收一次", 1, result.newItems.size());
+        assertEquals("A.JPG", result.newItems.get(0).filename);
+    }
+
+    private static NewPhotoResolver.Resolution resolveBatch(
+            NewPhotoResolver resolver,
+            FakeCameraTransport transport,
+            int expectedCount,
+            long settleMillis,
+            long timeoutMillis) throws Exception {
+        return resolver.resolveBatch(
+                new PtpOperationService(transport), timeoutMillis, POLL_MS, 0,
+                expectedCount, settleMillis, null, new TransferControl());
+    }
+
     private static NewPhotoResolver.Resolution resolve(
             NewPhotoResolver resolver,
             FakeCameraTransport transport,

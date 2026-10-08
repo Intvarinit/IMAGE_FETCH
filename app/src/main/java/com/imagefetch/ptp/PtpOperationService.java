@@ -113,6 +113,32 @@ public final class PtpOperationService {
         return transport.supportedValues(propertyCode);
     }
 
+    /**
+     * P0 能力探测（见 {@link com.imagefetch.transport.CameraTransport#probeVendorCapabilities}）。
+     * {@code verifyWrite=true} 会真的写相机，只应由用户显式触发。
+     */
+    public CapabilityReport probeVendorCapabilities(boolean verifyWrite) throws Exception {
+        return transport.probeVendorCapabilities(verifyWrite);
+    }
+
+    /**
+     * 取一份厂商属性只读快照，用于机身改设置前后做差分比对
+     * （见 {@link com.imagefetch.transport.CameraTransport#snapshotVendorProperties}）。
+     */
+    public VendorPropertySnapshot snapshotVendorProperties() throws Exception {
+        return transport.snapshotVendorProperties();
+    }
+
+    /** 读一个厂商属性的原始值区域（只读）。 */
+    public byte[] readVendorPropertyBlock(int propertyCode) throws Exception {
+        return transport.readVendorPropertyBlock(propertyCode);
+    }
+
+    /** 整体回写一个厂商属性的值区域（会真的写相机）。返回相机响应码。 */
+    public int writeVendorPropertyBlock(int propertyCode, byte[] block) throws Exception {
+        return transport.writeVendorPropertyBlock(propertyCode, block);
+    }
+
     /** 读取对焦方式（Canon 0xD1BA）的当前编码值。 */
     public long readFocusArea() throws Exception {
         return transport.readFocusArea();

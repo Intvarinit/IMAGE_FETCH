@@ -4,8 +4,10 @@ import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.PtpOperationService;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -77,8 +79,37 @@ public final class NewPhotoResolver {
             int maxItems,
             Predicate<CameraStorage.Item> filter,
             TransferControl control) throws Exception {
+        // 单张拍摄：发现第一张就返回，与旧行为完全一致（settle=0 时下面第一轮命中即 break）。
+        return resolveBatch(
+                operations, timeoutMillis, pollIntervalMillis, maxItems, 1, 0L, filter, control);
+    }
+
+    /**
+     * 等「一批」新增对象：机内连续拍摄（对焦包围、HDR 包围）按一次快门会产出多张，
+     * 而 {@link #resolveUntil} 发现第一张就返回，只能拿到头一张——后面的还在写卡里。
+     *
+     * <p>收满 {@code expectedCount} 张即返回；不足时等 {@code settleMillis} 内不再有新对象
+     * 就收手（不硬凑数量，相机实际出几张就交几张），再不行才等到 {@code timeoutMillis}。
+     *
+     * @param expectedCount 预计张数；≤1 时行为与 {@link #resolveUntil} 相同
+     * @param settleMillis  已收到对象后，再等多久没有新增就认为相机写完了；0 表示不做这个等待
+     */
+    public Resolution resolveBatch(
+            PtpOperationService operations,
+            long timeoutMillis,
+            long pollIntervalMillis,
+            int maxItems,
+            int expectedCount,
+            long settleMillis,
+            Predicate<CameraStorage.Item> filter,
+            TransferControl control) throws Exception {
+        int target = Math.max(1, expectedCount);
+        long settleNanos = Math.max(0L, settleMillis) * 1_000_000L;
         long deadline = System.nanoTime() + Math.max(1L, timeoutMillis) * 1_000_000L;
         boolean eventSeen = false;
+        // 按对象键去重并保序：同一张会在后续每一轮里被判为「新」，不能重复收。
+        Map<String, CameraStorage.Item> collected = new LinkedHashMap<>();
+        long lastProgressAt = System.nanoTime();
         while (true) {
             if (control != null) control.throwIfCancelled();
 
@@ -105,12 +136,21 @@ public final class NewPhotoResolver {
                     if (isNew(item, filter)) matches.add(item);
                 }
             }
-            if (!matches.isEmpty()) return new Resolution(matches, eventSeen);
+            int before = collected.size();
+            for (CameraStorage.Item item : matches) {
+                collected.putIfAbsent(objectKey(item), item);
+            }
+            if (collected.size() > before) lastProgressAt = System.nanoTime();
 
-            long remaining = deadline - System.nanoTime();
-            if (remaining <= 0) return new Resolution(matches, eventSeen);
+            if (collected.size() >= target) break;
+
+            long now = System.nanoTime();
+            if (!collected.isEmpty() && now - lastProgressAt >= settleNanos) break;
+            long remaining = deadline - now;
+            if (remaining <= 0) break;
             sleep(Math.min(pollIntervalMillis, remaining / 1_000_000L));
         }
+        return new Resolution(new ArrayList<>(collected.values()), eventSeen);
     }
 
     private boolean isNew(CameraStorage.Item item, Predicate<CameraStorage.Item> filter) {

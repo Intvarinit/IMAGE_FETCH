@@ -2,7 +2,9 @@ package com.imagefetch.transport;
 
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
+import com.imagefetch.ptp.VendorPropertySnapshot;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -152,6 +154,37 @@ public interface CameraTransport extends Closeable {
      */
     default int[] supportedValues(int propertyCode) {
         return null;
+    }
+
+    /**
+     * P0 能力探测：对 {@link com.imagefetch.ptp.VendorProperty#PROBE_TARGETS} 里的厂商属性逐个
+     * 取当前值原始字节，并（可选）做一次「原值回写」验证可写性。只读部分可以随时跑；
+     * {@code verifyWrite=true} 会真的写相机，必须由用户显式触发。不支持的传输实现保持默认。
+     */
+    default CapabilityReport probeVendorCapabilities(boolean verifyWrite) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持厂商属性能力探测");
+    }
+
+    /**
+     * 取一份「相机上报过的所有厂商属性」的只读快照，用于机身改设置前后做差分比对。
+     * 纯读，不写相机。不支持的传输实现保持默认。
+     */
+    default VendorPropertySnapshot snapshotVendorProperties() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持厂商属性快照");
+    }
+
+    /**
+     * 读一个厂商属性的原始值区域（只读）。用于 0xD134/0xD13D/0xD208 这类无文档的 24 字节块。
+     */
+    default byte[] readVendorPropertyBlock(int propertyCode) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持读取厂商属性值区域");
+    }
+
+    /**
+     * 整体回写一个厂商属性的值区域（会真的写相机）。返回相机响应码。
+     */
+    default int writeVendorPropertyBlock(int propertyCode, byte[] block) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持写入厂商属性值区域");
     }
 
     /**

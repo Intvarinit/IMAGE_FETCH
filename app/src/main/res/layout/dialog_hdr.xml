@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「HDR 拍摄」设置面板（机内 0xD13D HDRSetting）。
+  内容是只读报告 + 模式输入 + 读取/写入两个动作；按钮放在视图里而不是 AlertDialog 的按钮位上，
+  因为报告要一直在屏幕可见处，而默认按钮按下会关掉弹窗。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:maxHeight="260dp">
+
+        <TextView
+            android:id="@+id/hdrReport"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+    </ScrollView>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/hdr_mode_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/hdrMode"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:contentDescription="@string/hdr_mode_label"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <Button
+            android:id="@+id/hdrModeOff"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="@string/hdr_mode_off"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/hdrModeAuto"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="@string/hdr_mode_auto"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/hdrRead"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/hdr_read"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/hdrWrite"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/hdr_write"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:text="@string/hdr_hint"
+        android:textColor="#6B7280"
+        android:textSize="12sp" />
+</LinearLayout>

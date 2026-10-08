@@ -21,8 +21,11 @@ import android.util.LruCache;
 
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.PtpOperationService;
+import com.imagefetch.ptp.VendorProperty;
+import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.storage.PhotoRepository;
 import com.imagefetch.transfer.HeartbeatMonitor;
@@ -146,6 +149,33 @@ public final class CameraSessionCoordinator {
         }
 
         /**
+         * P0 能力探测结果：成功时 {@code report} 非空、{@code error} 为 null；失败时相反。
+         * 给默认空实现，便于既有实现/测试桩不必改动。
+         */
+        default void onCapabilityReport(CapabilityReport report, String error) {
+        }
+
+        /**
+         * 厂商属性快照结果（差分法用）：成功时 {@code snapshot} 非空、{@code error} 为 null；失败时相反。
+         */
+        default void onVendorPropertySnapshot(VendorPropertySnapshot snapshot, String error) {
+        }
+
+        /**
+         * 厂商属性值区域读取结果（{@code propertyCode} 见 {@link VendorProperty}）：
+         * 成功时 {@code block} 非空、{@code error} 为 null；失败时相反。
+         */
+        default void onVendorPropertyBlockRead(int propertyCode, byte[] block, String error) {
+        }
+
+        /**
+         * 厂商属性值区域写入结果：{@code code} 是相机响应码（{@code 0x2001} 为成功）。
+         * 传输层抛异常时 {@code code} 为 0、{@code error} 非 null。
+         */
+        default void onVendorPropertyBlockWritten(int propertyCode, int code, String error) {
+        }
+
+        /**
          * 一次「拍摄并取回」流程结束（含未取到 JPEG 与失败）。
          * 「未发现 JPEG」路径既不落盘也不报错，只发 onStatus，
          * 单靠 onFileSaved/onError 会把拍摄按钮永久留在禁用态。
@@ -161,6 +191,12 @@ public final class CameraSessionCoordinator {
     /** 拍后等待“写卡完成 + 新对象可读”的上限。 */
     private static final long CAPTURE_DISCOVERY_TIMEOUT_MS = 20000L;
     private static final long CAPTURE_POLL_INTERVAL_MS = 1000L;
+    /**
+     * 多张拍摄（对焦包围 / HDR 包围）里，收到最后一张后还等这么久没有新对象才认为相机写完了。
+     * 不能按「预计张数」硬凑：相机实际出几张就交几张，但也不能少收——机内包围每张之间有间隔，
+     * 一收到头一张就返回会把它后面的全丢掉。
+     */
+    private static final long CAPTURE_BATCH_SETTLE_MS = 3000L;
     /** Canon EOS 对焦方式属性码（0xD1BA EOS_LvAfSystem），与 transport 侧一致。 */
     private static final int CANON_PROP_AF_METHOD = 0xd1ba;
 
@@ -215,6 +251,8 @@ public final class CameraSessionCoordinator {
     private volatile List<CameraStorage.Item> fullScanItems;
     private volatile long thumbnailGeneration;
     private volatile long previewGeneration;
+    /** 最近一次能力探测结果（P0）；未探测或失败时为 null。 */
+    private volatile CapabilityReport lastCapabilityReport;
     private volatile int pageSize = DEFAULT_PAGE_SIZE;
 
     /** 缩略图缓存：按张数计，避免来回滚动时重复向相机取图。 */
@@ -1287,6 +1325,91 @@ public final class CameraSessionCoordinator {
     }
 
     /**
+     * P0 能力探测：在单线程 executor 上串行跑，与取景/拍摄互斥。
+     * {@code verifyWrite=true} 会真的把相机刚报的原值写回去一次，只应由用户显式触发。
+     */
+    public void probeVendorCapabilities(final boolean verifyWrite) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onCapabilityReport(null, "请先连接相机。"));
+                return;
+            }
+            try {
+                CapabilityReport report = operations.probeVendorCapabilities(verifyWrite);
+                lastCapabilityReport = report;
+                mainHandler.post(() -> listener.onCapabilityReport(report, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "能力探测失败";
+                mainHandler.post(() -> listener.onCapabilityReport(null, message));
+            }
+        });
+    }
+
+    /** 最近一次能力探测结果；未探测或失败时为 null。 */
+    public CapabilityReport lastCapabilityReport() {
+        return lastCapabilityReport;
+    }
+
+    /**
+     * 取一份厂商属性只读快照（差分法用）。纯读、不写相机；同样在单线程 executor 上串行，
+     * 与取景/拍摄互斥。
+     */
+    public void snapshotVendorProperties() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onVendorPropertySnapshot(null, "请先连接相机。"));
+                return;
+            }
+            try {
+                VendorPropertySnapshot snapshot = operations.snapshotVendorProperties();
+                mainHandler.post(() -> listener.onVendorPropertySnapshot(snapshot, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "属性快照失败";
+                mainHandler.post(() -> listener.onVendorPropertySnapshot(null, message));
+            }
+        });
+    }
+
+    /**
+     * 读一个厂商属性的原始值区域（只读，差分/参数解读用）。走单线程 executor，与取景、拍摄互斥。
+     */
+    public void readVendorPropertyBlock(int propertyCode) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onVendorPropertyBlockRead(propertyCode, null, "请先连接相机。"));
+                return;
+            }
+            try {
+                byte[] block = operations.readVendorPropertyBlock(propertyCode);
+                mainHandler.post(() -> listener.onVendorPropertyBlockRead(propertyCode, block, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "读取属性失败";
+                mainHandler.post(() -> listener.onVendorPropertyBlockRead(propertyCode, null, message));
+            }
+        });
+    }
+
+    /**
+     * 整体回写一个厂商属性的值区域。<b>会真的写相机</b>，只应由用户显式点击触发，
+     * 且上层传进来的 {@code block} 必须是「从相机读回来的字节 + 明确要改的字段」。
+     */
+    public void writeVendorPropertyBlock(int propertyCode, byte[] block) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onVendorPropertyBlockWritten(propertyCode, 0, "请先连接相机。"));
+                return;
+            }
+            try {
+                int code = operations.writeVendorPropertyBlock(propertyCode, block);
+                mainHandler.post(() -> listener.onVendorPropertyBlockWritten(propertyCode, code, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "写入属性失败";
+                mainHandler.post(() -> listener.onVendorPropertyBlockWritten(propertyCode, 0, message));
+            }
+        });
+    }
+
+    /**
      * 把取景画面里的一个点设为对焦框（0x915B，<b>只移动对焦框、不触发对焦</b>）。
      * 坐标由界面按取景帧像素坐标换算好再传进来。
      */
@@ -1335,6 +1458,18 @@ public final class CameraSessionCoordinator {
 
     /** 触发一次拍摄并自动取回新产生的 JPEG 原图（无 JPEG 时跳过，不保存 RAW）。 */
     public void captureAndFetch() {
+        captureAndFetch(1);
+    }
+
+    /**
+     * 触发一次拍摄并取回，适用于「一次快门产出多张」的机内连续拍摄。
+     *
+     * @param expectedShots 预计张数。1 走原来的「发现第一张就返回」；&gt;1 时收满或等相机
+     *                      不再出新对象为止（见 {@code NewPhotoResolver#resolveBatch}）。
+     *                      机内对焦包围/HDR 包围的张数由机身设定，App 这边只负责按它对量收图。
+     */
+    public void captureAndFetch(int expectedShots) {
+        int shots = Math.max(1, expectedShots);
         executor.submit(() -> {
             if (!isConnected()) {
                 mainHandler.post(() -> listener.onError("请先连接相机。", null));
@@ -1408,12 +1543,16 @@ public final class CameraSessionCoordinator {
                     return;
                 }
 
-                listener.onStatus("等待相机写卡并发现新对象…");
-                NewPhotoResolver.Resolution resolution = resolver.resolveUntil(
+                listener.onStatus(shots > 1
+                        ? "等待相机写卡并按 " + shots + " 张收集新对象…"
+                        : "等待相机写卡并发现新对象…");
+                NewPhotoResolver.Resolution resolution = resolver.resolveBatch(
                         operations,
                         CAPTURE_DISCOVERY_TIMEOUT_MS,
                         CAPTURE_POLL_INTERVAL_MS,
                         CAPTURE_BASELINE_ITEMS,
+                        shots,
+                        shots > 1 ? CAPTURE_BATCH_SETTLE_MS : 0L,
                         item -> !item.isVideo(),
                         current);
 

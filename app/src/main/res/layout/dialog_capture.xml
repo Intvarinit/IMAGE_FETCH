@@ -1,13 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 遥控拍摄面板：实时取景预览 + 快门/光圈/ISO 逐档调整 + 触发拍摄并取回。 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  遥控拍摄面板：实时取景预览 + 快门/光圈/ISO 逐档调整 + 触发拍摄并取回。
+  根布局用 ScrollView：三档曝光行 + 对焦行 + 取景尺寸行 + 「预计张数」行叠起来会超过屏幕高度，
+  而 AlertDialog 不会自动让自定义视图可滚动，底部快门键会被挤出可视区（表现为「找不到拍摄键」）。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="vertical"
-    android:paddingLeft="12dp"
-    android:paddingTop="4dp"
-    android:paddingRight="12dp"
-    android:paddingBottom="8dp">
+    android:scrollbars="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingLeft="12dp"
+        android:paddingTop="4dp"
+        android:paddingRight="12dp"
+        android:paddingBottom="8dp">
 
     <ImageView
         android:id="@+id/liveViewImage"
@@ -116,6 +125,39 @@
             android:text="@string/autofocus" />
     </LinearLayout>
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/capture_shots_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/captureShots"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:contentDescription="@string/capture_shots_label"
+            android:inputType="number"
+            android:maxLines="1"
+            android:text="1" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="@string/capture_shots_hint"
+        android:textColor="#6B7280"
+        android:textSize="11sp" />
+
     <Button
         android:id="@+id/captureShoot"
         android:layout_width="match_parent"
@@ -123,4 +165,5 @@
         android:layout_marginTop="10dp"
         android:minHeight="48dp"
         android:text="@string/capture_and_fetch" />
-</LinearLayout>
+    </LinearLayout>
+</ScrollView>

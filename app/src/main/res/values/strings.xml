@@ -55,4 +55,37 @@
     <string name="session_channel_description">连接相机期间保持会话不被系统回收</string>
     <string name="session_text_connected">已连接 · %1$s</string>
     <string name="session_text_reconnecting">自动重连中 · 第 %1$d 次</string>
+    <string name="capability_report_title">相机能力探测</string>
+    <string name="capability_open">能力探测</string>
+    <string name="property_diff_title">厂商属性差分（机身改设置前后对比）</string>
+    <string name="property_diff_open">属性差分</string>
+    <string name="property_diff_snapshot">取基线快照</string>
+    <string name="property_diff_compare">对比</string>
+    <string name="shot_options">拍摄选项</string>
+    <string name="shot_panel_title">拍摄选项</string>
+    <string name="shot_capture">拍摄</string>
+    <string name="shot_bracket">对焦包围</string>
+    <string name="shot_hdr">HDR 拍摄</string>
+    <string name="shot_close">关闭侧栏</string>
+    <string name="hdr_title">HDR 拍摄设置（0xD13D）</string>
+    <string name="hdr_read">读取当前值</string>
+    <string name="hdr_write">写入设置</string>
+    <string name="hdr_mode_label">模式</string>
+    <string name="hdr_mode_off">关闭</string>
+    <string name="hdr_mode_auto">自动</string>
+    <string name="hdr_hint">0xD13D 的 24 字节字段没有文档。差分实测只证实了一件事：偏移 4 是模式，0 = 关闭、1 = 自动；其余字节原样保留相机给的内容。写入后会自动回读核对一次，但「回读一致」只说明相机收下了，是否真的启用请对着机身屏幕看。机身菜单里带曝光补偿量的那几档取值没有证据，只能自己填原始数值。</string>
+    <string name="capture_shots_label">预计张数</string>
+    <string name="capture_shots_hint">对焦包围 / HDR 包围：机身菜单里设了几张就填几，App 按这个数收图（收满即返回，不足则等相机不再出新对象）。单张拍摄填 1。</string>
+    <string name="capability_probe_readonly">重新探测（只读）</string>
+    <string name="capability_verify_write">写入验证（原值回写）</string>
+    <string name="focus_title">对焦包围设置（0xD208）</string>
+    <string name="focus_read">读取当前值</string>
+    <string name="focus_write">写入设置</string>
+    <string name="focus_enabled_label">开关</string>
+    <string name="focus_enabled_off">关闭</string>
+    <string name="focus_enabled_on">开启</string>
+    <string name="focus_count_label">张数</string>
+    <string name="focus_increment_label">对焦增量</string>
+    <string name="focus_smoothing_label">曝光平滑化</string>
+    <string name="focus_hint">0xD208 的 24 字节字段没有文档。差分实测只证实了一件事：偏移 8 是开关，0 = 关闭、1 = 开启。张数 / 对焦增量 / 曝光平滑化（偏移 12 / 16 / 20）只是同一次设置里的旁证，不排除是别的字段，请对着机身屏幕核对。写入后会自动回读核对一次；若相机回 0x2019 之类的拒绝码，就说明这条属性在您这台机身上不可写，请改用机身菜单设置。写入成功后，「拍摄」面板的「预计张数」会自动填成这里的张数。</string>
 </resources>

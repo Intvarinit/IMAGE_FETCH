@@ -13,8 +13,11 @@ package com.imagefetch.transport;
 
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.StorageBrowser;
+import com.imagefetch.ptp.VendorProperty;
+import com.imagefetch.ptp.VendorPropertySnapshot;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -195,6 +198,20 @@ public final class PtpIpTransport implements CameraTransport {
     private static final long CANON_PROP_PUSH_INTERVAL_MS = 50L;
     /** 等待属性推送的总预算：兜住最坏时长，避免命令锁被占太久。 */
     private static final long CANON_PROP_PUSH_BUDGET_MS = 1000L;
+    /**
+     * 能力探测里「原值回写后重新读一遍」的等待预算。比普通读宽一些：刚写过属性的相机可能
+     * 还在忙，且探测是用户显式触发的一次性动作，多等一会儿换来确定的事实是划算的。
+     */
+    private static final long CANON_PROBE_READ_BUDGET_MS = 3000L;
+    /**
+     * 写厂商属性成功后，等一下再排空事件：相机不会立刻把新值推回 {@code 0xC189}，
+     * 不等这一拍就排空，缓存里留的还是写前那份旧值，上层随即做的回读核对会拿到旧值。
+     */
+    private static final long CANON_WRITE_SETTLE_MS = 300L;
+
+    /** 差分快照：排空之后再等几拍，把机身改设置后迟到的事件收进来。 */
+    private static final int CANON_SNAPSHOT_SETTLE_ROUNDS = 3;
+    private static final long CANON_SNAPSHOT_SETTLE_MS = 150L;
 
     /** 0x9153 的固定参数（libgphoto2 抓包值：0x00200000, 0, 0）。 */
     private static final long CANON_VIEWFINDER_PARAMETER = 0x0020_0000L;
@@ -732,6 +749,9 @@ public final class PtpIpTransport implements CameraTransport {
         // the camera, otherwise capture might return busy」（library.c:6106-6107）。
         // 排空失败不影响拍照尝试，只记一笔诊断。
         drainEosEventsForCapture();
+        // 对焦没结束时相机会把后续厂商命令一律回 0x2019——libgphoto2 只要动相机就先停对焦
+        // （config.c:574-577），按快门也不例外。标志位保证「本来没在跑对焦」时不白发命令。
+        cancelCanonAutofocus();
 
         // 机型判定的依据直接进诊断：判定落空会误用普通 EOS 的快门编码，把全按一直挡在
         // 0x2019——症状和「相机忙」完全一样，不打依据就分不清是哪一种。
@@ -748,7 +768,7 @@ public final class PtpIpTransport implements CameraTransport {
         long objectSeqBefore = objectAddedSeq;
 
         if (isCanonEosMSeries()) {
-            ReleaseResult press = releaseCommand(CANON_REMOTE_RELEASE_ON, EOS_M_FULL_PRESS);
+            ReleaseResult press = releaseCommandRetrying(CANON_REMOTE_RELEASE_ON, EOS_M_FULL_PRESS);
             recordCaptureStep(stepText("0x9128 RemoteReleaseOn(3,0) 全按（EOS M 编码）", press));
             // 全按后立刻松开（与普通 EOS 分支同一条纪律）：0x9128 等价于「按住快门不放」，
             // 驱动模式是连拍时按住多久就拍多久。libgphoto2 是「等 Button 事件 → 再松」，
@@ -786,7 +806,8 @@ public final class PtpIpTransport implements CameraTransport {
         }
 
         // 半按：实测相机在此步会测光/对焦（屏幕里对焦成功）但不拍，因此后面必须补全按。
-        ReleaseResult half = releaseCommand(CANON_REMOTE_RELEASE_ON, HALF_PRESS);
+        // 半按同样要退避重试：取景里按快门时这一步最容易撞上 0x2019，而原先一次被拒就整单失败。
+        ReleaseResult half = releaseCommandRetrying(CANON_REMOTE_RELEASE_ON, HALF_PRESS);
         recordCaptureStep(stepText("0x9128 RemoteReleaseOn(1,0) 半按", half));
         if (half.code != RESPONSE_OK) throw rejected(half.code);
         sleepQuietly(CANON_RELEASE_HOLD_MS);
@@ -794,17 +815,10 @@ public final class PtpIpTransport implements CameraTransport {
         // 这里不等对焦结果，但必须把队列清掉，否则又会变成下一次全按的积压。
         drainEosEventsForCapture();
 
-        // 全按：用 libgphoto2 实证过的 (2, 0)。只发一次在部分机型上会被瞬时拒绝，
-        // 故对 DeviceBusy 退避重试——这是「相机还在忙」而非「不支持」。
-        ReleaseResult press = releaseCommand(CANON_REMOTE_RELEASE_ON, FULL_PRESS);
+        // 全按：用 libgphoto2 实证过的 (2, 0)。取景中相机在退出推流/写卡时都会瞬时回
+        // DeviceBusy，退避重试由 releaseCommandRetrying 统一处置（与写属性同一套兜底）。
+        ReleaseResult press = releaseCommandRetrying(CANON_REMOTE_RELEASE_ON, FULL_PRESS);
         recordCaptureStep(stepText("0x9128 RemoteReleaseOn(2,0) 全按", press));
-        for (int retry = 1; press.code == RESPONSE_DEVICE_BUSY
-                && retry <= CANON_RELEASE_BUSY_RETRIES; retry++) {
-            sleepQuietly(CANON_RELEASE_BUSY_BACKOFF_MS * retry);
-            drainEosEventsForCapture();
-            press = releaseCommand(CANON_REMOTE_RELEASE_ON, FULL_PRESS);
-            recordCaptureStep(stepText("0x9128 RemoteReleaseOn(2,0) 全按重试 " + retry, press));
-        }
         // 「半按被接受、全按恒忙」可能是 EOS M 机身（按钮值 3），也可能只是普通 EOS 瞬时忙
         // （写卡/退出取景）。两种情形在响应码上分不开，所以这里只**试**一次 (3,0)，不记机型；
         // 要不要记住由下面的「发现新对象」决定。
@@ -921,7 +935,7 @@ public final class PtpIpTransport implements CameraTransport {
             }
             // 顺手把这一块里的 0xC189/0xC18A 事件收进缓存：0xD1xx 属性的当前值与允许值列表
             // 只能从这里攒（见 harvestEosEventBlock）。
-            harvestEosEventBlock(block, canonPropValues, canonPropEnums);
+            harvestEosEventBlock(block, canonPropValues, canonPropEnums, canonPropRaw);
             if (isEmptyEosEventBlock(block)) return null;
         }
         // 撞上限说明事件还在往外冒，队列**没排干净**。这里必须报出来：返回 null 会被上层
@@ -956,7 +970,7 @@ public final class PtpIpTransport implements CameraTransport {
                 // 队列已空（相机回纯 ResponseOK）：本轮没读到按钮事件。
                 return null;
             }
-            harvestEosEventBlock(block, canonPropValues, canonPropEnums);
+            harvestEosEventBlock(block, canonPropValues, canonPropEnums, canonPropRaw);
             if (block.length < 8) return null;
             Integer button = parseButtonEvent(block);
             if (button != null) return button;
@@ -978,20 +992,26 @@ public final class PtpIpTransport implements CameraTransport {
     }
 
     /**
-     * 把一段 {@code 0x9116 GetEvent} 数据段里的 TLV 记录收进两个缓存。记录序列为
+     * 把一段 {@code 0x9116 GetEvent} 数据段里的 TLV 记录收进三个缓存。记录序列为
      * {@code [u32 size][u32 code][payload…]}，{@code size} **含** 8 字节头
      * （libgphoto2 {@code ptp_unpack_EOS_events}，ptp-pack.c:1869-1899）。
      *
-     * <p>只关心两类：{@code 0xC189} 属性当前值（收进 {@code values}）与 {@code 0xC18A}
-     * 属性允许值列表（收进 {@code enums}，仅 {@code propxtype==3} 的枚举）。相机积攒很久的
-     * 事件块里会混着属性描述等其它记录，逐个跳过即可。终止条件与 libgphoto2 对齐：记录头不足
-     * 8 字节、{@code size==8 && code==0}（相机的「没有更多事件」标记，ptp-pack.c:1881）、
-     * 或声明长度越界，都立刻停止而不报错——截断/未知记录一律忽略。
+     * <p>只关心两类：{@code 0xC189} 属性当前值（收进 {@code values}，同时把原始字节原样收进
+     * {@code raw}）与 {@code 0xC18A} 属性允许值列表（收进 {@code enums}，仅 {@code propxtype==3}
+     * 的枚举）。相机积攒很久的事件块里会混着属性描述等其它记录，逐个跳过即可。终止条件与
+     * libgphoto2 对齐：记录头不足 8 字节、{@code size==8 && code==0}（相机的「没有更多事件」
+     * 标记，ptp-pack.c:1881）、或声明长度越界，都立刻停止而不报错——截断/未知记录一律忽略。
      *
-     * <p>做成 {@code static} 且只操作传入的两个 Map，便于脱离 socket 单测（见 EosEventHarvestTest）。
+     * <p>{@code raw} 是给能力探测用的：{@code 0xD134}/{@code 0xD13D} 的当前值在 EOS RP 上是
+     * 24 字节的不透明区域，{@code long} 装不下，必须原样留字节。
+     *
+     * <p>做成 {@code static} 且只操作传入的三个 Map，便于脱离 socket 单测（见 EosEventHarvestTest）。
      */
     static void harvestEosEventBlock(
-            byte[] block, Map<Integer, Long> values, Map<Integer, int[]> enums) {
+            byte[] block,
+            Map<Integer, Long> values,
+            Map<Integer, int[]> enums,
+            Map<Integer, byte[]> raw) {
         if (block == null) return;
         int offset = 0;
         while (offset + 8 <= block.length) {
@@ -1001,8 +1021,12 @@ public final class PtpIpTransport implements CameraTransport {
             int recordSize = (int) size;
             if (code == CANON_EVENT_PROP_VALUE_CHANGED) {
                 int property = recordProperty(block, offset, recordSize);
-                long value = propValueOf(block, offset, recordSize);
-                if (property >= 0 && value >= 0) values.put(property, value);
+                if (property >= 0) {
+                    long value = propValueOf(block, offset, recordSize);
+                    if (value >= 0) values.put(property, value);
+                    byte[] region = propRawOf(block, offset, recordSize);
+                    if (region != null) raw.put(property, region);
+                }
             } else if (code == CANON_EVENT_AVAIL_LIST_CHANGED) {
                 int property = recordProperty(block, offset, recordSize);
                 int[] allowed = propEnumOf(block, offset, recordSize);
@@ -1026,6 +1050,19 @@ public final class PtpIpTransport implements CameraTransport {
         if (size >= 0x10) return u32(block, offset + 0x0c) & 0xffffL;
         if (size >= 0x0e) return u16(block, offset + 0x0c) & 0xffffL;
         return -1;
+    }
+
+    /**
+     * {@code 0xC189} 记录的值区域**原始字节**（payload +0x0c 到记录末尾）。给能力探测用：
+     * {@code 0xD134}/{@code 0xD13D} 的当前值在 EOS RP 上是 24 字节的不透明区域，
+     * 只有原样留字节才能既完整显示、又在「原值回写」验证时按原样写回去。
+     * 记录里没有值区域（不长于 12 字节）时返回 {@code null}。
+     */
+    private static byte[] propRawOf(byte[] block, int offset, int size) {
+        if (size <= 0x0c) return null;
+        byte[] region = new byte[size - 0x0c];
+        System.arraycopy(block, offset + 0x0c, region, 0, region.length);
+        return region;
     }
 
     /**
@@ -1091,6 +1128,33 @@ public final class PtpIpTransport implements CameraTransport {
             this.code = code;
             this.payload = payload;
         }
+    }
+
+    /**
+     * 发一次快门命令，遇 {@code 0x2019 DeviceBusy} 退避重试；退避完仍忙就重建遥控/事件态再补发一次。
+     *
+     * <p>为什么要与 {@link #writeExposure} 完全同一套处置：取景中按快门时，相机在「退出取景推流」
+     * 与「写卡」两个时刻都会瞬时回 {@code 0x2019}。原先只有全按 (2,0) 带退避重试，**半按 (1,0)
+     * 与 EOS M 的 (3,0) 一次被拒就整单失败**——症状是「在取景里拍，时好时坏」。
+     * 退避完仍忙说明相机可能已经不在遥控/事件态（与 0x9110 写入被拒同因），
+     * 这时先 {@link #rebuildCanonStateAfterBusy()} 把状态重建回来，再补发一次。
+     *
+     * <p>重试是安全的：回 {@code 0x2019} 意味着快门**没有**被释放，重发不会多拍。
+     */
+    private ReleaseResult releaseCommandRetrying(int operation, long[] parameters) throws Exception {
+        ReleaseResult result = releaseCommand(operation, parameters);
+        for (int retry = 1; result.code == RESPONSE_DEVICE_BUSY
+                && retry <= CANON_RELEASE_BUSY_RETRIES; retry++) {
+            sleepQuietly(CANON_RELEASE_BUSY_BACKOFF_MS * retry);
+            drainEosEventsForCapture();
+            result = releaseCommand(operation, parameters);
+        }
+        if (result.code == RESPONSE_DEVICE_BUSY) {
+            rebuildCanonStateAfterBusy();
+            drainEosEventsForCapture();
+            result = releaseCommand(operation, parameters);
+        }
+        return result;
     }
 
     // ── Canon EOS 实时取景与曝光参数 ──
@@ -1254,6 +1318,12 @@ public final class PtpIpTransport implements CameraTransport {
      * （属性码 → 取值数组，保持相机给的顺序）。界面用它把曝光档位收窄到机身真正支持的子集。
      */
     private final Map<Integer, int[]> canonPropEnums = new LinkedHashMap<>();
+    /**
+     * 事件缓存：{@code 0xC189} 推来的属性当前值的**原始字节**（属性码 → 值区域）。
+     * {@code canonPropValues} 只留低 16 位，装不下 {@code 0xD134}/{@code 0xD13D} 的 24 字节
+     * 不透明区域——能力探测（P0）需要原样字节，故单独存一份。同样只在 synchronized 方法里读写。
+     */
+    private final Map<Integer, byte[]> canonPropRaw = new LinkedHashMap<>();
 
 
     /**
@@ -1531,6 +1601,242 @@ public final class PtpIpTransport implements CameraTransport {
     public synchronized int[] supportedValues(int propertyCode) {
         int[] allowed = canonPropEnums.get(propertyCode);
         return allowed == null ? null : allowed.clone();
+    }
+
+    /**
+     * P0 能力探测：把 {@link VendorProperty#PROBE_TARGETS} 这几个厂商属性的事实读出来——
+     * 是否存在、当前值原始字节、{@code 0xC18A} 给不给允许值、写入是否被接受。
+     *
+     * <p>只读部分：每个属性先排空 {@code 0x9116} 事件队列，缓存里没有值就发一次
+     * {@code 0x9127 RequestDevicePropValue} 催读，再按 10 次 × 50ms 重排（与
+     * {@link #readCanonProperty} 是同一条路——libgphoto2 也用 10×50ms 等 EOS 推属性，
+     * config.c:429-436）。
+     *
+     * <p>{@code verifyWrite=true} 时，对每个读到的属性再做一次**原值回写**：把刚读到的字节
+     * 原样经 {@code 0x9110} 写回去，然后重新读一遍比对。写的是相机自己刚报的值（语义上
+     * no-op），但它确实是一次真实写入，所以只由用户显式触发。这一步同时回答一个决定后续
+     * 阶段可行性的问题：<b>{@code 0x9110} 是否接受超过 12 字节的载荷</b>——libgphoto2 没有
+     * 先例（{@code ptp_canon_eos_setdevicepropvalue} 的默认分支固定写 12 字节，ptp.c:3951-3955，
+     * 且要求属性有 descriptor，{@code 0xD134}/{@code 0xD13D} 都没有）。
+     *
+     * <p>单个属性读不到不算失败：记下原因继续下一个，最后一起汇报。
+     */
+    @Override
+    public synchronized CapabilityReport probeVendorCapabilities(boolean verifyWrite)
+            throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        List<CapabilityReport.Entry> entries = new ArrayList<>();
+        for (int property : VendorProperty.PROBE_TARGETS) {
+            entries.add(probeVendorProperty(property, verifyWrite));
+        }
+        return new CapabilityReport(getCameraName(), entries, verifyWrite);
+    }
+
+    /**
+     * 把当前事件缓存里**所有**被 {@code 0xC189} 报过的厂商属性打一份只读快照，供差分法反推
+     * 取值语义与属性码（见 {@link VendorPropertySnapshot}）。纯读，不写相机。
+     *
+     * <p>机身改设置后事件会晚到几拍，所以排空之后再等一小会儿，重排几轮把迟到的事件收进来。
+     */
+    @Override
+    public synchronized VendorPropertySnapshot snapshotVendorProperties() throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        for (int round = 0; round < CANON_SNAPSHOT_SETTLE_ROUNDS; round++) {
+            if (round > 0) sleepQuietly(CANON_SNAPSHOT_SETTLE_MS);
+            drainEosEvents();
+        }
+        // 值事件与原始字节事件是两套缓存（有的属性只报了其中一种），取并集才不会漏条目。
+        Map<Integer, VendorPropertySnapshot.Item> byCode = new LinkedHashMap<>();
+        for (Map.Entry<Integer, byte[]> entry : canonPropRaw.entrySet()) {
+            int code = entry.getKey();
+            Long value = canonPropValues.get(code);
+            byCode.put(code, new VendorPropertySnapshot.Item(
+                    code, value == null ? VendorPropertySnapshot.UNSET : value, entry.getValue()));
+        }
+        for (Map.Entry<Integer, Long> entry : canonPropValues.entrySet()) {
+            if (!byCode.containsKey(entry.getKey())) {
+                byCode.put(entry.getKey(), new VendorPropertySnapshot.Item(
+                        entry.getKey(), entry.getValue(), null));
+            }
+        }
+        return new VendorPropertySnapshot(System.currentTimeMillis(), byCode);
+    }
+
+    /**
+     * 读一个厂商属性的**原始值区域**（只读）。0xD134 / 0xD13D / 0xD208 这类值是 24 字节的不透明块，
+     * 没有文档可查（libgphoto2 对这些属性一条字段定义都没有），所以只能把原始字节拿回来，
+     * 由上层决定怎么解读——绝不在这里「按猜的结构解析」。
+     *
+     * <p><b>为什么这里用 {@code fresh=false}（缓存优先）</b>：{@code 0xD13D} 这类没有 descriptor
+     * 的块，相机并不是每次 {@code 0x9127} 都会按需重推。真机实测：同一条链路上「能力探测」
+     * （{@code fresh=false}，从 {@code 0xC189} 事件缓存取值）能拿到完整的 24 字节，而这里原先用
+     * {@code fresh=true} 先把自己唯一的缓存删掉、再等相机重推，结果是既没等到推送、这一轮的
+     * {@code 0x9116 GetEvent} 还超时（{@code SocketTimeoutException}），值就此永久丢失。
+     * 缓存里的块来自 {@code SetEventMode(1)} 后的初始事件灌流或机身改设置时的 {@code 0xC189}，
+     * 是相机自己给的原值；读取时先排空一轮把已排队的变化事件收进来，再取缓存，
+     * 没有缓存才退化到 {@code 0x9127} 请相机推。
+     *
+     * @param propertyCode 见 {@link VendorProperty}
+     * @throws IOException 缓存为空且相机在预算内没有推送该属性的值时
+     */
+    @Override
+    public synchronized byte[] readVendorPropertyBlock(int propertyCode) throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        return readCanonPropertyRaw(propertyCode, false);
+    }
+
+    /**
+     * 整体回写一个厂商属性的值区域（会真的写相机，只应由用户显式操作触发）。
+     *
+     * <p>写入前按项目规矩排空 {@code 0x9116} 并停掉可能还在跑的对焦，遇 {@code 0x2019} 退避重试
+     * ——真机实测：这四个属性里除 0xD11D 外都接受 24 字节长载荷并回读一致。
+     *
+     * @return 相机响应码（{@code 0x2001} 为成功）
+     */
+    @Override
+    public synchronized int writeVendorPropertyBlock(int propertyCode, byte[] block) throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        drainEosEvents();
+        cancelCanonAutofocus();
+        int code = writeCanonPropertyBlobRetrying(propertyCode, block);
+        if (code == RESPONSE_OK) {
+            // 写成功后补一次「等一拍 + 排空」：写入本身不会让相机立刻把新值推回 0xC189，
+            // 不补这一下，事件缓存里留的还是写前那份旧值，上层随后的回读核对（缓存优先）
+            // 就会拿旧值去比，把「相机收下了」误报成「布局与设想不同」。
+            sleepQuietly(CANON_WRITE_SETTLE_MS);
+            drainEosEvents();
+        }
+        return code;
+    }
+
+    /** 探测单个属性：读（必须）→ 原值回写（可选）→ 重读比对（可选）。 */
+    private CapabilityReport.Entry probeVendorProperty(int propertyCode, boolean verifyWrite) {
+        byte[] current = null;
+        String readFailure = null;
+        try {
+            current = readCanonPropertyRaw(propertyCode, false);
+        } catch (Exception error) {
+            readFailure = describe(error);
+        }
+        int[] allowed = canonPropEnums.get(propertyCode);
+        if (!verifyWrite || current == null || current.length == 0) {
+            return new CapabilityReport.Entry(propertyCode, current, readFailure, allowed,
+                    CapabilityReport.WRITE_NOT_ATTEMPTED, null, null, null);
+        }
+        int code = CapabilityReport.WRITE_NOT_ATTEMPTED;
+        String writeFailure = null;
+        try {
+            // 与 writeExposure 同一套前置：先排空 0x9116，再停掉可能还在跑的对焦——
+            // 对焦没结束时 0x9110 一律回 0x2019（writeExposure 的注释里有实测记录）。
+            drainEosEvents();
+            cancelCanonAutofocus();
+            code = writeCanonPropertyBlobRetrying(propertyCode, current);
+        } catch (Exception error) {
+            writeFailure = describe(error);
+        }
+        if (code != RESPONSE_OK) {
+            return new CapabilityReport.Entry(propertyCode, current, readFailure, allowed,
+                    code, writeFailure, null, null);
+        }
+        byte[] readBack = null;
+        String readBackFailure = null;
+        try {
+            readBack = readCanonPropertyRaw(propertyCode, true);
+        } catch (Exception error) {
+            readBackFailure = describe(error);
+        }
+        return new CapabilityReport.Entry(propertyCode, current, readFailure, allowed,
+                code, writeFailure, readBack, readBackFailure);
+    }
+
+    /**
+     * 取一个厂商属性当前值的**原始字节**：先看事件缓存，没有就 {@code 0x9127} 催一次再重排。
+     *
+     * @param fresh {@code true} 时先丢掉该属性的缓存（回写验证后必须重读，否则拿到的还是旧值）
+     */
+    private byte[] readCanonPropertyRaw(int propertyCode, boolean fresh) throws Exception {
+        if (fresh) {
+            canonPropRaw.remove(propertyCode);
+            canonPropValues.remove(propertyCode);
+        }
+        drainEosEvents();
+        byte[] cached = canonPropRaw.get(propertyCode);
+        if (cached != null && cached.length > 0) return cached.clone();
+        requestCanonProperty(propertyCode);
+        String drainFailure = null;
+        long deadline = System.currentTimeMillis() + CANON_PROBE_READ_BUDGET_MS;
+        for (int attempt = 0; attempt < CANON_PROP_PUSH_ATTEMPTS; attempt++) {
+            String failure = drainEosEvents();
+            if (failure != null) drainFailure = failure;
+            cached = canonPropRaw.get(propertyCode);
+            if (cached != null && cached.length > 0) return cached.clone();
+            if (attempt + 1 >= CANON_PROP_PUSH_ATTEMPTS) break;
+            if (System.currentTimeMillis() >= deadline) break;
+            Thread.sleep(CANON_PROP_PUSH_INTERVAL_MS);
+        }
+        throw new IOException("相机没有推送 " + VendorProperty.label(propertyCode) + " 的当前值"
+                + (drainFailure == null ? "" : "\n" + drainFailure));
+    }
+
+    /**
+     * {@code 0x9110} 写厂商属性，值区域可能超过 4 字节。数据段形态与
+     * {@code ptp_canon_eos_setdevicepropvalue} 完全一致（ptp.c:3980-3983）：
+     * {@code [u32 总长度（含本字段与属性码）][u32 属性码][值区域…]}，总长度 = {@code 8 + 值区域长度}。
+     * libgphoto2 的 ImageFormat/CustomFuncEx 分支正是这么写的（{@code size = 8 + pack(...)}，
+     * ptp.c:3937-3948），默认分支则退化成 {@code 8 + 4 = 12} 字节——与本工程既有的
+     * {@link #writeCanonProperty} 一致。
+     */
+    private int writeCanonPropertyBlob(int propertyCode, byte[] region) throws Exception {
+        if (region.length > 4) {
+            return commandSendData(
+                    CANON_SET_DEVICE_PROP_VALUE_EX,
+                    transactionId++,
+                    new long[0],
+                    canonPropValueExPayload(propertyCode, region));
+        }
+        if (region.length >= 4) return writeCanonProperty(propertyCode, u32(region, 0));
+        if (region.length >= 2) return writeCanonProperty(propertyCode, u16(region, 0));
+        return writeCanonProperty(propertyCode, region.length == 1 ? region[0] & 0xffL : 0);
+    }
+
+    /**
+     * {@link #writeCanonPropertyBlob} 的重试版：遇 {@code 0x2019 DeviceBusy} 退避重试（重试前先排空
+     * 事件队列）；退避完仍被拒时重建遥控/事件态再补写一次。处置与 {@link #writeExposure} 一致——
+     * 真机上 0x2019 多数是「瞬时忙」，但也可能是相机已经不在遥控态，两种情形要分开兜。
+     */
+    private int writeCanonPropertyBlobRetrying(int propertyCode, byte[] region) throws Exception {
+        int code = RESPONSE_DEVICE_BUSY;
+        for (int attempt = 0;
+                attempt <= CANON_PROP_WRITE_BUSY_RETRIES && code == RESPONSE_DEVICE_BUSY;
+                attempt++) {
+            if (attempt > 0) {
+                sleepQuietly(CANON_RELEASE_BUSY_BACKOFF_MS * attempt);
+                drainEosEvents();
+            }
+            code = writeCanonPropertyBlob(propertyCode, region);
+        }
+        if (code == RESPONSE_DEVICE_BUSY) {
+            rebuildCanonStateAfterBusy();
+            code = writeCanonPropertyBlob(propertyCode, region);
+        }
+        return code;
+    }
+
+    /**
+     * {@code 0x9110} 长载荷的数据段：{@code [u32 总长度 = 8 + 值区域长度][u32 属性码][值区域…]}。
+     * 单独拆出来是为了能在 JVM 单测里把这段字节钉死——长度字段写错在真机上只会表现为
+     * 「相机静默忽略」或 {@code 0x2006 ParameterNotSupported}，很难反推。
+     */
+    static byte[] canonPropValueExPayload(int propertyCode, byte[] region) {
+        ByteWriter payload = new ByteWriter();
+        payload.u32(8 + region.length);
+        payload.u32(propertyCode);
+        payload.bytes(region);
+        return payload.data();
     }
 
     /** 0x9110 写厂商属性，返回响应码（由调用方决定哪些码可以容忍）。 */

@@ -4,7 +4,9 @@ import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.transport.CameraTransport;
 
 import java.io.OutputStream;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 
 /**
@@ -15,6 +17,8 @@ public final class FakeCameraTransport implements CameraTransport {
     private String cameraName = "Fake Camera";
     private CameraStorage.Snapshot snapshot =
             new CameraStorage.Snapshot(new ArrayList<>(), new ArrayList<>());
+    /** 分阶段快照队列：listStorage 每次弹一个，用尽后一直返回最后一个（见 stageSnapshots）。 */
+    private final Deque<CameraStorage.Snapshot> stagedSnapshots = new ArrayDeque<>();
     private byte[] objectBytes = new byte[0];
     private int failuresBeforeSuccess;
     private Exception failure;
@@ -41,6 +45,19 @@ public final class FakeCameraTransport implements CameraTransport {
 
     public FakeCameraTransport snapshot(CameraStorage.Snapshot value) {
         this.snapshot = value;
+        return this;
+    }
+
+    /**
+     * 让 listStorage 逐次返回不同快照（模拟“相机边拍边写卡”的中间态）：
+     * 第 n 次调用返回第 n 个，用尽后一直返回最后一个；不调用则始终返回 {@link #snapshot}。
+     */
+    public FakeCameraTransport stageSnapshots(CameraStorage.Snapshot... values) {
+        stagedSnapshots.clear();
+        if (values == null) return this;
+        for (CameraStorage.Snapshot value : values) {
+            stagedSnapshots.addLast(value);
+        }
         return this;
     }
 
@@ -78,6 +95,12 @@ public final class FakeCameraTransport implements CameraTransport {
     @Override
     public CameraStorage.Snapshot listStorage(int maxItems) {
         lastMaxItems = maxItems;
+        if (!stagedSnapshots.isEmpty()) {
+            CameraStorage.Snapshot next = stagedSnapshots.pollFirst();
+            // 队尾保留最后一个，用尽后反复返回它。
+            if (stagedSnapshots.isEmpty()) stagedSnapshots.addLast(next);
+            return next;
+        }
         return snapshot;
     }
 

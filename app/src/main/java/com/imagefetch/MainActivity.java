@@ -12,6 +12,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
+import android.graphics.Typeface;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.net.wifi.WifiInfo;
@@ -32,17 +33,24 @@ import android.widget.EditText;
 import android.widget.GridView;
 import android.widget.ImageView;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 
+import com.imagefetch.capture.FocusBracketPlan;
+import com.imagefetch.capture.HdrPlan;
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
+import com.imagefetch.ptp.VendorProperty;
+import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.ui.PhotoGridAdapter;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -109,6 +117,59 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 遥控拍摄面板（点「拍摄并取回」打开）；关闭后置空。 */
     private AlertDialog captureDialog;
+    /** P0 能力探测报告弹窗（侧栏项 / 长按状态文字打开）；关闭后置空。 */
+    private AlertDialog capabilityDialog;
+    private TextView capabilityMessageView;
+    /** 侧栏（「拍摄选项」）里的「能力探测」项；未连接时置灰。 */
+    private TextView capabilityItem;
+    /** 侧栏里的「属性差分」项；未连接时置灰。 */
+    private TextView diffItem;
+    /** 侧栏里的「拍摄」项（基础拍摄入口）；未连接时置灰。 */
+    private TextView captureItem;
+    /** 侧栏里的「对焦包围」项；未连接时置灰。 */
+    private TextView bracketItem;
+    /** 侧栏里的「HDR 拍摄」项；未连接时置灰。 */
+    private TextView hdrItem;
+    /** HDR 设置面板（0xD13D）；关闭后置空。 */
+    private AlertDialog hdrDialog;
+    private TextView hdrReportView;
+    private EditText hdrModeField;
+    /**
+     * 最近一次从相机读回的 0xD13D 原始 24 字节。写入时以它为底稿，只覆盖已证实的偏移 4，
+     * 其余 20 字节原样带回相机。没有底稿就不允许写入。
+     */
+    private byte[] hdrBlock;
+    /** 刚写下去的 24 字节，用于写入后自动回读核对；null 表示这次读取不是回读。 */
+    private byte[] pendingHdrWrite;
+    /** 对焦包围设置面板（0xD208）；关闭后置空。 */
+    private AlertDialog focusBracketDialog;
+    private TextView focusReportView;
+    private EditText focusEnabledField;
+    private EditText focusCountField;
+    private EditText focusIncrementField;
+    private EditText focusSmoothingField;
+    /**
+     * 最近一次从相机读回的 0xD208 原始 24 字节。写入时以它为底稿，只覆盖已证实的偏移 8
+     * 与旁证的偏移 12/16/20，其余 8 字节原样带回相机。没有底稿就不允许写入。
+     */
+    private byte[] focusBracketBlock;
+    /** 刚写下去的 0xD208 的 24 字节，用于写入后自动回读核对；null 表示这次读取不是回读。 */
+    private byte[] pendingFocusBracketWrite;
+    /** 拍摄面板上的「预计张数」输入框；面板关闭后置空。 */
+    private EditText captureShotsField;
+    /** 上次用过的预计张数，跨面板开关保留；对焦包围/HDR 包围下省得每次重填。 */
+    private int expectedShots = 1;
+    /** 侧栏容器与遮罩；未打开时均为 GONE。零 AndroidX 工程不能用 DrawerLayout，手写滑出。 */
+    private View drawerPanel;
+    private View drawerScrim;
+    private boolean drawerOpen;
+    /** 属性差分弹窗（机身改设置前后对比）；关闭后置空。 */
+    private AlertDialog diffDialog;
+    private TextView diffMessageView;
+    /** 差分基线快照；null 表示还没取。 */
+    private VendorPropertySnapshot diffBaseline;
+    /** 下一次快照回调是「取基线」还是「对比」——回调本身分不清这两件事。 */
+    private boolean snapshotIsBaseline;
     private ImageView liveViewImage;
     private TextView liveViewStatusView;
     private Button captureShootButton;
@@ -166,6 +227,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         pageInfoView = findViewById(R.id.pageInfo);
         progressBar = findViewById(R.id.progress);
         statusView = findViewById(R.id.status);
+        // 能力探测 / 属性差分收进侧栏（主页面底部「拍摄选项」打开）；长按状态文字仍是备用入口。
+        statusView.setOnLongClickListener(view -> {
+            showCapabilityReport();
+            return true;
+        });
+        setUpShotPanel();
         selectionCountView = findViewById(R.id.selectionCount);
         photoGrid = findViewById(R.id.grid);
 
@@ -239,14 +306,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             coordinator.connect(CameraSessionCoordinator.TransportKind.USB, "", 0);
         });
 
-        captureButton.setOnClickListener(view -> {
-            if (!coordinator.isConnected()) {
-                showError("请先连接相机。", null);
-                return;
-            }
-            // 拍摄取回改为在遥控面板里触发：面板同时提供实时取景与快门/光圈/ISO 调整。
-            showCapturePanel();
-        });
+        // 拍摄取回在遥控面板里触发：面板同时提供实时取景与快门/光圈/ISO 调整。
+        // 主界面按钮与侧栏「拍摄」项共用这一个入口。
+        captureButton.setOnClickListener(view -> openCapturePanel());
 
         refreshButton.setOnClickListener(view -> {
             if (!coordinator.isConnected()) {
@@ -428,6 +490,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     // ── 遥控拍摄面板（实时取景 + 快门/光圈/ISO） ──
 
+    /** 基础拍摄入口（主界面「拍摄并取回」按钮与侧栏「拍摄」项共用）。未连接时只提示。 */
+    private void openCapturePanel() {
+        if (coordinator == null || !coordinator.isConnected()) {
+            showError("请先连接相机。", null);
+            return;
+        }
+        showCapturePanel();
+    }
+
     /**
      * 打开遥控拍摄面板：实时取景预览 + 三档曝光参数 + 「拍摄并取回」。
      * 打开即开取景并读三档当前值；关闭（含链路断开）时停取景并回收最后一帧。
@@ -441,6 +512,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureAutofocusButton = content.findViewById(R.id.captureAutofocus);
         liveViewSizeSpinner = content.findViewById(R.id.liveViewSize);
         afModeSpinner = content.findViewById(R.id.afMode);
+        captureShotsField = content.findViewById(R.id.captureShots);
+        captureShotsField.setText(String.valueOf(expectedShots));
 
         // 取景是 3:2 画面：给黑底定一个固定高度，换帧时弹窗高度才不会跟着抖动。
         // 比例不能太大——预览是弹窗里最高的一块，占满后下面的档位行和拍摄按钮会被挤出
@@ -505,6 +578,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureAutofocusButton = null;
         liveViewSizeSpinner = null;
         afModeSpinner = null;
+        captureShotsField = null;
         afModeValues = null;
         lastAppliedAfValue = 0;
         exposureRows.clear();
@@ -720,12 +794,24 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             return;
         }
         if (captureRunning) return;
+        // 先把张数读出来并记住：机内包围一次快门出多张，之后的收集要按这个数等。
+        expectedShots = readExpectedShots();
         captureRunning = true;
         if (captureShootButton != null) captureShootButton.setEnabled(false);
         if (liveViewStatusView != null) liveViewStatusView.setText(R.string.capture_running);
         progressBar.setProgress(0);
         setBusy(true);
-        coordinator.captureAndFetch();
+        coordinator.captureAndFetch(expectedShots);
+    }
+
+    /** 拍摄面板上的「预计张数」。填得不合法就按 1 张——不能因为一个输入框让快门按不下去。 */
+    private int readExpectedShots() {
+        if (captureShotsField == null) return 1;
+        try {
+            return Math.max(1, Integer.parseInt(captureShotsField.getText().toString().trim()));
+        } catch (NumberFormatException exception) {
+            return 1;
+        }
     }
 
     private ExposureRow rowFor(CanonExposure.Setting setting) {
@@ -890,6 +976,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         super.onDestroy();
     }
 
+    /** 侧栏展开时返回键先收侧栏，不直接退出应用。 */
+    @Override
+    public void onBackPressed() {
+        if (drawerOpen) {
+            closeShotPanel();
+            return;
+        }
+        super.onBackPressed();
+    }
+
     // ── 协调器回调（均已切回主线程） ──
 
     @Override
@@ -912,6 +1008,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             goToPage(0);
             // Wi‑Fi 会话连上后，把实际所用的网络名称反写进输入框（密码读不回来）。
             if (wifiSession) writeBackCameraSsid();
+            // P0 能力探测（只读）：连接后立刻跑一次，结果落进状态栏的菜单里。
+            // 刻意放在开取景之前：探测要独占命令通道，与取景帧循环抢锁会互相拖慢。
+            coordinator.probeVendorCapabilities(false);
         });
     }
 
@@ -922,6 +1021,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             updateConnectButton(false);
             // 链路已断：遥控面板里的取景与参数都没了意义，先收起。
             dismissCapturePanel();
+            // 链路已断：能力报告里的按钮已无法执行，一并收起。
+            if (capabilityDialog != null) {
+                capabilityDialog.dismiss();
+            }
+            if (diffDialog != null) {
+                diffDialog.dismiss();
+            }
+            // 差分基线是一条会话里的事件缓存快照，链路断了就不再可比。
+            diffBaseline = null;
             // 链路已断：清掉图片栏，避免展示已经无法下载/预览的旧缩略图。
             gridAdapter.reset();
             statusView.setText(R.string.status_idle);
@@ -1098,6 +1206,486 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         });
     }
 
+    @Override
+    public void onCapabilityReport(CapabilityReport report, String error) {
+        runOnUiThread(() -> {
+            if (error != null || report == null) {
+                // 探测失败不影响任何既有功能，只在报告弹窗开着时把原因显示出来。
+                if (capabilityDialog != null && capabilityDialog.isShowing()) {
+                    capabilityMessageView.setText("探测失败：" + error);
+                }
+                return;
+            }
+            String text = report.describe();
+            if (capabilityDialog != null && capabilityDialog.isShowing()) {
+                capabilityMessageView.setText(text);
+            }
+        });
+    }
+
+    @Override
+    public void onVendorPropertySnapshot(VendorPropertySnapshot snapshot, String error) {
+        runOnUiThread(() -> {
+            if (snapshot == null) {
+                if (diffMessageView != null) diffMessageView.setText("快照失败：" + error);
+                return;
+            }
+            if (diffMessageView == null) return;
+            if (snapshotIsBaseline) {
+                diffBaseline = snapshot;
+                diffMessageView.setText("基线已取：" + snapshot.size() + " 个属性。\n\n"
+                        + "现在去机身上改一项设置（比如「对焦包围」或「间隔定时拍摄」），"
+                        + "改完回到这里点「对比」。\n\n"
+                        + snapshot.describe());
+            } else {
+                diffMessageView.setText(snapshot.describeDiff(diffBaseline));
+            }
+        });
+    }
+
+    /**
+     * 厂商属性差分工作台：机身改设置 → 前后字节比对。这是反推 {@code 0xD134}/{@code 0xD13D}
+     * 那 24 字节字段含义、以及在 RP 上找出「对焦包围」挂在哪个属性码上的唯一手段
+     * （libgphoto2 对这三条属性一条记录都没有，Canon 也完全没有对焦包围属性）。纯读，不写相机。
+     */
+    private void showPropertyDiff() {
+        if (coordinator == null || !coordinator.isConnected()) {
+            statusView.setText("请先连接相机，再看属性差分。");
+            return;
+        }
+        if (diffDialog != null && diffDialog.isShowing()) return;
+        diffMessageView = new TextView(this);
+        int padding = (int) (16 * getResources().getDisplayMetrics().density);
+        diffMessageView.setPadding(padding, padding, padding, padding);
+        diffMessageView.setTextIsSelectable(true);
+        diffMessageView.setTextSize(12f);
+        diffMessageView.setTypeface(Typeface.MONOSPACE);
+        diffMessageView.setText(diffBaseline == null
+                ? "还没有基线快照。\n\n顺序：先点「取基线快照」→ 去机身上改一项设置 → 回来点「对比」。"
+                : "已有一份基线快照（" + diffBaseline.size() + " 个属性）。改完机身设置后点「对比」。");
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(diffMessageView);
+        diffDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.property_diff_title)
+                .setView(scroll)
+                .setPositiveButton(R.string.property_diff_compare, null)
+                .setNeutralButton(R.string.property_diff_snapshot, null)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        diffDialog.setOnShowListener(dialog -> {
+            diffDialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                snapshotIsBaseline = true;
+                diffMessageView.setText("正在取基线快照…（只读）");
+                coordinator.snapshotVendorProperties();
+            });
+            diffDialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                snapshotIsBaseline = false;
+                diffMessageView.setText("正在取新快照并对比…（只读）");
+                coordinator.snapshotVendorProperties();
+            });
+        });
+        diffDialog.setOnDismissListener(dialog -> {
+            diffDialog = null;
+            diffMessageView = null;
+        });
+        diffDialog.show();
+    }
+
+    /**
+     * 厂商属性「整块读取」的回调（HDR 与对焦包围两个面板共用）。写入后会自动再读一次做回读核对，
+     * 所以这里要能分清「用户点的读取」和「写入后的核对」——靠各自的 pending 缓冲是否为空。
+     * 两个功能读的是不同属性码，先按 propertyCode 分流，再各自判断面板还在不在。
+     */
+    @Override
+    public void onVendorPropertyBlockRead(int propertyCode, byte[] block, String error) {
+        runOnUiThread(() -> {
+            if (propertyCode == VendorProperty.FOCUS_SHIFT_SETTING) {
+                onFocusBracketBlockRead(block, error);
+                return;
+            }
+            // 面板已关或回调迟到：直接丢弃，不要写进别的界面。
+            if (hdrReportView == null) return;
+            if (error != null || block == null) {
+                hdrReportView.setText("读取 " + VendorProperty.hex(propertyCode) + " 失败：" + error
+                        + "\n\n写入必须以相机自己的 24 字节为底稿，读不到就不能写。");
+                pendingHdrWrite = null;
+                return;
+            }
+            byte[] previous = hdrBlock;
+            hdrBlock = block;
+            String check = takeHdrWriteCheck(block, previous);
+            showHdrBlock(
+                    "0xD13D EOS_HDRSetting 当前值"
+                            + (check.isEmpty() ? "（只读）" : "（写入后自动回读）"),
+                    block,
+                    check.isEmpty()
+                            ? "\n偏移 4 的模式由差分实测证实（0 = 关闭、1 = 自动）；"
+                            + "其余字节原样保留相机给的内容。"
+                            : check);
+        });
+    }
+
+    /** 厂商属性「整块写入」的回调。写入被受理后立刻回读一次核对，不把「回了 OK」当成结论。 */
+    @Override
+    public void onVendorPropertyBlockWritten(int propertyCode, int code, String error) {
+        runOnUiThread(() -> {
+            if (propertyCode == VendorProperty.FOCUS_SHIFT_SETTING) {
+                onFocusBracketBlockWritten(code, error);
+                return;
+            }
+            if (hdrReportView == null) {
+                pendingHdrWrite = null;
+                return;
+            }
+            if (error != null || code == 0) {
+                pendingHdrWrite = null;
+                hdrReportView.setText("写入 " + VendorProperty.hex(propertyCode) + " 失败："
+                        + (error == null ? "相机未正常应答" : error));
+                return;
+            }
+            hdrReportView.setText("写入 " + VendorProperty.hex(propertyCode) + " 回 "
+                    + VendorProperty.hex(code) + "，正在回读核对…");
+            coordinator.readVendorPropertyBlock(propertyCode);
+        });
+    }
+
+    /**
+     * 「对焦包围」设置面板：机内 0xD208（{@code PTP_DPC_CANON_EOS_FocusShiftSetting}）
+     * 的读改回写。之前只做「按张数收图」，机身没配好就拍不出包围——缺的正是这一块参数界面。
+     *
+     * <p>0xD208 里只有「偏移 8 = 开关」是差分实测证实的；张数 / 对焦增量 / 曝光平滑化
+     * （偏移 12 / 16 / 20）只是旁证。可写性在 RP 上完全未验证（同类属性 {@code 0xD11D}
+     * 就是被拒 {@code 0x2019} 的先例），所以写入失败要如实报错，不能让界面崩。
+     */
+    private void openBracketCapture() {
+        if (coordinator == null || !coordinator.isConnected()) {
+            statusView.setText("请先连接相机，再设置对焦包围。");
+            return;
+        }
+        if (focusBracketDialog != null && focusBracketDialog.isShowing()) return;
+        View content = getLayoutInflater().inflate(R.layout.dialog_focus_bracket, null);
+        focusReportView = content.findViewById(R.id.focusReport);
+        focusEnabledField = content.findViewById(R.id.focusEnabled);
+        focusCountField = content.findViewById(R.id.focusCount);
+        focusIncrementField = content.findViewById(R.id.focusIncrement);
+        focusSmoothingField = content.findViewById(R.id.focusSmoothing);
+        if (focusBracketBlock == null) {
+            focusReportView.setText("正在读取 0xD208…（只读）");
+        } else {
+            // 先把上次那份字节立即摆出来（进面板就有东西可看、可改），随后的一次默认读取会覆盖它。
+            showFocusBracketBlock("上次读到的 0xD208（正在刷新…）", focusBracketBlock, "");
+        }
+        content.findViewById(R.id.focusEnabledOff).setOnClickListener(view -> focusEnabledField.setText("0"));
+        content.findViewById(R.id.focusEnabledOn).setOnClickListener(view -> focusEnabledField.setText("1"));
+        content.findViewById(R.id.focusRead).setOnClickListener(view -> {
+            pendingFocusBracketWrite = null;
+            focusReportView.setText("正在读取 0xD208…（只读）");
+            coordinator.readVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING);
+        });
+        content.findViewById(R.id.focusWrite).setOnClickListener(view -> writeFocusBracket());
+        focusBracketDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.focus_title)
+                .setView(content)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        focusBracketDialog.setOnDismissListener(dialog -> {
+            focusBracketDialog = null;
+            focusReportView = null;
+            focusEnabledField = null;
+            focusCountField = null;
+            focusIncrementField = null;
+            focusSmoothingField = null;
+            pendingFocusBracketWrite = null;
+        });
+        focusBracketDialog.show();
+        // 进面板就默认读一次：省掉「先点读取当前值」这一步；用户手动读取时会再清一次 pending。
+        pendingFocusBracketWrite = null;
+        coordinator.readVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING);
+    }
+
+    /** 把读到的 24 字节摆进报告，并把四个字段预填进输入框。 */
+    private void showFocusBracketBlock(String title, byte[] block, String footer) {
+        if (focusReportView == null) return;
+        focusReportView.setText(title + "\n\n" + FocusBracketPlan.describeBlock(block) + footer);
+        try {
+            FocusBracketPlan plan = FocusBracketPlan.fromBlock(block);
+            focusEnabledField.setText(String.valueOf(plan.enabled()));
+            focusCountField.setText(String.valueOf(plan.count()));
+            focusIncrementField.setText(String.valueOf(plan.increment()));
+            focusSmoothingField.setText(String.valueOf(plan.smoothing()));
+        } catch (IllegalArgumentException ignored) {
+            // 长度不是 24 的机型：原始字节照常展示，四个值留给用户自己填。
+        }
+    }
+
+    /** 对焦包围面板的「整块读取」回调（含写入后的自动回读）。 */
+    private void onFocusBracketBlockRead(byte[] block, String error) {
+        if (focusReportView == null) return;
+        if (error != null || block == null) {
+            focusReportView.setText("读取 0xD208 失败：" + error
+                    + "\n\n写入必须以相机自己的 24 字节为底稿，读不到就不能写。");
+            pendingFocusBracketWrite = null;
+            return;
+        }
+        byte[] previous = focusBracketBlock;
+        focusBracketBlock = block;
+        String check = takeFocusBracketWriteCheck(block, previous);
+        showFocusBracketBlock(
+                "0xD208 EOS_FocusShiftSetting 当前值"
+                        + (check.isEmpty() ? "（只读）" : "（写入后自动回读）"),
+                block,
+                check.isEmpty()
+                        ? "\n偏移 8 的开关由差分实测证实（0 = 关闭、1 = 开启）；"
+                        + "偏移 12 / 16 / 20 只是旁证，其余字节原样保留。"
+                        : check);
+    }
+
+    /** 对焦包围面板的「整块写入」回调。写入被受理后立刻回读一次核对。 */
+    private void onFocusBracketBlockWritten(int code, String error) {
+        if (focusReportView == null) {
+            pendingFocusBracketWrite = null;
+            return;
+        }
+        if (error != null || code == 0) {
+            pendingFocusBracketWrite = null;
+            focusReportView.setText("写入 0xD208 失败："
+                    + (error == null ? "相机未正常应答" : error)
+                    + "\n\n若为 0x2019（参数不受支持），说明这条属性在您这台机身上不可写，"
+                    + "请改用机身菜单设置对焦包围。");
+            return;
+        }
+        focusReportView.setText("写入 0xD208 回 " + VendorProperty.hex(code) + "，正在回读核对…");
+        // 开关是「开」时，把张数同步成拍摄面板的「预计张数」——否则用户还要在两个面板各填一次，
+        // 填漏了就会「等了半天只出一张」。
+        if (focusEnabledField != null && focusCountField != null
+                && "1".equals(focusEnabledField.getText().toString().trim())) {
+            try {
+                expectedShots = Math.max(1, Integer.parseInt(focusCountField.getText().toString().trim()));
+            } catch (NumberFormatException ignored) {
+                // 张数不是整数：保留原来的预计张数，拍摄面板的输入框仍可手填。
+            }
+        }
+        coordinator.readVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING);
+    }
+
+    /**
+     * 写入后回读的那一次读取，用刚写下去的字节与相机现在报的字节逐字节比对。
+     * 与 HDR 面板同样的三档判词：一致 / 相机没回报新值 / 相机改写了字段——分开报才分得清
+     * 「读不到」与「字段布局不对」。
+     *
+     * @param previous 写入前的底稿，用来区分「相机改写了字段」与「相机压根没回报新值」
+     * @return 结论文案；本次读取不是回读时返回空串
+     */
+    private String takeFocusBracketWriteCheck(byte[] block, byte[] previous) {
+        byte[] expected = pendingFocusBracketWrite;
+        if (expected == null) return "";
+        pendingFocusBracketWrite = null;
+        if (Arrays.equals(expected, block)) {
+            return "\n\n回读核对：与刚写入的 24 字节完全一致，相机已收下。"
+                    + "\n但这只说明收下了，是否真的启用（以及张数、增量是否正确）请到机身屏幕核对。";
+        }
+        if (previous != null && Arrays.equals(previous, block)) {
+            return "\n\n回读核对：读回的仍是写入前那份字节——相机这次没有回报新值，"
+                    + "无法判断写入是否生效。以机身屏幕为准，或重连后再读一次。";
+        }
+        return "\n\n回读核对：与刚写入的字节不一致——相机改写了其中一部分。"
+                + "这是有价值的结论：说明该字段的布局与设想不同，别照这次的推断继续用。";
+    }
+
+    /** 把输入框里的四个字段叠到读回的 24 字节底稿上写回相机。没有底稿就不写。 */
+    private void writeFocusBracket() {
+        if (focusReportView == null) return;
+        if (focusBracketBlock == null) {
+            focusReportView.setText("还没有 0xD208 的底稿，请先点「读取当前值」。");
+            return;
+        }
+        long enabled;
+        long count;
+        long increment;
+        long smoothing;
+        try {
+            enabled = Long.parseLong(focusEnabledField.getText().toString().trim());
+            count = Long.parseLong(focusCountField.getText().toString().trim());
+            increment = Long.parseLong(focusIncrementField.getText().toString().trim());
+            smoothing = Long.parseLong(focusSmoothingField.getText().toString().trim());
+        } catch (NumberFormatException exception) {
+            focusReportView.setText("开关 / 张数 / 对焦增量 / 曝光平滑化都要填整数。"
+                    + "\n开关：0 = 关闭，1 = 开启。");
+            return;
+        }
+        FocusBracketPlan plan;
+        try {
+            plan = new FocusBracketPlan(enabled, count, increment, smoothing);
+        } catch (IllegalArgumentException exception) {
+            focusReportView.setText("参数无效：" + exception.getMessage());
+            return;
+        }
+        byte[] payload = plan.applyTo(focusBracketBlock);
+        pendingFocusBracketWrite = payload;
+        focusReportView.setText("正在写入 0xD208…（" + plan.describe() + "）\n\n"
+                + FocusBracketPlan.describeBlock(payload));
+        coordinator.writeVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING, payload);
+    }
+
+    /**
+     * 「HDR 拍摄」设置面板：机内 0xD13D 的读改回写。这是能力探测之后第一条真正写 0xD1xx
+     * 厂商属性的功能，所以界面把「原始字节」摆在最显眼处，模式只是叠加在相机自己那份 24 字节
+     * 之上的偏移 4。写入后自动回读核对，让「相机收下了」与「真的启用了」分得开。
+     */
+    private void openHdrDialog() {
+        if (coordinator == null || !coordinator.isConnected()) {
+            statusView.setText("请先连接相机，再设置 HDR。");
+            return;
+        }
+        if (hdrDialog != null && hdrDialog.isShowing()) return;
+        View content = getLayoutInflater().inflate(R.layout.dialog_hdr, null);
+        hdrReportView = content.findViewById(R.id.hdrReport);
+        hdrModeField = content.findViewById(R.id.hdrMode);
+        if (hdrBlock == null) {
+            hdrReportView.setText("正在读取 0xD13D…（只读）");
+        } else {
+            // 先把上次那份字节立即摆出来（进面板就有东西可看、可改），随后的一次默认读取会覆盖它。
+            showHdrBlock("上次读到的 0xD13D（正在刷新…）", hdrBlock, "");
+        }
+        content.findViewById(R.id.hdrModeOff).setOnClickListener(view -> hdrModeField.setText("0"));
+        content.findViewById(R.id.hdrModeAuto).setOnClickListener(view -> hdrModeField.setText("1"));
+        content.findViewById(R.id.hdrRead).setOnClickListener(view -> {
+            pendingHdrWrite = null;
+            hdrReportView.setText("正在读取 0xD13D…（只读）");
+            coordinator.readVendorPropertyBlock(VendorProperty.HDR_SETTING);
+        });
+        content.findViewById(R.id.hdrWrite).setOnClickListener(view -> writeHdrMode());
+        hdrDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.hdr_title)
+                .setView(content)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        hdrDialog.setOnDismissListener(dialog -> {
+            hdrDialog = null;
+            hdrReportView = null;
+            hdrModeField = null;
+            pendingHdrWrite = null;
+        });
+        hdrDialog.show();
+        // 进面板就默认读一次：省掉「先点读取当前值」这一步；用户手动读取时会再清一次 pending。
+        pendingHdrWrite = null;
+        coordinator.readVendorPropertyBlock(VendorProperty.HDR_SETTING);
+    }
+
+    /** 把读到的 24 字节摆进报告，并把偏移 4 的模式预填进输入框。 */
+    private void showHdrBlock(String title, byte[] block, String footer) {
+        if (hdrReportView == null) return;
+        hdrReportView.setText(title + "\n\n" + HdrPlan.describeBlock(block) + footer);
+        try {
+            hdrModeField.setText(String.valueOf(HdrPlan.fromBlock(block).mode()));
+        } catch (IllegalArgumentException ignored) {
+            // 长度不是 24 的机型：原始字节照常展示，模式值留给用户自己填。
+        }
+    }
+
+    /**
+     * 写入后回读的那一次读取，用刚写下去的字节与相机现在报的字节逐字节比对。
+     * 不一致是有价值的结论（说明字段布局与设想不同），必须如实报出来，不能只报「写入成功」。
+     *
+     * @param previous 写入前的底稿，用来区分「相机改写了字段」与「相机压根没回报新值」
+     * @return 结论文案；本次读取不是回读时返回空串
+     */
+    private String takeHdrWriteCheck(byte[] block, byte[] previous) {
+        byte[] expected = pendingHdrWrite;
+        if (expected == null) return "";
+        pendingHdrWrite = null;
+        if (Arrays.equals(expected, block)) {
+            return "\n\n回读核对：与刚写入的 24 字节完全一致，相机已收下。"
+                    + "\n但这只说明收下了，是否真的启用（以及是哪一档）请到机身屏幕核对。";
+        }
+        if (previous != null && Arrays.equals(previous, block)) {
+            // 相机这次没把缓存换成新值（多半是没推 0xC189），不是它改写了字段。
+            // 这两种情形必须分开报：混在一起会把「读不到」误判成「字段布局不对」。
+            return "\n\n回读核对：读回的仍是写入前那份字节——相机这次没有回报新值，"
+                    + "无法判断写入是否生效。以机身屏幕为准，或重连后再读一次。";
+        }
+        return "\n\n回读核对：与刚写入的字节不一致——相机改写了其中一部分。"
+                + "这是有价值的结论：说明该字段的布局与设想不同，别照这次的推断继续用。";
+    }
+
+    /** 把输入框里的模式叠到读回的 24 字节底稿上写回相机。没有底稿就不写。 */
+    private void writeHdrMode() {
+        if (hdrReportView == null) return;
+        if (hdrBlock == null) {
+            hdrReportView.setText("还没有 0xD13D 的底稿，请先点「读取当前值」。");
+            return;
+        }
+        long mode;
+        try {
+            mode = Long.parseLong(hdrModeField.getText().toString().trim());
+        } catch (NumberFormatException exception) {
+            hdrReportView.setText("模式要填整数：0 = 关闭，1 = 自动；其余取值没有证据。");
+            return;
+        }
+        HdrPlan plan;
+        try {
+            plan = new HdrPlan(mode);
+        } catch (IllegalArgumentException exception) {
+            hdrReportView.setText("模式取值无效：" + exception.getMessage());
+            return;
+        }
+        byte[] payload = plan.applyTo(hdrBlock);
+        pendingHdrWrite = payload;
+        hdrReportView.setText("正在写入 0xD13D…（" + plan.describe() + "）\n\n"
+                + HdrPlan.describeBlock(payload));
+        coordinator.writeVendorPropertyBlock(VendorProperty.HDR_SETTING, payload);
+    }
+
+    /**
+     * P0 能力探测报告（状态行右侧「能力探测」按钮，或长按状态文字）。内容按需填进一个可滚动的
+     * TextView。「写入验证」按钮做的是原值回写——虽然写的是相机自己刚报的值，但真的会写相机，
+     * 所以只在用户点击后才跑。
+     */
+    private void showCapabilityReport() {
+        if (coordinator == null || !coordinator.isConnected()) {
+            statusView.setText("请先连接相机，再看能力报告。");
+            return;
+        }
+        capabilityMessageView = new TextView(this);
+        int padding = (int) (16 * getResources().getDisplayMetrics().density);
+        capabilityMessageView.setPadding(padding, padding, padding, padding);
+        capabilityMessageView.setTextIsSelectable(true);
+        capabilityMessageView.setTextSize(12f);
+        // 报告主体是十六进制字节，等宽字体才看得出来对齐与字段边界。
+        capabilityMessageView.setTypeface(Typeface.MONOSPACE);
+        CapabilityReport cached = coordinator.lastCapabilityReport();
+        capabilityMessageView.setText(cached == null
+                ? "正在探测…（连接后会自动跑一次只读探测）"
+                : cached.describe());
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(capabilityMessageView);
+        capabilityDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.capability_report_title)
+                .setView(scroll)
+                .setPositiveButton(R.string.capability_verify_write, null)
+                .setNeutralButton(R.string.capability_probe_readonly, null)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        capabilityDialog.setOnShowListener(dialog -> {
+            // 自己接管点击：默认行为会关掉弹窗，那样探测结果回来时就没地方显示了。
+            Button verify = capabilityDialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            verify.setOnClickListener(view -> {
+                capabilityMessageView.setText("正在做原值回写验证…（会真的写一次相机属性）");
+                coordinator.probeVendorCapabilities(true);
+            });
+            Button relist = capabilityDialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+            relist.setOnClickListener(view -> {
+                capabilityMessageView.setText("正在重新探测…");
+                coordinator.probeVendorCapabilities(false);
+            });
+        });
+        capabilityDialog.setOnDismissListener(dialog -> {
+            capabilityDialog = null;
+            capabilityMessageView = null;
+        });
+        capabilityDialog.show();
+    }
+
     /**
      * 把预览控件上的点按位置换算成取景帧像素坐标并下发 0x915B，只移动对焦框、不触发对焦。
      *
@@ -1172,9 +1760,88 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         }
     }
 
+    /**
+     * 侧栏（「拍摄选项」）的搭建与开合。
+     *
+     * <p>零 AndroidX 工程不能用 DrawerLayout，所以侧栏就是「面板 + 遮罩」两个兄弟视图。
+     * 面板在 layout_gravity=start 下左边缘本来就贴着屏幕左边，要藏到屏幕外得往<b>负</b>方向平移
+     * 一个自身宽度（往正方向平移会横在屏幕中间）。
+     *
+     * <p>面板保持 INVISIBLE（不是 GONE）而不是初始隐藏：GONE 的视图不会被测量，
+     * {@code getWidth()} 会返回 0，滑动距离就算不出来了。
+     */
+    private void setUpShotPanel() {
+        drawerPanel = findViewById(R.id.drawerPanel);
+        drawerScrim = findViewById(R.id.drawerScrim);
+        capabilityItem = findViewById(R.id.shotCapability);
+        diffItem = findViewById(R.id.shotDiff);
+        captureItem = findViewById(R.id.shotCapture);
+        bracketItem = findViewById(R.id.shotBracket);
+        hdrItem = findViewById(R.id.shotHdr);
+
+        Button openButton = findViewById(R.id.shotOptions);
+        openButton.setOnClickListener(view -> openShotPanel());
+        findViewById(R.id.shotClose).setOnClickListener(view -> closeShotPanel());
+        drawerScrim.setOnClickListener(view -> closeShotPanel());
+        captureItem.setOnClickListener(view -> {
+            closeShotPanel();
+            openCapturePanel();
+        });
+        bracketItem.setOnClickListener(view -> {
+            closeShotPanel();
+            openBracketCapture();
+        });
+        hdrItem.setOnClickListener(view -> {
+            closeShotPanel();
+            openHdrDialog();
+        });
+        capabilityItem.setOnClickListener(view -> {
+            closeShotPanel();
+            showCapabilityReport();
+        });
+        diffItem.setOnClickListener(view -> {
+            closeShotPanel();
+            showPropertyDiff();
+        });
+        setShotPanelItemsEnabled(false);
+        drawerPanel.post(() -> drawerPanel.setTranslationX(-drawerPanel.getWidth()));
+    }
+
+    private void openShotPanel() {
+        if (drawerOpen) return;
+        drawerOpen = true;
+        drawerScrim.setVisibility(View.VISIBLE);
+        drawerPanel.setVisibility(View.VISIBLE);
+        drawerPanel.animate().translationX(0f).setDuration(180).start();
+    }
+
+    private void closeShotPanel() {
+        if (!drawerOpen) return;
+        drawerOpen = false;
+        drawerScrim.setVisibility(View.GONE);
+        // 滑出后转 INVISIBLE，而非 GONE——GONE 会让宽度归零，下次滑出就没有距离可算了。
+        drawerPanel.animate()
+                .translationX(-drawerPanel.getWidth())
+                .setDuration(180)
+                .withEndAction(() -> drawerPanel.setVisibility(View.INVISIBLE))
+                .start();
+    }
+
+    /** 侧栏里需要连上相机才有意义的项：断开时置灰并停掉点击。 */
+    private void setShotPanelItemsEnabled(boolean enabled) {
+        for (TextView item : new TextView[]{
+                captureItem, bracketItem, hdrItem, capabilityItem, diffItem}) {
+            if (item == null) continue;
+            item.setEnabled(enabled);
+            item.setAlpha(enabled ? 1f : 0.4f);
+        }
+    }
+
     private void updateConnectButton(boolean connected) {
         connectButton.setText(connected ? R.string.disconnect : R.string.connect);
         connectUsbButton.setText(connected ? R.string.disconnect : R.string.connect_usb);
+        // 能力探测要连上相机才有意义，断开时置灰（避免用户点了以为坏了）。
+        setShotPanelItemsEnabled(connected);
     }
 
     /**

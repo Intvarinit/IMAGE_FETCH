@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「对焦包围」设置面板（机内 0xD208 FocusShiftSetting）。
+  与 HDR 面板同样的结构：只读报告 + 参数输入 + 读取/写入两个动作。按钮放在视图里而不是
+  AlertDialog 的按钮位上，因为报告要一直在屏幕可见处，而默认按钮按下会关掉弹窗。
+  根布局用 ScrollView：报告 + 三行参数 + 按钮 + 长提示叠起来会超过屏幕高度，
+  AlertDialog 不会自动让自定义视图可滚动，底部按钮会被挤出可视区。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:scrollbars="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/focusReport"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/focus_enabled_label"
+                android:textColor="@color/ink"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/focusEnabled"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/focus_enabled_label"
+                android:inputType="number"
+                android:maxLines="1" />
+
+            <Button
+                android:id="@+id/focusEnabledOff"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="@string/focus_enabled_off"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/focusEnabledOn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:text="@string/focus_enabled_on"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/focus_count_label"
+                android:textColor="@color/ink"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/focusCount"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/focus_count_label"
+                android:inputType="number"
+                android:maxLines="1" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:text="@string/focus_increment_label"
+                android:textColor="@color/ink"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/focusIncrement"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/focus_increment_label"
+                android:inputType="number"
+                android:maxLines="1" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/focus_smoothing_label"
+                android:textColor="@color/ink"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/focusSmoothing"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/focus_smoothing_label"
+                android:inputType="number"
+                android:maxLines="1" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/focusRead"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/focus_read"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/focusWrite"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/focus_write"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="@string/focus_hint"
+            android:textColor="#6B7280"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>
