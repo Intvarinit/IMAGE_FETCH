@@ -1510,12 +1510,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             smoothing = Long.parseLong(focusSmoothingField.getText().toString().trim());
         } catch (NumberFormatException exception) {
             focusReportView.setText("开关 / 张数 / 对焦增量 / 曝光平滑化都要填整数。"
-                    + "\n开关：0 = 关闭，1 = 开启。");
+                    + "\n开关：0 = 关闭，1 = 开启。"
+                    + "\n张数：" + FocusBracketPlan.MIN_COUNT + "–" + FocusBracketPlan.MAX_COUNT
+                    + "（开启时）。对焦增量：" + FocusBracketPlan.MIN_INCREMENT + "–"
+                    + FocusBracketPlan.MAX_INCREMENT + "。曝光平滑化：0 = 关闭、1 = 启用。");
             return;
         }
         FocusBracketPlan plan;
         try {
-            plan = new FocusBracketPlan(enabled, count, increment, smoothing);
+            plan = FocusBracketPlan.forWrite(enabled, count, increment, smoothing);
         } catch (IllegalArgumentException exception) {
             focusReportView.setText("参数无效：" + exception.getMessage());
             return;

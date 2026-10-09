@@ -73,9 +73,10 @@
     <string name="hdr_mode_label">模式</string>
     <string name="hdr_mode_off">关闭</string>
     <string name="hdr_mode_auto">自动</string>
-    <string name="hdr_hint">0xD13D 的 24 字节字段没有文档。差分实测只证实了一件事：偏移 4 是模式，0 = 关闭、1 = 自动；其余字节原样保留相机给的内容。写入后会自动回读核对一次，但「回读一致」只说明相机收下了，是否真的启用请对着机身屏幕看。机身菜单里带曝光补偿量的那几档取值没有证据，只能自己填原始数值。</string>
+    <string name="hdr_mode_hint">0 = 关闭，1 = 自动（偏移 4 的 u32，差分实测证实：机身 HDR 从关改到自动时这一项由 0 变 1）。机身菜单里带曝光补偿量的那几档取值没有证据，只能自己填原始数值。</string>
+    <string name="hdr_hint">0xD13D 的 24 字节字段没有文档，只有「模式」是差分实测证实的，其余字节原样保留相机给的内容。写入后会自动回读核对一次，但「回读一致」只说明相机收下了，是否真的启用请对着机身屏幕看。</string>
     <string name="capture_shots_label">预计张数</string>
-    <string name="capture_shots_hint">对焦包围 / HDR 包围：机身菜单里设了几张就填几，App 按这个数收图（收满即返回，不足则等相机不再出新对象）。单张拍摄填 1。</string>
+    <string name="capture_shots_hint">对焦包围 / HDR 包围：机身菜单里设了几张就填几，App 按这个数收图（收满即返回，不足则等相机不再出新对象）。在「对焦包围」面板写入张数后这里会自动填上，单张拍摄填 1。</string>
     <string name="capability_probe_readonly">重新探测（只读）</string>
     <string name="capability_verify_write">写入验证（原值回写）</string>
     <string name="focus_title">对焦包围设置（0xD208）</string>
@@ -87,5 +88,12 @@
     <string name="focus_count_label">张数</string>
     <string name="focus_increment_label">对焦增量</string>
     <string name="focus_smoothing_label">曝光平滑化</string>
-    <string name="focus_hint">0xD208 的 24 字节字段没有文档。差分实测只证实了一件事：偏移 8 是开关，0 = 关闭、1 = 开启。张数 / 对焦增量 / 曝光平滑化（偏移 12 / 16 / 20）只是同一次设置里的旁证，不排除是别的字段，请对着机身屏幕核对。写入后会自动回读核对一次；若相机回 0x2019 之类的拒绝码，就说明这条属性在您这台机身上不可写，请改用机身菜单设置。写入成功后，「拍摄」面板的「预计张数」会自动填成这里的张数。</string>
+    <string name="focus_enabled_hint">0 = 关闭，1 = 开启（偏移 8 的 u32，差分实测证实：机身打开对焦包围时这一项由 0 变 1）。关着的时候按快门只出一张，收不到包围序列。</string>
+    <string name="focus_count_hint">一次拍摄连续拍几张，机身允许 2–999（偏移 12，旁证）。相机会从当前对焦的最近点出发，向无限远方向逐张移动焦点，直到拍满设定的张数或到达对焦极限。这个值宁多勿少：张数不够可能盖不住想要的清晰范围，但设太多会拖长拍摄时间并多占存储。</string>
+    <string name="focus_increment_hint">每拍一张焦点向后移动的步长，机身允许 1–10（偏移 16，旁证）。数值越小步长越精细、焦点移动越慢，适合微距这类要高精度的题材；数值越大步长越大、覆盖越快，适合大景深场景。步长不是固定距离，相机会跟着你设的光圈调整：光圈越小（如 f/11）景深越深，同一个增量值下焦点实际移动的范围也越大。</string>
+    <string name="focus_smoothing_hint">0 = 关闭，1 = 启用，只有这两档（偏移 20，旁证）。作用是在焦点移动过程中让每张亮度保持一致：镜头对到很近时进入相机的光量会略减、照片偏暗，开启后相机会自动补偿，后期合成更顺畅。个别镜头（如 EF 100mm f/2.8L Macro IS USM）近摄时亮度本来就稳，官方建议关闭以免补偿过度。</string>
+    <string name="focus_reference_title">常见场景起始值（可按实际微调）</string>
+    <string name="focus_reference">微距（花卉、昆虫）：30–100+ 张 · 增量 1–2 · 平滑化启用\n近摄 / 产品（小物件）：15–40 张 · 增量 2–4 · 平滑化启用\n风光（带前景）：5–20 张 · 增量 4–8 · 平滑化启用\n大场景 / 建筑：3–10 张 · 增量 8–10 · 平滑化启用</string>
+    <string name="focus_reference_tips">不确定时稳妥起步：增量 1、张数 30。\n光圈建议 f/5.6–f/11，多数镜头在这个区间画质与景深最平衡。\n务必上三脚架并关闭镜头防抖，避免拍摄中机身移动导致后期合成错位。</string>
+    <string name="focus_hint">0xD208 的 24 字节字段没有文档：上面四项里只有「开关」是差分实测证实的，其余三项的偏移靠旁证，取值区间与含义则来自佳能对焦包围的说明资料。写入以刚读到的字节为底稿，只覆盖这四项，其余字节原样带回相机；写后自动回读核对一次。若相机回 0x2019 之类的拒绝码，说明这条属性在您这台机身上不可写，请改用机身菜单设置对焦包围。</string>
 </resources>
