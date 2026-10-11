@@ -5,23 +5,29 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.graphics.Typeface;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
+import android.net.Uri;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -37,7 +43,12 @@ import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 
+import com.chaquo.python.PyObject;
+import com.chaquo.python.Python;
+import com.chaquo.python.android.AndroidPlatform;
+import com.imagefetch.capture.FocusBracketCalculator;
 import com.imagefetch.capture.FocusBracketPlan;
+import com.imagefetch.capture.FocusStackBatch;
 import com.imagefetch.capture.HdrPlan;
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
@@ -49,8 +60,13 @@ import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.ui.PhotoGridAdapter;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -67,6 +83,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final int REQUEST_NOTIFICATIONS = 0x71;
     private static final int REQUEST_NEARBY_WIFI = 0x72;
     private static final int REQUEST_WIFI_PICKER = 0x73;
+    /** 手动挑照片做景深合成（系统文件选择器，多选）。 */
+    private static final int REQUEST_PICK_STACK = 0x74;
 
     private static final String PREFS_NAME = "image_fetch_prefs";
     private static final String PREF_EXPORT_TO_GALLERY = "export_to_gallery";
@@ -148,6 +166,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private EditText focusCountField;
     private EditText focusIncrementField;
     private EditText focusSmoothingField;
+    /** 对焦包围参数计算器面板；关闭后置空。它叠在对焦包围面板之上，关掉它不影响下面的面板。 */
+    private AlertDialog focusCalculatorDialog;
+    private TextView calcReportView;
+    private EditText calcFocalField;
+    private EditText calcApertureField;
+    private EditText calcNearField;
+    private EditText calcFarField;
+    private EditText calcOverlapField;
+    /** 最近一次成功的计算结果；「填入对焦包围面板」用它。 */
+    private FocusBracketCalculator.Result calcResult;
     /**
      * 最近一次从相机读回的 0xD208 原始 24 字节。写入时以它为底稿，只覆盖已证实的偏移 8
      * 与旁证的偏移 12/16/20，其余 8 字节原样带回相机。没有底稿就不允许写入。
@@ -159,6 +187,27 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private EditText captureShotsField;
     /** 上次用过的预计张数，跨面板开关保留；对焦包围/HDR 包围下省得每次重填。 */
     private int expectedShots = 1;
+    /**
+     * 侧栏里的「景深合成自检」项（临时验证入口）。
+     * 它跑的是手机本地的 Python/OpenCV，与相机无关，所以不随连接状态置灰。
+     */
+    private TextView stackCheckItem;
+    /** 侧栏里的「选照片做景深合成」项：拿相册里的旧照片试合成，同样不随连接状态置灰。 */
+    private TextView stackPickItem;
+    /** 景深合成自检面板；关闭后置空。 */
+    private AlertDialog stackDialog;
+    private TextView stackReportView;
+    private ImageView stackImageView;
+    /** 本次对焦包围批次的落盘文件收集器；每次拍摄前开窗，批次结束关窗。 */
+    private final FocusStackBatch stackBatch = new FocusStackBatch();
+    /** 合成进行中：避免连拍/重入同时跑两份 Python 合成。 */
+    private boolean stackRunning;
+    /** 最近一次成功写出的合成图；结果面板的「再次导出到相册」用它。 */
+    private File lastStackResultFile;
+    /** 景深合成结果面板；关闭后置空。 */
+    private AlertDialog stackResultDialog;
+    private TextView stackResultReportView;
+    private ImageView stackResultImageView;
     /** 侧栏容器与遮罩；未打开时均为 GONE。零 AndroidX 工程不能用 DrawerLayout，手写滑出。 */
     private View drawerPanel;
     private View drawerScrim;
@@ -796,6 +845,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         if (captureRunning) return;
         // 先把张数读出来并记住：机内包围一次快门出多张，之后的收集要按这个数等。
         expectedShots = readExpectedShots();
+        // 多张（对焦包围/HDR 包围）这一批要留给景深合成：先开收集窗，并让协调器在导出相册后
+        // 保留应用内副本——否则原图导出成功即被清理，合成就没得读了。
+        if (expectedShots > 1) {
+            stackBatch.arm();
+            coordinator.setRetainLocalCopiesForStack(true);
+        } else {
+            stackBatch.disarm();
+            coordinator.setRetainLocalCopiesForStack(false);
+        }
         captureRunning = true;
         if (captureShootButton != null) captureShootButton.setEnabled(false);
         if (liveViewStatusView != null) liveViewStatusView.setText(R.string.capture_running);
@@ -1071,6 +1129,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     @Override
     public void onFileSaved(File file, long bytes, long elapsedMillis, String note) {
         runOnUiThread(() -> {
+            // 对焦包围批次逐张收拢，等这一批全部取回后再统一做景深合成（见 onDownloadFinished）。
+            stackBatch.add(file);
             setBusy(false);
             progressBar.setProgress(100);
             // note 必须带上：否则相册导出结果会被这条消息覆盖掉，用户无从判断。
@@ -1085,6 +1145,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             setBusy(false);
             // 下载已结束：清掉图片栏里之前的选中状态，避免看起来像还没下载。
             gridAdapter.clearSelection();
+            // 关窗并取出这一批的落盘文件；够两张就自动合成。
+            stackBatch.disarm();
+            coordinator.setRetainLocalCopiesForStack(false);
+            List<File> batch = stackBatch.files();
+            if (batch.size() >= FocusStackBatch.MIN_SHOTS) {
+                startFocusStack(batch);
+            } else if (!batch.isEmpty()) {
+                statusView.setText("本批只取回 " + batch.size() + " 张，不足以做景深合成（至少 "
+                        + FocusStackBatch.MIN_SHOTS + " 张）。");
+            }
         });
     }
 
@@ -1383,6 +1453,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             coordinator.readVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING);
         });
         content.findViewById(R.id.focusWrite).setOnClickListener(view -> writeFocusBracket());
+        content.findViewById(R.id.focusCalculator).setOnClickListener(view -> openFocusCalculator());
         focusBracketDialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.focus_title)
                 .setView(content)
@@ -1530,6 +1601,153 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         coordinator.writeVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING, payload);
     }
 
+    // ── 对焦包围参数计算器（纯本地计算，不碰相机） ──
+
+    /**
+     * 打开参数计算器面板。它叠在「对焦包围设置」面板之上；关掉它只关自己，下面的面板还在，
+     * 所以「填入」时 focusCountField 等字段一定有效。
+     */
+    private void openFocusCalculator() {
+        if (focusCalculatorDialog != null && focusCalculatorDialog.isShowing()) return;
+        View content = getLayoutInflater().inflate(R.layout.dialog_focus_calculator, null);
+        calcReportView = content.findViewById(R.id.calcReport);
+        calcFocalField = content.findViewById(R.id.calcFocal);
+        calcApertureField = content.findViewById(R.id.calcAperture);
+        calcNearField = content.findViewById(R.id.calcNear);
+        calcFarField = content.findViewById(R.id.calcFar);
+        calcOverlapField = content.findViewById(R.id.calcOverlap);
+
+        // 默认按「产品」场景起步：打开就有可算的数，用户再按实际改。
+        FocusBracketCalculator.Scene scene = FocusBracketCalculator.Scene.PRODUCT;
+        calcFocalField.setText("50");
+        calcApertureField.setText("8");
+        calcNearField.setText(wholeNumber(scene.defaultNearMm()));
+        calcFarField.setText(wholeNumber(scene.defaultFarMm()));
+        calcOverlapField.setText(String.valueOf(scene.defaultOverlapPercent()));
+
+        content.findViewById(R.id.calcSceneMacro).setOnClickListener(
+                view -> applyCalculatorScene(FocusBracketCalculator.Scene.MACRO));
+        content.findViewById(R.id.calcSceneProduct).setOnClickListener(
+                view -> applyCalculatorScene(FocusBracketCalculator.Scene.PRODUCT));
+        content.findViewById(R.id.calcSceneLandscape).setOnClickListener(
+                view -> applyCalculatorScene(FocusBracketCalculator.Scene.LANDSCAPE));
+        content.findViewById(R.id.calcSceneArchitecture).setOnClickListener(
+                view -> applyCalculatorScene(FocusBracketCalculator.Scene.ARCHITECTURE));
+        content.findViewById(R.id.calcApply).setOnClickListener(view -> applyCalculatorResult());
+
+        // 五个输入框挂同一个监听：任何一格变动都立即重算，做到「边改边看」。
+        TextWatcher watcher = new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence text, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence text, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable text) {
+                recomputeCalculator();
+            }
+        };
+        calcFocalField.addTextChangedListener(watcher);
+        calcApertureField.addTextChangedListener(watcher);
+        calcNearField.addTextChangedListener(watcher);
+        calcFarField.addTextChangedListener(watcher);
+        calcOverlapField.addTextChangedListener(watcher);
+
+        focusCalculatorDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.calc_title)
+                .setView(content)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        focusCalculatorDialog.setOnDismissListener(dialog -> {
+            focusCalculatorDialog = null;
+            calcReportView = null;
+            calcFocalField = null;
+            calcApertureField = null;
+            calcNearField = null;
+            calcFarField = null;
+            calcOverlapField = null;
+            calcResult = null;
+        });
+        focusCalculatorDialog.show();
+        recomputeCalculator();
+    }
+
+    /** 点场景按钮：把该场景的默认距离与重叠率填进输入框，随后的即时重算会刷新报告。 */
+    private void applyCalculatorScene(FocusBracketCalculator.Scene scene) {
+        if (calcNearField == null || calcFarField == null || calcOverlapField == null) return;
+        calcNearField.setText(wholeNumber(scene.defaultNearMm()));
+        calcFarField.setText(wholeNumber(scene.defaultFarMm()));
+        calcOverlapField.setText(String.valueOf(scene.defaultOverlapPercent()));
+    }
+
+    /**
+     * 即时重算。输入不完整或越界时安静返回——正在输入「1」想打成「1000」的中间态很常见，
+     * 每次都报错只会挡住输入；把上一份报告留在屏上，等数字填全了自然会刷新。
+     */
+    private void recomputeCalculator() {
+        if (calcReportView == null) return;
+        Double focal = readNumber(calcFocalField);
+        Double aperture = readNumber(calcApertureField);
+        Double near = readNumber(calcNearField);
+        Double far = readNumber(calcFarField);
+        Double overlap = readNumber(calcOverlapField);
+        if (focal == null || aperture == null || near == null || far == null || overlap == null) {
+            return;
+        }
+        try {
+            calcResult = FocusBracketCalculator.compute(
+                    focal, aperture, near, far, (int) Math.round(overlap));
+        } catch (IllegalArgumentException exception) {
+            calcResult = null;
+            calcReportView.setText(getString(R.string.calc_invalid) + "\n\n" + exception.getMessage());
+            return;
+        }
+        calcReportView.setText(calcResult.report());
+    }
+
+    /** 把计算结果填进对焦包围面板的张数 / 增量 / 平滑化，并把开关置为「开」。 */
+    private void applyCalculatorResult() {
+        if (calcResult == null) {
+            if (calcReportView != null) calcReportView.setText(R.string.calc_invalid);
+            return;
+        }
+        if (focusCountField == null || focusIncrementField == null
+                || focusSmoothingField == null || focusEnabledField == null) {
+            statusView.setText("对焦包围面板已关闭，无法填入。");
+            return;
+        }
+        focusEnabledField.setText("1");
+        focusCountField.setText(String.valueOf(calcResult.count));
+        focusIncrementField.setText(String.valueOf(calcResult.incrementPrimary));
+        focusSmoothingField.setText(String.valueOf(calcResult.smoothing));
+        if (focusReportView != null) {
+            focusReportView.setText("已从计算器填入：" + calcResult.summary()
+                    + "\n\n确认无误后点「写入设置」发给相机。");
+        }
+        statusView.setText("计算器已填入：" + calcResult.summary());
+        if (focusCalculatorDialog != null) focusCalculatorDialog.dismiss();
+    }
+
+    /** 读一个输入框里的数字；空或非数字返回 null（保持安静，不打断输入）。 */
+    private static Double readNumber(EditText field) {
+        if (field == null) return null;
+        String text = field.getText().toString().trim();
+        if (text.isEmpty()) return null;
+        try {
+            return Double.parseDouble(text);
+        } catch (NumberFormatException exception) {
+            return null;
+        }
+    }
+
+    /** 把整数值写成不带小数点的字符串，便于填进输入框。 */
+    private static String wholeNumber(double value) {
+        return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value);
+    }
+
     /**
      * 「HDR 拍摄」设置面板：机内 0xD13D 的读改回写。这是能力探测之后第一条真正写 0xD1xx
      * 厂商属性的功能，所以界面把「原始字节」摆在最显眼处，模式只是叠加在相机自己那份 24 字节
@@ -1573,6 +1791,458 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         // 进面板就默认读一次：省掉「先点读取当前值」这一步；用户手动读取时会再清一次 pending。
         pendingHdrWrite = null;
         coordinator.readVendorPropertyBlock(VendorProperty.HDR_SETTING);
+    }
+
+    /**
+     * 「景深合成自检」：在手机上启动 Chaquopy，导入 numpy/cv2 并跑一遍景深合成演示，
+     * 结果直接显示在面板里——不依赖 adb，也不用连接相机。
+     *
+     * <p>这是临时验证入口，要回答的是「Python 运行时与 OpenCV 原生库在真机上能不能加载、
+     * 算子能不能算出正确结果」。它与相机的 PTP 会话毫无关系，所以自带线程、
+     * 不占用 CameraSessionCoordinator 的那个单线程 executor。
+     */
+    private void openStackCheck() {
+        if (stackDialog != null && stackDialog.isShowing()) return;
+        View content = getLayoutInflater().inflate(R.layout.dialog_focusstack_check, null);
+        stackReportView = content.findViewById(R.id.stackReport);
+        stackImageView = content.findViewById(R.id.stackImage);
+        content.findViewById(R.id.stackRerun).setOnClickListener(view -> runStackCheck());
+        stackDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.stack_check_title)
+                .setView(content)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        stackDialog.setOnDismissListener(dialog -> {
+            stackDialog = null;
+            stackReportView = null;
+            stackImageView = null;
+        });
+        stackDialog.show();
+        runStackCheck();
+    }
+
+    /** 跑自检。Python 首次启动要解包运行时，可能要等几秒，所以放独立线程。 */
+    private void runStackCheck() {
+        if (stackReportView != null) stackReportView.setText(R.string.stack_check_running);
+        if (stackImageView != null) {
+            stackImageView.setVisibility(View.GONE);
+            stackImageView.setImageDrawable(null);
+        }
+        new Thread(() -> {
+            String report;
+            String demoText;
+            byte[] png = null;
+            try {
+                ensurePython();
+                PyObject module = Python.getInstance().getModule("focusstack_probe");
+                report = module.callAttr("report").toString();
+                List<PyObject> demo = module.callAttr("demo").asList();
+                png = demo.get(0).toJava(byte[].class);
+                demoText = demo.get(1).toString();
+            } catch (Throwable error) {
+                postStackResult("自检失败：\n" + stackFailureTrace(error), null);
+                return;
+            }
+            postStackResult(report + "\n\n" + demoText, png);
+        }, "focusstack-check").start();
+    }
+
+    /** 幂等启动 Chaquopy 运行时。首次启动要解包，可能要几秒，必须在后台线程调用。 */
+    private void ensurePython() {
+        if (!Python.isStarted()) {
+            Python.start(new AndroidPlatform(getApplicationContext()));
+        }
+    }
+
+    /**
+     * 合成/自检失败时把异常连同堆栈整段显示出来。
+     * 这里最容易出问题的是原生库加载（.so 缺失/ABI 不匹配），只显示「失败」两个字没法定位。
+     */
+    private static String stackFailureTrace(Throwable error) {
+        java.io.StringWriter writer = new java.io.StringWriter();
+        error.printStackTrace(new java.io.PrintWriter(writer));
+        return writer.toString();
+    }
+
+    /** 把结果贴回界面；合成图解码失败也要说清楚，不能悄悄空着。 */
+    private void postStackResult(String text, byte[] png) {
+        runOnUiThread(() -> {
+            if (stackReportView != null) stackReportView.setText(text);
+            if (png == null || stackImageView == null) return;
+            Bitmap bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
+            if (bitmap == null) {
+                if (stackReportView != null) {
+                    stackReportView.setText(text + "\n\n（合成图解码失败，收到 " + png.length + " 字节）");
+                }
+                return;
+            }
+            stackImageView.setImageBitmap(bitmap);
+            stackImageView.setVisibility(View.VISIBLE);
+        });
+    }
+
+    // ── 真实照片景深合成（对焦包围批次取回后自动触发） ──
+
+    /**
+     * 对一批已落盘的对焦包围照片做景深合成，并把结果与报告显示在面板里。
+     *
+     * <p>合成要跑 Python/OpenCV，绝不能占用 CameraSessionCoordinator 的那个单线程 executor
+     * （会冻住 PTP 会话与心跳），所以这里起独立线程；结果回来再切回主线程贴到面板上。
+     * 合成图同时写进应用内目录，并按设置导出到系统相册。
+     */
+    private void startFocusStack(List<File> files) {
+        startFocusStack(files, false);
+    }
+
+    /**
+     * 同上，但 {@code manualPick} 为真时是「手动挑的旧照片」这一路：
+     * 那些照片是用户的成品，绝不能像对焦包围批次那样在合成后被清理——合成本身只读它们，
+     * 唯一会被删的是我们自己复制出来的临时副本。
+     */
+    private void startFocusStack(List<File> files, boolean manualPick) {
+        if (stackRunning) {
+            statusView.setText("上一次景深合成还没结束，本次先跳过。");
+            return;
+        }
+        stackRunning = true;
+        statusView.setText("正在对 " + files.size() + " 张照片做景深合成…"
+                + "（首次运行要启动 Python，请稍候）");
+        showStackResult("正在合成…（全分辨率，2600 万像素级别可能要几分钟）", null);
+
+        // 路径用 java.util.List 交给 Chaquopy；注意它并不会把 List 转成 Python 的 list，
+        // 传过去的是 Java 代理对象（Python 侧按 size()/get() 取值，见 focusstack.stack）。
+        // 第二个参数是进度回调，Python 侧每推进一步就调一次（Consumer 同样是代理，
+        // 只能走 accept()，Python 侧已做兼容）。
+        List<String> paths = new ArrayList<>();
+        for (File file : files) paths.add(file.getAbsolutePath());
+        java.util.function.Consumer<String> progress = message ->
+                runOnUiThread(() -> {
+                    if (stackResultReportView != null) {
+                        stackResultReportView.setText(message + "\n\n（合成进行中，请勿关闭本面板）");
+                    }
+                    statusView.setText(message);
+                });
+
+        new Thread(() -> {
+            String report;
+            byte[] fullJpeg = null;
+            byte[] preview = null;
+            try {
+                if (!Python.isStarted()) {
+                    Python.start(new AndroidPlatform(getApplicationContext()));
+                }
+                PyObject module = Python.getInstance().getModule("focusstack");
+                List<PyObject> result = module.callAttr("stack", paths, progress).asList();
+                fullJpeg = result.get(0).toJava(byte[].class);
+                preview = result.get(1).toJava(byte[].class);
+                report = result.get(2).toString();
+                if (manualPick) {
+                    report = "来源：手动选择的 " + files.size() + " 张照片"
+                            + "（合成只读这些照片，原件不会被动到）。\n\n" + report;
+                }
+
+                File output = focusStackOutputFile();
+                try (java.io.FileOutputStream stream = new java.io.FileOutputStream(output)) {
+                    stream.write(fullJpeg);
+                }
+                lastStackResultFile = output;
+                report = report + "\n\n合成图已写入：" + output.getName()
+                        + "（" + (fullJpeg.length / 1024) + " KB）";
+                report = report + exportStackToGallery(output);
+                if (manualPick) {
+                    report = report + cleanPickScratch();
+                } else {
+                    // 合成已经成功、结果也拿到手了，这一批的应用内原图副本没必要再占空间。
+                    report = report + cleanStackCopies();
+                }
+            } catch (Throwable error) {
+                report = "景深合成失败：\n" + stackFailureTrace(error);
+                report = report + (manualPick
+                        ? "\n\n选中的照片原封不动，临时副本也已清理，重新挑一次即可再试。"
+                        : "\n\n原图副本没有清理——合成没成，先留着，方便重试或手动处理。");
+                if (manualPick) cleanPickScratch();
+                preview = null;
+            }
+            final String text = report;
+            final byte[] thumb = preview;
+            runOnUiThread(() -> {
+                stackRunning = false;
+                // 贴进面板的是 Python 另外给的小预览图：直接解码 2600 万像素的合成图会把 Java 堆撑爆。
+                showStackResult(text, thumb);
+            });
+        }, "focusstack").start();
+    }
+
+    // ── 手动挑照片做景深合成 ──
+
+    /**
+     * 打开系统文件选择器多选图片。用 SAF（{@code ACTION_OPEN_DOCUMENT}）而不是直接读相册：
+     * 不需要申请任何存储权限，用户翻到哪个目录都行——包括本应用以前导出到
+     * DCIM/IMAGE_FETCH 的旧照片。
+     *
+     * <p>选中的照片会在 {@link #onActivityResult} 里复制成应用内的临时副本，因为
+     * Python/OpenCV 只认文件路径，读不了 {@code content://} 这种 URI。原件全程只读，
+     * 合成结束时清理的也只有这些我们自己复制出来的副本。
+     */
+    private void pickStackPhotos() {
+        if (stackRunning) {
+            statusView.setText("上一次景深合成还没结束，等它跑完再挑照片。");
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.putExtra(Intent.EXTRA_TITLE, getString(R.string.stack_pick_title));
+        try {
+            startActivityForResult(intent, REQUEST_PICK_STACK);
+        } catch (Exception error) {
+            showError("打不开系统文件选择器，这台设备上可能没有可用的文件管理应用。", error);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        // 运行时权限申请走 onRequestPermissionsResult，与这里互不干扰；不认识的请求码交回父类。
+        if (requestCode != REQUEST_PICK_STACK) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null) return;
+
+        List<Uri> picked = new ArrayList<>();
+        ClipData clip = data.getClipData();
+        if (clip != null) {
+            for (int index = 0; index < clip.getItemCount(); index++) {
+                Uri uri = clip.getItemAt(index).getUri();
+                if (uri != null) picked.add(uri);
+            }
+        } else if (data.getData() != null) {
+            picked.add(data.getData());
+        }
+        if (picked.size() < 2) {
+            statusView.setText(R.string.stack_pick_need_two);
+            return;
+        }
+
+        statusView.setText(R.string.stack_pick_copying);
+        new Thread(() -> {
+            List<File> copies;
+            try {
+                copies = copyPickedToScratch(picked);
+            } catch (Throwable error) {
+                String note = getString(R.string.stack_pick_failed) + "\n"
+                        + stackFailureTrace(error);
+                runOnUiThread(() -> {
+                    statusView.setText(R.string.stack_pick_failed);
+                    showStackResult(note, null);
+                });
+                return;
+            }
+            runOnUiThread(() -> startFocusStack(copies, true));
+        }, "stack-pick").start();
+    }
+
+    /**
+     * 把选中的 URI 逐个复制成应用私有的临时副本，返回按文件名排好序的副本清单。
+     *
+     * <p>排序是因为文件选择器给的是「用户点选的顺序」，而相机连拍的文件名天然零填充
+     * （IMG_0001、IMG_0002…），按名排序就等于按拍摄顺序，也就是先近后远——
+     * 这正好是景深合成想要的顺序。
+     */
+    private List<File> copyPickedToScratch(List<Uri> uris) throws IOException {
+        File directory = pickScratchDirectory();
+        List<PickedPhoto> photos = new ArrayList<>();
+        for (Uri uri : uris) photos.add(new PickedPhoto(queryDisplayName(uri), uri));
+        Collections.sort(photos, (left, right) ->
+                String.CASE_INSENSITIVE_ORDER.compare(left.name, right.name));
+
+        List<File> copies = new ArrayList<>();
+        for (int index = 0; index < photos.size(); index++) {
+            PickedPhoto photo = photos.get(index);
+            File target = new File(directory, scratchName(directory, index, photo.name));
+            try (InputStream source = getContentResolver().openInputStream(photo.uri);
+                 OutputStream sink = new FileOutputStream(target)) {
+                if (source == null) throw new IOException("读不到 " + photo.uri);
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = source.read(buffer)) > 0) sink.write(buffer, 0, read);
+            }
+            copies.add(target);
+        }
+        return copies;
+    }
+
+    /** 临时副本目录：cache 下的独立子目录，每次挑照片前清空。 */
+    private File pickScratchDirectory() {
+        File directory = new File(getCacheDir(), "stackpick");
+        deleteRecursively(directory);
+        if (directory.mkdirs() || directory.isDirectory()) return directory;
+        // 建不出子目录就退回 cache 根目录——不让一个目录问题挡住合成。
+        return getCacheDir();
+    }
+
+    /** 清掉手动挑照片留下的临时副本。选中的原件始终没动，所以这里删的只可能是我们自己复制的。 */
+    private String cleanPickScratch() {
+        File directory = new File(getCacheDir(), "stackpick");
+        File[] children = directory.listFiles();
+        int removed = 0;
+        long freed = 0;
+        if (children != null) {
+            for (File child : children) {
+                long size = child.length();
+                deleteRecursively(child);
+                if (!child.exists()) {
+                    removed++;
+                    freed += size;
+                }
+            }
+        }
+        return "\n\n临时副本已清理 " + removed + " 个（" + (freed / (1024 * 1024))
+                + " MB）；选中的原始照片一张都没动。";
+    }
+
+    /** 临时副本的文件名：尽量沿用原文件名（报告里认得出来），重名时加序号。 */
+    private static String scratchName(File directory, int index, String displayName) {
+        String name = displayName == null ? "" : displayName.trim();
+        // 文件系统里不能出现路径分隔符；其余字符（含中文）照留，报告里才看得懂。
+        name = name.replace('/', '_').replace('\\', '_').replace('\0', '_');
+        if (name.isEmpty()) name = "pick_" + index + ".jpg";
+        return new File(directory, name).exists() ? index + "_" + name : name;
+    }
+
+    /** 问系统要这张图在文件管理器里显示的名字（SAF 的 URI 本身不带文件名）。 */
+    private String queryDisplayName(Uri uri) {
+        try (android.database.Cursor cursor = getContentResolver().query(
+                uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (column >= 0 && !cursor.isNull(column)) return cursor.getString(column);
+            }
+        } catch (Exception ignored) {
+            // 问不到名字不算错：退回按序号命名，合成照跑。
+        }
+        return null;
+    }
+
+    private static void deleteRecursively(File target) {
+        if (target == null || !target.exists()) return;
+        if (target.isDirectory()) {
+            File[] children = target.listFiles();
+            if (children != null) {
+                for (File child : children) deleteRecursively(child);
+            }
+        }
+        target.delete();
+    }
+
+    /** 一个待复制的选中项：显示名 + 源 URI（排序要按名字，复制要按 URI，所以得配成对）。 */
+    private static final class PickedPhoto {
+        final String name;
+        final Uri uri;
+
+        PickedPhoto(String name, Uri uri) {
+            this.name = name;
+            this.uri = uri;
+        }
+    }
+
+    /** 合成图落盘位置：与下载原图同一个目录，前缀区分，便于用户一并找到。 */
+    private File focusStackOutputFile() {
+        String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT)
+                .format(new java.util.Date());
+        return new File(coordinator.outputDirectory(), "focusstack_" + stamp + ".jpg");
+    }
+
+    /** 按「保存到系统相册」设置导出合成图；失败只上报，不影响面板里已经看到的结果。 */
+    private String exportStackToGallery(File file) {
+        if (!exportToGalleryBox.isChecked()) return " · 未勾选「保存到系统相册」";
+        try {
+            new GalleryExporter(this).export(file, file.getName());
+            return " · 已存入系统相册 " + GalleryExporter.RELATIVE_PATH;
+        } catch (Exception error) {
+            return " · 相册导出失败：" + (error.getMessage() == null
+                    ? error.getClass().getSimpleName() : error.getMessage());
+        }
+    }
+
+    /**
+     * 清理这一批的应用内原图副本（合成成功后才调）。
+     *
+     * <p>清单由协调器给：只有<b>已确认导出到相册</b>的副本才在里面。导出关掉或导出失败的
+     * 副本不在其中——那种情况下应用内这份就是唯一原件，删掉照片就没了。
+     */
+    private String cleanStackCopies() {
+        List<File> cleanable = coordinator.takeStackCleanableCopies();
+        if (cleanable.isEmpty()) {
+            return "\n\n原图副本已保留：这一批没有导出到相册，应用内这份就是唯一原件。";
+        }
+        int removed = 0;
+        long freed = 0;
+        for (File file : cleanable) {
+            long size = file.length();
+            if (file.delete()) {
+                removed++;
+                freed += size;
+            }
+        }
+        return "\n\n已清理 " + removed + " / " + cleanable.size() + " 张应用内原图副本，释放 "
+                + (freed / (1024 * 1024)) + " MB；原件仍在相册 "
+                + GalleryExporter.RELATIVE_PATH + " 里。";
+    }
+
+    /**
+     * 把上一次的合成图再导一次到相册。原图副本在合成成功后已按设置清理，
+     * 所以这里不再重跑合成——重导成品图既便宜又不依赖那批原图。
+     */
+    private void reexportLastStackResult() {
+        File result = lastStackResultFile;
+        if (result == null || !result.isFile()) {
+            if (stackResultReportView != null) {
+                stackResultReportView.setText("还没有可导出的合成图。");
+            }
+            return;
+        }
+        String note = exportStackToGallery(result);
+        if (stackResultReportView != null) {
+            stackResultReportView.setText("合成图 " + result.getName() + note);
+        }
+    }
+
+    /** 结果面板：报告 + 合成图预览 + 再次导出成品图。重复调用复用同一个面板。 */
+    private void showStackResult(String text, byte[] png) {
+        if (stackResultDialog == null) {
+            View content = getLayoutInflater().inflate(R.layout.dialog_focusstack_result, null);
+            stackResultReportView = content.findViewById(R.id.stackResultReport);
+            stackResultImageView = content.findViewById(R.id.stackResultImage);
+            Button rerun = content.findViewById(R.id.stackResultRerun);
+            rerun.setOnClickListener(view -> reexportLastStackResult());
+            stackResultDialog = new AlertDialog.Builder(this)
+                    .setTitle(R.string.stack_result_title)
+                    .setView(content)
+                    .setNegativeButton(R.string.close, null)
+                    .create();
+            stackResultDialog.setOnDismissListener(dialog -> {
+                stackResultDialog = null;
+                stackResultReportView = null;
+                stackResultImageView = null;
+            });
+            stackResultDialog.show();
+        }
+        stackResultReportView.setText(text);
+        if (png == null) {
+            stackResultImageView.setVisibility(View.GONE);
+            stackResultImageView.setImageDrawable(null);
+            return;
+        }
+        Bitmap bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
+        if (bitmap == null) {
+            stackResultReportView.setText(text + "\n\n（合成图解码失败，收到 " + png.length + " 字节）");
+            stackResultImageView.setVisibility(View.GONE);
+            return;
+        }
+        stackResultImageView.setImageBitmap(bitmap);
+        stackResultImageView.setVisibility(View.VISIBLE);
     }
 
     /** 把读到的 24 字节摆进报告，并把偏移 4 的模式预填进输入框。 */
@@ -1781,6 +2451,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureItem = findViewById(R.id.shotCapture);
         bracketItem = findViewById(R.id.shotBracket);
         hdrItem = findViewById(R.id.shotHdr);
+        stackCheckItem = findViewById(R.id.shotStackCheck);
+        stackPickItem = findViewById(R.id.shotStackPick);
 
         Button openButton = findViewById(R.id.shotOptions);
         openButton.setOnClickListener(view -> openShotPanel());
@@ -1797,6 +2469,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         hdrItem.setOnClickListener(view -> {
             closeShotPanel();
             openHdrDialog();
+        });
+        stackCheckItem.setOnClickListener(view -> {
+            closeShotPanel();
+            openStackCheck();
+        });
+        stackPickItem.setOnClickListener(view -> {
+            closeShotPanel();
+            pickStackPhotos();
         });
         capabilityItem.setOnClickListener(view -> {
             closeShotPanel();

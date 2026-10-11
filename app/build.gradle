@@ -1,5 +1,6 @@
 plugins {
     id "com.android.application"
+    id "com.chaquo.python"
 }
 
 android {
@@ -13,6 +14,12 @@ android {
         targetSdk 35
         versionCode 19
         versionName "0.8.0"
+
+        // OpenCV 的 Android wheel 只提供到 4.5.1.48，且只编译了 cp38/cp310，
+        // 所以 app 的 Python 锁 3.10、ABI 只留 64 位的 arm64-v8a。
+        ndk {
+            abiFilters "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -33,4 +40,16 @@ android {
 
 dependencies {
     testImplementation "junit:junit:4.13.2"
+}
+
+// 景深合成可行性验证：确认 Python 3.10 运行时与 OpenCV wheel 能否装进来、体积涨多少。
+// buildPython 不写死路径，交给 Chaquopy 自己按 `py -3.10` 找（本机 3.13 仍是默认，不受影响）。
+chaquopy {
+    defaultConfig {
+        version = "3.10"
+        pip {
+            install("numpy")
+            install("opencv-python==4.5.1.48")
+        }
+    }
 }

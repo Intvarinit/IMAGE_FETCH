@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  景深合成结果面板：对焦包围批次取回并合成后弹出，显示合成报告与合成图；
+  「再次导出成品图到相册」用于首次导出失败时重试——合成成功后原图副本已清理，
+  所以这里重导的是成品图，不再重跑合成。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:maxHeight="520dp"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/stackResultReport"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+
+        <ImageView
+            android:id="@+id/stackResultImage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:adjustViewBounds="true"
+            android:contentDescription="@string/stack_result_title"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/stackResultRerun"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/stack_result_rerun"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>

@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「对焦包围参数计算器」面板：输入焦段 / 光圈 / 场景，算出机内该填的张数、对焦增量、曝光平滑化。
+  结构沿用 dialog_focus_bracket.xml：根 ScrollView + 每个输入项「标签 → 输入框 → 灰色小字说明」
+  三件套——计算器要暴露「经验估算」的不确定性，说明必须贴着参数走，不能堆到底部。
+  报告放在最上面：输入一变就即时重算，报告要在屏幕可见处才能边改边看。
+  「填入对焦包围面板」放在报告与输入之间靠下位置：填的是下面那个面板，按钮就压在最后。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:scrollbars="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/calcReport"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/calc_focal_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/calcFocal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:contentDescription="@string/calc_focal_label"
+            android:inputType="numberDecimal"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/calc_focal_hint"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/calc_aperture_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/calcAperture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:contentDescription="@string/calc_aperture_label"
+            android:inputType="numberDecimal"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/calc_aperture_hint"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/calc_scene_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/calcSceneMacro"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/calc_scene_macro"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/calcSceneProduct"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:text="@string/calc_scene_product"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/calcSceneLandscape"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:text="@string/calc_scene_landscape"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/calcSceneArchitecture"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:text="@string/calc_scene_architecture"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/calc_scene_hint"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/calc_near_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/calcNear"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:contentDescription="@string/calc_near_label"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/calc_far_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/calcFar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:contentDescription="@string/calc_far_label"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/calc_distance_hint"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/calc_overlap_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/calcOverlap"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:contentDescription="@string/calc_overlap_label"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/calc_overlap_hint"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+
+        <Button
+            android:id="@+id/calcApply"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/calc_apply"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="@string/calc_hint"
+            android:textColor="#6B7280"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>

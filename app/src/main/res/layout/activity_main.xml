@@ -326,6 +326,36 @@
             android:textColor="@color/ink"
             android:textSize="15sp" />
 
+        <TextView
+            android:id="@+id/shotStackCheck"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:paddingStart="20dp"
+            android:paddingTop="14dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="14dp"
+            android:text="@string/shot_stack_check"
+            android:textColor="@color/ink"
+            android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/shotStackPick"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:paddingStart="20dp"
+            android:paddingTop="14dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="14dp"
+            android:text="@string/shot_stack_pick"
+            android:textColor="@color/ink"
+            android:textSize="15sp" />
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"

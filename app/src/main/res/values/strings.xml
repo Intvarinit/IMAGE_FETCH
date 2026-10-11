@@ -66,6 +66,18 @@
     <string name="shot_capture">拍摄</string>
     <string name="shot_bracket">对焦包围</string>
     <string name="shot_hdr">HDR 拍摄</string>
+    <string name="shot_stack_check">景深合成自检</string>
+    <string name="shot_stack_pick">选照片做景深合成</string>
+    <string name="stack_pick_title">选择要合成的照片（可多选）</string>
+    <string name="stack_pick_need_two">至少选 2 张照片才能做景深合成。</string>
+    <string name="stack_pick_copying">正在把选中的照片复制到应用内临时目录，请稍候…</string>
+    <string name="stack_pick_failed">读取选中的照片失败：</string>
+    <string name="stack_check_title">景深合成自检（Chaquopy + OpenCV）</string>
+    <string name="stack_check_rerun">重新运行</string>
+    <string name="stack_result_title">景深合成结果</string>
+    <string name="stack_result_rerun">再次导出成品图到相册</string>
+    <string name="stack_check_running">正在手机上运行 Python / OpenCV，首次启动要解包运行时，请稍候…</string>
+    <string name="stack_check_hint">这一页用来验证「在手机里跑 OpenCV 做景深合成」这条路能不能走通，与相机无关，不用连接。上面是运行时报告（Python 版本、numpy、cv2、SIFT、算子链路）；下面是合成效果演示：造一组模拟对焦包围的三张样张，每张只有一个横条是清晰的，再按「局部清晰度取最锐像素」合成——合成图应三条都清晰。若报告里 cv2 为 missing，说明 OpenCV 原生库没能加载，这一页会把原始报错一并显示出来。</string>
     <string name="shot_close">关闭侧栏</string>
     <string name="hdr_title">HDR 拍摄设置（0xD13D）</string>
     <string name="hdr_read">读取当前值</string>
@@ -96,4 +108,24 @@
     <string name="focus_reference">微距（花卉、昆虫）：30–100+ 张 · 增量 1–2 · 平滑化启用\n近摄 / 产品（小物件）：15–40 张 · 增量 2–4 · 平滑化启用\n风光（带前景）：5–20 张 · 增量 4–8 · 平滑化启用\n大场景 / 建筑：3–10 张 · 增量 8–10 · 平滑化启用</string>
     <string name="focus_reference_tips">不确定时稳妥起步：增量 1、张数 30。\n光圈建议 f/5.6–f/11，多数镜头在这个区间画质与景深最平衡。\n务必上三脚架并关闭镜头防抖，避免拍摄中机身移动导致后期合成错位。</string>
     <string name="focus_hint">0xD208 的 24 字节字段没有文档：上面四项里只有「开关」是差分实测证实的，其余三项的偏移靠旁证，取值区间与含义则来自佳能对焦包围的说明资料。写入以刚读到的字节为底稿，只覆盖这四项，其余字节原样带回相机；写后自动回读核对一次。若相机回 0x2019 之类的拒绝码，说明这条属性在您这台机身上不可写，请改用机身菜单设置对焦包围。</string>
+    <string name="focus_calculator">参数计算器</string>
+    <string name="calc_title">对焦包围参数计算器</string>
+    <string name="calc_focal_label">焦段（mm）</string>
+    <string name="calc_focal_hint">镜头的实际焦距。它决定景深：同样距离下焦段越长景深越浅、需要的张数越多。</string>
+    <string name="calc_aperture_label">光圈（F 值）</string>
+    <string name="calc_aperture_hint">只填数字，比如 f/8 就填 8。光圈越小（数字越大）景深越深、需要的张数越少。</string>
+    <string name="calc_scene_label">场景（点一下填入该场景的默认距离与重叠率）</string>
+    <string name="calc_scene_macro">微距</string>
+    <string name="calc_scene_product">产品</string>
+    <string name="calc_scene_landscape">风光</string>
+    <string name="calc_scene_architecture">建筑</string>
+    <string name="calc_scene_hint">场景只提供一组默认值，下面的距离与重叠率都可以按实际改。真正参与计算的是距离范围，不是场景名字——你给的例子正是这个道理：同样的参数，拍摄距离范围一变，张数就完全不同。</string>
+    <string name="calc_near_label">最近距离（mm）</string>
+    <string name="calc_far_label">最远距离（mm）</string>
+    <string name="calc_distance_hint">要拍清楚的范围：从画面的最前端到最远端，单位毫米（1m = 1000mm）。计算用的是范围里最近的那一端来定步长，因为近处景深最浅、最吃张数。</string>
+    <string name="calc_overlap_label">重叠率（%）</string>
+    <string name="calc_overlap_hint">相邻两张希望有多少比例是重叠的，默认 40%：重叠越多越保险，但张数也越多。合成时靠重叠区域找对齐点，太低容易接不上。</string>
+    <string name="calc_apply">填入对焦包围面板</string>
+    <string name="calc_hint">纯光学部分（超焦距、景深限）是标准公式；但「对焦增量」与物理步长的换算是本工具唯一没有实测依据的一环——它来自 5.2 mm/档 的经验标定常数，不同镜头与机身可能有差异。报告里的「对照」一栏按景深比例换算，那个模型等于 (1 − 重叠率) ÷ 0.12，与焦段、光圈、距离都无关（重叠率 40% 时恒为 5），只在两个模型不一致时提示经验成分较大。建议先按推荐值试拍一组：有模糊断层就减小增量或增大张数，想精简张数就缩小距离范围或收小光圈。</string>
+    <string name="calc_invalid">输入不完整或有误，无法计算。</string>
 </resources>

@@ -44,6 +44,7 @@ import java.net.NoRouteToHostException;
 import java.net.UnknownHostException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -213,6 +214,13 @@ public final class CameraSessionCoordinator {
     private final GalleryExporter galleryExporter;
     /** 落盘后是否再导出到系统相册（默认开；关闭时只保留应用内副本）。 */
     private volatile boolean exportToGallery = true;
+    /** 导出相册后是否保留应用内副本（默认不保留）。对焦包围批次要留给景深合成读，才置为真。 */
+    private volatile boolean retainLocalCopiesForStack;
+    /**
+     * 本批「已确认导出到相册」的应用内副本。景深合成用完后可以安全删掉它们——相册里有原件。
+     * <p>只记成功导出的：导出关掉或失败时，应用内副本是唯一一份，绝不能删。
+     */
+    private final List<File> stackExportedCopies = Collections.synchronizedList(new ArrayList<>());
     /** 每页张数（快速分页与完整扫描共用）；由设置界面调整。 */
     private static final int DEFAULT_PAGE_SIZE = 20;
     private static final int MAX_PAGE_SIZE = 500;
@@ -485,6 +493,31 @@ public final class CameraSessionCoordinator {
     /** 是否在落盘后再导出到系统相册（关闭时只保留应用内副本）。 */
     public void setExportToGallery(boolean value) {
         exportToGallery = value;
+    }
+
+    /**
+     * 本批是否保留应用内副本。景深合成要读原图，而导出相册成功后默认会删掉私有副本，
+     * 所以对焦包围这一批必须先把这个开关打开，合成才有文件可读。
+     *
+     * <p>只影响「导出成功后是否删除副本」这一处；导出本身照常进行，用户在系统图库里一样能看到原图。
+     * 打开时顺带清掉上一批的「可清理副本」记录，避免跨批误删。
+     */
+    public void setRetainLocalCopiesForStack(boolean value) {
+        retainLocalCopiesForStack = value;
+        if (value) stackExportedCopies.clear();
+    }
+
+    /**
+     * 取走本批「已导出到相册、可以安全删除」的应用内副本，并清空记录。
+     * 景深合成成功之后调用：相册里已有原件，应用内这份就没必要再占空间了。
+     * 未成功导出相册的副本不在其中，所以调用方不必再判一次安全性。
+     */
+    public List<File> takeStackCleanableCopies() {
+        synchronized (stackExportedCopies) {
+            List<File> result = new ArrayList<>(stackExportedCopies);
+            stackExportedCopies.clear();
+            return result;
+        }
     }
 
     /** 每页张数。 */
@@ -866,6 +899,12 @@ public final class CameraSessionCoordinator {
         if (!exportToGallery) return " · 未勾选「保存到系统相册」";
         try {
             galleryExporter.export(file, file.getName());
+            // 景深合成批次要读这份原图，合成没跑完之前不能删（删了就只能从相册取回，代价大得多）。
+            // 记下来：合成成功后由 MainActivity 删掉——那时相册里已经有原件了。
+            if (retainLocalCopiesForStack) {
+                stackExportedCopies.add(file);
+                return " · 已存入系统相册 " + GalleryExporter.RELATIVE_PATH + "（并保留应用内副本供景深合成）";
+            }
             // 只留相册：导出成功后清掉私有目录副本，避免同一张照片占两份空间。
             // 去重索引（.imported-index）按对象身份记录，不依赖副本存在，跳过重复下载的能力不受影响。
             if (!file.delete()) {
