@@ -6,7 +6,7 @@
    所以先对每张图求「到参考帧的单应矩阵」（SIFT 特征 + RANSAC），再把它们变换到同一个坐标系。
    参考帧取中间那一张——前后景的位移都最小，warp 后越界最少。
 2. **融合**：逐像素算清晰度（拉普拉斯绝对值的局部平滑，越大越锐），每个像素取所有样张里最锐的那张。
-   清晰度要先在**较大邻域**上平滑再比大小（见 SCORE_SIGMA）：否则在几张都不锐的地方分数彼此接近、
+   清晰度要先在**较大邻域**上平滑再比大小（见 _score_window）：否则在几张都不锐的地方分数彼此接近、
    由噪声定胜负，逐像素来回跳图，合出来是一层椒盐状的脏污。
 3. **编码**：合成图编成 JPEG 字节返回。
 
@@ -28,17 +28,23 @@ import traceback
 ALIGN_PIXELS = 3_000_000
 # 融合时的条带高度（像素）。条带越小峰值内存越低，但 warp 调用次数越多。
 STRIP_ROWS = 512
-# 清晰度打分的空间平滑半径。这一步不是为了去噪，而是为了让「取哪一张」这个决定在
-# 一个足够大的邻域上保持一致：平滑太小（原始实现是 3）时，在几张都不太锐的地方
-# （远景墙面、失焦斑块的边缘）分数彼此接近、由噪声定胜负，逐像素来回跳图，合出来
-# 是一层椒盐状的「脏污」。实测这组 4 张 2600 万像素样张：σ=3 时相邻像素取自不同
-# 照片的比例高达 4.29%，σ=16 降到 0.06%，且合成图锐度回落到接近「单张最锐」的水平
-# （σ=3 时反而虚高，那些多出来的高频正是跳图造出来的假边缘）。
-SCORE_SIGMA = 16.0
-# 打分时的上下 halo 行数。高斯核在 OpenCV 里按 4σ 取半径，条带四周必须多取这么多
-# 真实邻行，否则条带上下沿只能靠反射填充补邻域，每 STRIP_ROWS 行会留一道横向接缝
-# （实测无 halo 时条带边界行的跳图率是别处的 1.75 倍）。
-SCORE_PAD = int(round(4 * SCORE_SIGMA))
+# 清晰度打分的空间平滑半径，按画幅宽度取：它不是为了去噪，而是「取哪一张」这个决定
+# 要保持一致的邻域大小。半径太小（原始实现固定 3）时，在几张都不太锐的地方（远景墙面、
+# 失焦斑块的边缘）分数彼此接近、由噪声定胜负，逐像素来回跳图，合出来是一层椒盐状的
+# 「脏污」。取画幅宽的 1/390，即邻域约 ±0.77% 画幅宽——这个比例对「比它更细的孤立
+# 锐利结构」才是理论上的代价，所以必须按画幅缩放而不是钉死像素数，否则小图上的邻域
+# 相对画幅会偏大、大图上偏小。
+#
+# 实测这组 4 张 6240 宽的样张（对应 σ=16）：相邻像素取自不同照片的比例，σ=3 时高达
+# 4.29%，σ=16 降到 0.06%；而合成图锐度在 σ=16 就回落到「单张最锐」的上限（风扇区
+# 5.436 对单张 5.431），σ=24/32 不再变化，说明这个半径已把跳图压干净且没丢细节。
+SCORE_SIGMA_RATIO = 1.0 / 390.0
+# 缩略图级别的小图下不至于把邻域压到近乎没有。
+SCORE_SIGMA_MIN = 4.0
+# 打分时的上下 halo 行数 = 这个系数 × σ。高斯核在 OpenCV 里按 4σ 取半径，条带四周必须
+# 多取这么多真实邻行，否则条带上下沿只能靠反射填充补邻域，每 STRIP_ROWS 行会留一道
+# 横向接缝（实测无 halo 时条带边界行的跳图率是别处的 1.75 倍）。
+SCORE_PAD_RATIO = 4.0
 # 参与合成的最大样张数。融合阶段「哪张最锐」的索引图用 uint8 装下标，所以硬上限是 256 张：
 # 这是数据结构的边界，不是画质取舍。除此之外没有张数限制——配准与融合都是逐张处理，
 # 峰值内存与张数无关，只是耗时随张数线性增长。
@@ -152,18 +158,24 @@ def _aligned_strip(matrix, image, width, y0, y1):
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
-def _score_strip(strip):
+def _score_window(width):
+    """返回打分的 (平滑半径 σ, 条带上下 halo 行数)，两者都随画幅宽度缩放。"""
+    sigma = max(SCORE_SIGMA_MIN, width * SCORE_SIGMA_RATIO)
+    return sigma, int(round(SCORE_PAD_RATIO * sigma))
+
+
+def _score_strip(strip, sigma):
     """一条带（含上下 halo）的逐像素清晰度：拉普拉斯绝对值的局部平滑，压成 uint16。
 
     灰度差分的绝对值上限约 2040（8 邻域拉普拉斯 × 255），uint16 装得下，量化损失可忽略。
-    平滑半径见 SCORE_SIGMA——它决定「取哪一张」这个决定在多大的邻域上保持一致，
-    是压掉椒盐状脏污的关键。传入的条带要带 halo，调用方打分后再把 halo 裁掉。
+    σ 决定「取哪一张」这个决定在多大的邻域上保持一致，是压掉椒盐状脏污的关键（见
+    SCORE_SIGMA_RATIO）。传入的条带要带 halo，调用方打分后再把 halo 裁掉。
     """
     import cv2
     import numpy
 
     lap = numpy.absolute(cv2.Laplacian(_gray(strip), cv2.CV_32F))
-    smoothed = cv2.GaussianBlur(lap, (0, 0), SCORE_SIGMA)
+    smoothed = cv2.GaussianBlur(lap, (0, 0), sigma)
     return numpy.clip(smoothed, 0.0, 65535.0).astype(numpy.uint16)
 
 
@@ -178,6 +190,7 @@ def _fuse(paths, matrices, width, height, note):
     best_score = numpy.zeros((height, width), numpy.uint16)
     best_index = numpy.zeros((height, width), numpy.uint8)
 
+    sigma, pad = _score_window(width)
     rows = range(0, height, STRIP_ROWS)
     # 第一遍：给每个像素记下「哪一张最锐」。
     for index, (path, matrix) in enumerate(zip(paths, matrices)):
@@ -186,12 +199,12 @@ def _fuse(paths, matrices, width, height, note):
             note("对齐与打分 %d / %d…" % (index + 1, len(paths)))
         for y0 in rows:
             y1 = min(height, y0 + STRIP_ROWS)
-            # 多 warp 上下各 SCORE_PAD 行做 halo，打完分再裁回本条的 y0:y1——
+            # 多 warp 上下各 pad 行做 halo，打完分再裁回本条的 y0:y1——
             # 否则平滑在条带上下沿拿反射填充当邻域，每 STRIP_ROWS 行留一道横向接缝。
-            py0 = max(0, y0 - SCORE_PAD)
-            py1 = min(height, y1 + SCORE_PAD)
+            py0 = max(0, y0 - pad)
+            py1 = min(height, y1 + pad)
             score = _score_strip(
-                _aligned_strip(matrix, image, width, py0, py1))[y0 - py0:y1 - py0]
+                _aligned_strip(matrix, image, width, py0, py1), sigma)[y0 - py0:y1 - py0]
             window = best_score[y0:y1]
             take = score > window
             window[take] = score[take]
