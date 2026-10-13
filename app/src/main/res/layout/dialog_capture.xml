@@ -18,13 +18,27 @@
         android:paddingRight="12dp"
         android:paddingBottom="8dp">
 
-    <ImageView
-        android:id="@+id/liveViewImage"
+    <!-- 黑底容器 + 方框覆盖层：高度定在容器上，覆盖层与画面等大叠放（点按仍落到下层 ImageView）。 -->
+    <FrameLayout
+        android:id="@+id/liveViewFrame"
         android:layout_width="match_parent"
         android:layout_height="240dp"
-        android:background="#000000"
-        android:contentDescription="@string/live_view_hint"
-        android:scaleType="fitCenter" />
+        android:background="#000000">
+
+        <ImageView
+            android:id="@+id/liveViewImage"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="@string/live_view_hint"
+            android:scaleType="fitCenter" />
+
+        <com.imagefetch.ui.FocusBoxOverlayView
+            android:id="@+id/focusBoxOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clickable="false"
+            android:focusable="false" />
+    </FrameLayout>
 
     <TextView
         android:id="@+id/liveViewStatus"

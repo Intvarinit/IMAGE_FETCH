@@ -167,6 +167,14 @@
         </LinearLayout>
 
         <Button
+            android:id="@+id/focusShoot"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="@string/focus_write_and_open_capture"
+            android:textSize="12sp" />
+
+        <Button
             android:id="@+id/focusCalculator"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

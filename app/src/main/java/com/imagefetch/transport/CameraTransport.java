@@ -202,10 +202,38 @@ public interface CameraTransport extends Closeable {
 
     /**
      * 把取景画面里的一个点设为对焦框（Canon {@code 0x915B EOS_TouchAfPosition}，
-     * <b>不触发</b>对焦）。{@code x}/{@code y} 为取景帧像素坐标。不支持的传输实现保持默认。
+     * <b>不触发</b>对焦）。{@code x}/{@code y} 是<b>感光器像素</b>坐标
+     * （可先用 {@link #liveViewSensorSize()} 把取景帧像素换算过来）。
+     * 不支持的传输实现保持默认。
      */
     default void touchAfPosition(int x, int y) throws Exception {
         throw new UnsupportedOperationException("当前连接方式不支持移动对焦框");
+    }
+
+    /**
+     * 先按感光器像素坐标移动对焦框，再触发一次对焦：让「自动对焦」落在用户点选的那一点，
+     * 而不是相机当前的对焦点。默认实现退化为 {@link #autofocus()}（忽略坐标）。
+     * 不支持的传输实现保持默认。
+     */
+    default void autofocusAt(int x, int y) throws Exception {
+        autofocus();
+    }
+
+    /**
+     * 最近一帧取景载荷里上报的感光器分辨率（{@code [宽, 高]}），没上报过返回 {@code null}。
+     * 用于把取景帧像素坐标换算成 {@link #touchAfPosition} 需要的感光器像素坐标。
+     * 不支持的传输实现保持默认。
+     */
+    default int[] liveViewSensorSize() {
+        return null;
+    }
+
+    /**
+     * 最近一帧取景载荷里出现的 TLV 段类型列表（逗号分隔，诊断用）；没收到过返回 {@code null}。
+     * 当 {@link #liveViewSensorSize()} 取不到时，用它排查相机是否压根没推分辨率段。
+     */
+    default String liveViewSegmentTypes() {
+        return null;
     }
 
     /**

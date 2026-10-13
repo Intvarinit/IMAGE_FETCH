@@ -24,6 +24,8 @@ public final class FakeCameraTransport implements CameraTransport {
     private Exception failure;
     private ObjectEventListener listener;
     private long[] captureHandles = new long[0];
+    /** 每次 listStorage 前的固定延时，模拟「相机写卡有间隔」；默认 0（不延时）。 */
+    private long listStorageDelayMillis;
 
     public int downloadCalls;
     public int captureCalls;
@@ -66,6 +68,12 @@ public final class FakeCameraTransport implements CameraTransport {
         return this;
     }
 
+    /** 每次 listStorage 前先 sleep 这么久，模拟相机写卡期间没有新对象的空窗。 */
+    public FakeCameraTransport listStorageDelay(long millis) {
+        this.listStorageDelayMillis = millis;
+        return this;
+    }
+
     /** 前 failuresBeforeSuccess 次下载抛 failure，之后成功。 */
     public FakeCameraTransport failDownloads(int failuresBeforeSuccess, Exception failure) {
         this.failuresBeforeSuccess = failuresBeforeSuccess;
@@ -95,6 +103,13 @@ public final class FakeCameraTransport implements CameraTransport {
     @Override
     public CameraStorage.Snapshot listStorage(int maxItems) {
         lastMaxItems = maxItems;
+        if (listStorageDelayMillis > 0) {
+            try {
+                Thread.sleep(listStorageDelayMillis);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
         if (!stagedSnapshots.isEmpty()) {
             CameraStorage.Snapshot next = stagedSnapshots.pollFirst();
             // 队尾保留最后一个，用尽后反复返回它。

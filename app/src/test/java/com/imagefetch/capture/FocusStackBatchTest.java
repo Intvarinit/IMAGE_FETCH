@@ -112,4 +112,83 @@ public class FocusStackBatchTest {
         assertThrows(UnsupportedOperationException.class, () -> batch.files().clear());
         assertEquals(2, batch.size());
     }
+
+    // ---------- 批次来源标记与「取用即清空」（自动合成只在 App 发起的拍摄后跑） ----------
+
+    @Test
+    public void App拍摄开窗会标记批次来源() {
+        FocusStackBatch batch = new FocusStackBatch();
+        batch.armForAppCapture();
+        batch.add(file("a.jpg"));
+        batch.add(file("b.jpg"));
+
+        FocusStackBatch.Batch snapshot = batch.consume();
+
+        assertTrue("App 发起的拍摄批次才允许自动合成", snapshot.appInitiated());
+        assertEquals(2, snapshot.files().size());
+    }
+
+    @Test
+    public void 普通开窗不标记App来源() {
+        FocusStackBatch batch = new FocusStackBatch();
+        batch.arm();
+        batch.add(file("a.jpg"));
+        batch.add(file("b.jpg"));
+
+        FocusStackBatch.Batch snapshot = batch.consume();
+
+        assertFalse("机身自己拍的批次不该触发合成", snapshot.appInitiated());
+        assertEquals(2, snapshot.files().size());
+    }
+
+    @Test
+    public void 取用即清空且二次取用为空() {
+        FocusStackBatch batch = new FocusStackBatch();
+        batch.armForAppCapture();
+        batch.add(file("a.jpg"));
+        batch.add(file("b.jpg"));
+
+        assertEquals(2, batch.consume().files().size());
+
+        FocusStackBatch.Batch second = batch.consume();
+        assertTrue("同一批不得被重复合成", second.files().isEmpty());
+        assertFalse(second.appInitiated());
+        assertEquals(0, batch.size());
+    }
+
+    @Test
+    public void 取用后窗口关闭不再收集() {
+        FocusStackBatch batch = new FocusStackBatch();
+        batch.armForAppCapture();
+        batch.add(file("a.jpg"));
+        batch.consume();
+
+        // 取用即关窗：之后到达的落盘回调不能再被算进本批。
+        batch.add(file("later.jpg"));
+
+        assertEquals(0, batch.size());
+    }
+
+    @Test
+    public void 关窗后快照仍保留旧契约() {
+        FocusStackBatch batch = new FocusStackBatch();
+        batch.arm();
+        batch.add(file("a.jpg"));
+        batch.add(file("b.jpg"));
+        batch.disarm();
+
+        // disarm() 不清 list：既有调用方（导出后合成）依赖这一点。
+        assertEquals(2, batch.files().size());
+        assertTrue(batch.ready());
+    }
+
+    @Test
+    public void 取用快照是只读副本() {
+        FocusStackBatch batch = new FocusStackBatch();
+        batch.armForAppCapture();
+        batch.add(file("a.jpg"));
+
+        FocusStackBatch.Batch snapshot = batch.consume();
+        assertThrows(UnsupportedOperationException.class, () -> snapshot.files().clear());
+    }
 }

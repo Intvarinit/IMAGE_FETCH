@@ -36,6 +36,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.GridView;
 import android.widget.ImageView;
 import android.widget.ProgressBar;
@@ -57,6 +58,7 @@ import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.storage.GalleryExporter;
+import com.imagefetch.ui.FocusBoxOverlayView;
 import com.imagefetch.ui.PhotoGridAdapter;
 
 import java.io.File;
@@ -183,6 +185,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private byte[] focusBracketBlock;
     /** 刚写下去的 0xD208 的 24 字节，用于写入后自动回读核对；null 表示这次读取不是回读。 */
     private byte[] pendingFocusBracketWrite;
+    /** 对焦包围面板的「拍摄并取回」：写入成功后立刻收起包围面板并开拍。 */
+    private boolean pendingShootAfterWrite;
     /** 拍摄面板上的「预计张数」输入框；面板关闭后置空。 */
     private EditText captureShotsField;
     /** 上次用过的预计张数，跨面板开关保留；对焦包围/HDR 包围下省得每次重填。 */
@@ -220,6 +224,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 下一次快照回调是「取基线」还是「对比」——回调本身分不清这两件事。 */
     private boolean snapshotIsBaseline;
     private ImageView liveViewImage;
+    /** 取景预览容器：只靠它给画面定高，让方框覆盖层与 ImageView 等大叠放。 */
+    private FrameLayout liveViewFrame;
+    /** 对焦点小方框覆盖层；面板关闭后置空。 */
+    private FocusBoxOverlayView focusBoxOverlay;
+    /** 最近一次下发的对焦点帧坐标；NaN 表示还没点过（面板重开时复位）。 */
+    private float lastFocusFrameX = Float.NaN;
+    private float lastFocusFrameY = Float.NaN;
     private TextView liveViewStatusView;
     private Button captureShootButton;
     /** 面板上的「自动对焦」按钮；对焦进行中禁用，结束后恢复。关闭面板后置空。 */
@@ -556,6 +567,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         if (captureDialog != null) return;
         View content = getLayoutInflater().inflate(R.layout.dialog_capture, null);
         liveViewImage = content.findViewById(R.id.liveViewImage);
+        liveViewFrame = content.findViewById(R.id.liveViewFrame);
+        focusBoxOverlay = content.findViewById(R.id.focusBoxOverlay);
+        lastFocusFrameX = Float.NaN;
+        lastFocusFrameY = Float.NaN;
         liveViewStatusView = content.findViewById(R.id.liveViewStatus);
         captureShootButton = content.findViewById(R.id.captureShoot);
         captureAutofocusButton = content.findViewById(R.id.captureAutofocus);
@@ -566,10 +581,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
         // 取景是 3:2 画面：给黑底定一个固定高度，换帧时弹窗高度才不会跟着抖动。
         // 比例不能太大——预览是弹窗里最高的一块，占满后下面的档位行和拍摄按钮会被挤出
-        // 可视区（表现为「按钮被压缩」）。
-        ViewGroup.LayoutParams imageParams = liveViewImage.getLayoutParams();
-        imageParams.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.28f);
-        liveViewImage.setLayoutParams(imageParams);
+        // 可视区（表现为「按钮被压缩」）。高度设在容器上，让方框覆盖层与画面同尺寸。
+        ViewGroup.LayoutParams frameParams = liveViewFrame.getLayoutParams();
+        frameParams.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.28f);
+        liveViewFrame.setLayoutParams(frameParams);
 
         // 点按预览只移动对焦框、不触发对焦（用户明确要求：对焦另走「自动对焦」按钮）。
         liveViewImage.setOnTouchListener((view, event) -> {
@@ -590,7 +605,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureAutofocusButton.setOnClickListener(view -> {
             // 对焦要等相机执行完才回，期间禁用按钮避免连点排队。
             captureAutofocusButton.setEnabled(false);
-            coordinator.autofocus();
+            // 已有落点时按用户点选的那一点对焦；没点过则退回相机的当前对焦点。
+            if (!Float.isNaN(lastFocusFrameX) && !Float.isNaN(lastFocusFrameY)) {
+                coordinator.autofocusAtPoint((int) lastFocusFrameX, (int) lastFocusFrameY);
+            } else {
+                coordinator.autofocus();
+            }
         });
         setUpLiveViewSizeSpinner();
         setUpAfModeSpinner();
@@ -622,6 +642,11 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         debounceHandler.removeCallbacksAndMessages(null);
         captureDialog = null;
         liveViewImage = null;
+        liveViewFrame = null;
+        if (focusBoxOverlay != null) focusBoxOverlay.clear();
+        focusBoxOverlay = null;
+        lastFocusFrameX = Float.NaN;
+        lastFocusFrameY = Float.NaN;
         liveViewStatusView = null;
         captureShootButton = null;
         captureAutofocusButton = null;
@@ -715,11 +740,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         });
     }
 
-    /** 用真实可选值填充下拉框（{@code selectedIndex < 0} 表示选第一项）。 */
-    private void setAfSpinnerItems(int[] values, int selectedIndex) {
+    /**
+     * 用真实可选值填充下拉框。{@code fromCamera=false} 表示列表是用候选全表降级的
+     * （相机没上报允许值），逐项加「候选」标注，免得被当成相机确认过的取值。
+     */
+    private void setAfSpinnerItems(int[] values, int selectedIndex, boolean fromCamera) {
         if (afModeSpinner == null) return;
         String[] labels = new String[values.length];
-        for (int i = 0; i < values.length; i++) labels[i] = afModeLabel(values[i]);
+        for (int i = 0; i < values.length; i++) {
+            labels[i] = afModeLabel(values[i]) + (fromCamera ? "" : AF_METHOD_CANDIDATE_SUFFIX);
+        }
         ArrayAdapter<String> adapter = new ArrayAdapter<>(
                 this, android.R.layout.simple_spinner_item, labels);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
@@ -728,6 +758,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         afModeSpinner.setSelection(selected);
         lastAppliedAfValue = values[selected];
     }
+
+    /** 相机没上报允许值时的候选项标注。 */
+    private static final String AF_METHOD_CANDIDATE_SUFFIX = "（候选）";
 
     /** 下拉框占位/不可用项（此时不设 afModeValues，选中回调会直接忽略）。 */
     private void setAfSpinnerPlaceholder(String label) {
@@ -847,11 +880,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         expectedShots = readExpectedShots();
         // 多张（对焦包围/HDR 包围）这一批要留给景深合成：先开收集窗，并让协调器在导出相册后
         // 保留应用内副本——否则原图导出成功即被清理，合成就没得读了。
+        // 张数 = 1 时顺带把上一批残留取走丢掉，免得旧文件被之后的下载路径误拿去合成。
         if (expectedShots > 1) {
-            stackBatch.arm();
+            stackBatch.armForAppCapture();
             coordinator.setRetainLocalCopiesForStack(true);
         } else {
-            stackBatch.disarm();
+            stackBatch.consume();
             coordinator.setRetainLocalCopiesForStack(false);
         }
         captureRunning = true;
@@ -864,7 +898,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 拍摄面板上的「预计张数」。填得不合法就按 1 张——不能因为一个输入框让快门按不下去。 */
     private int readExpectedShots() {
-        if (captureShotsField == null) return 1;
+        // 输入框还没装配好（例如从对焦包围面板直接开拍）时，用已记住的张数，
+        // 别把刚写入的张数吞成 1。
+        if (captureShotsField == null) return Math.max(1, expectedShots);
         try {
             return Math.max(1, Integer.parseInt(captureShotsField.getText().toString().trim()));
         } catch (NumberFormatException exception) {
@@ -1129,7 +1165,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     @Override
     public void onFileSaved(File file, long bytes, long elapsedMillis, String note) {
         runOnUiThread(() -> {
-            // 对焦包围批次逐张收拢，等这一批全部取回后再统一做景深合成（见 onDownloadFinished）。
+            // 对焦包围批次逐张收拢，等这一批全部取回后再统一做景深合成（见 onCaptureFinished）。
             stackBatch.add(file);
             setBusy(false);
             progressBar.setProgress(100);
@@ -1145,16 +1181,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             setBusy(false);
             // 下载已结束：清掉图片栏里之前的选中状态，避免看起来像还没下载。
             gridAdapter.clearSelection();
-            // 关窗并取出这一批的落盘文件；够两张就自动合成。
-            stackBatch.disarm();
+            // 手动/批量下载一律不合成：这里只把可能残留的批次取走丢掉并复位保留开关，
+            // 免得旧文件被误拿去合成（自动合成只在 onCaptureFinished 里做）。
+            stackBatch.consume();
             coordinator.setRetainLocalCopiesForStack(false);
-            List<File> batch = stackBatch.files();
-            if (batch.size() >= FocusStackBatch.MIN_SHOTS) {
-                startFocusStack(batch);
-            } else if (!batch.isEmpty()) {
-                statusView.setText("本批只取回 " + batch.size() + " 张，不足以做景深合成（至少 "
-                        + FocusStackBatch.MIN_SHOTS + " 张）。");
-            }
         });
     }
 
@@ -1186,6 +1216,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             Bitmap previous = liveViewBitmap;
             liveViewBitmap = frame;
             liveViewImage.setImageBitmap(frame);
+            // 换帧后重新映射方框：图传尺寸/比例变了，旧控件坐标就不对了。
+            updateFocusBox();
             // 约 10fps、每帧 MB 级：延迟回收上一帧，既不攒垃圾也不打断渲染线程的绘制。
             if (previous != null && !previous.isRecycled()) {
                 deferredRecycle.postDelayed(previous::recycle, 300L);
@@ -1264,7 +1296,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     @Override
-    public void onFocusAreaResult(int[] values, int currentIndex, String error) {
+    public void onFocusAreaResult(int[] values, int currentIndex, boolean fromCamera, String error) {
         runOnUiThread(() -> {
             if (afModeSpinner == null) return;
             if (error != null || values == null || values.length == 0) {
@@ -1272,7 +1304,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 return;
             }
             afModeValues = values;
-            setAfSpinnerItems(values, currentIndex);
+            setAfSpinnerItems(values, currentIndex, fromCamera);
+            if (!fromCamera && liveViewStatusView != null) {
+                liveViewStatusView.setText("对焦方式列表非相机上报，为候选全表（未获相机确认），选中后写入可能被拒。");
+            }
         });
     }
 
@@ -1453,6 +1488,11 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             coordinator.readVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING);
         });
         content.findViewById(R.id.focusWrite).setOnClickListener(view -> writeFocusBracket());
+        // 「写入后打开拍摄」：写完参数后收起本面板并打开拍摄面板（张数已预填），不再自动开拍。
+        content.findViewById(R.id.focusShoot).setOnClickListener(view -> {
+            pendingShootAfterWrite = true;
+            writeFocusBracket();
+        });
         content.findViewById(R.id.focusCalculator).setOnClickListener(view -> openFocusCalculator());
         focusBracketDialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.focus_title)
@@ -1467,6 +1507,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             focusIncrementField = null;
             focusSmoothingField = null;
             pendingFocusBracketWrite = null;
+            pendingShootAfterWrite = false;
         });
         focusBracketDialog.show();
         // 进面板就默认读一次：省掉「先点读取当前值」这一步；用户手动读取时会再清一次 pending。
@@ -1515,10 +1556,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private void onFocusBracketBlockWritten(int code, String error) {
         if (focusReportView == null) {
             pendingFocusBracketWrite = null;
+            pendingShootAfterWrite = false;
             return;
         }
         if (error != null || code == 0) {
             pendingFocusBracketWrite = null;
+            // 写失败不去拍：张数没写进相机，拍了也收不到包围序列。
+            pendingShootAfterWrite = false;
             focusReportView.setText("写入 0xD208 失败："
                     + (error == null ? "相机未正常应答" : error)
                     + "\n\n若为 0x2019（参数不受支持），说明这条属性在您这台机身上不可写，"
@@ -1535,6 +1579,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             } catch (NumberFormatException ignored) {
                 // 张数不是整数：保留原来的预计张数，拍摄面板的输入框仍可手填。
             }
+        }
+        // 「写入后打开拍摄」：只收起本面板、打开拍摄面板（张数已预填），让取景先起来、
+        // 由用户自己在面板里按快门。绝不在开面板的同时立刻拍摄——开取景是异步的，背靠背
+        // 触发拍摄会先暂停还没起来的取景，表现为黑屏，并在用户未操作时就误拍、误取回、误合成。
+        if (pendingShootAfterWrite) {
+            pendingShootAfterWrite = false;
+            if (focusBracketDialog != null) focusBracketDialog.dismiss();
+            openCapturePanel();
+            return;
         }
         coordinator.readVendorPropertyBlock(VendorProperty.FOCUS_SHIFT_SETTING);
     }
@@ -1567,6 +1620,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private void writeFocusBracket() {
         if (focusReportView == null) return;
         if (focusBracketBlock == null) {
+            // 早退一律清掉「写完就拍」的标记：写都没写成就不能去拍。
+            pendingShootAfterWrite = false;
             focusReportView.setText("还没有 0xD208 的底稿，请先点「读取当前值」。");
             return;
         }
@@ -1580,6 +1635,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             increment = Long.parseLong(focusIncrementField.getText().toString().trim());
             smoothing = Long.parseLong(focusSmoothingField.getText().toString().trim());
         } catch (NumberFormatException exception) {
+            pendingShootAfterWrite = false;
             focusReportView.setText("开关 / 张数 / 对焦增量 / 曝光平滑化都要填整数。"
                     + "\n开关：0 = 关闭，1 = 开启。"
                     + "\n张数：" + FocusBracketPlan.MIN_COUNT + "–" + FocusBracketPlan.MAX_COUNT
@@ -1591,6 +1647,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         try {
             plan = FocusBracketPlan.forWrite(enabled, count, increment, smoothing);
         } catch (IllegalArgumentException exception) {
+            pendingShootAfterWrite = false;
             focusReportView.setText("参数无效：" + exception.getMessage());
             return;
         }
@@ -2378,7 +2435,31 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         int y = Math.round(point[1]);
         // 落在图像外（fitCenter 的黑边）时忽略：相机只认画面内的坐标。
         if (x < 0 || y < 0 || x >= frameWidth || y >= frameHeight) return;
+        // 记住落点并在预览上画出小方框：否则「切了没效果」时看不出到底是没下发还是没响应。
+        lastFocusFrameX = x;
+        lastFocusFrameY = y;
+        updateFocusBox();
         coordinator.touchAfPosition(x, y);
+    }
+
+    /**
+     * 把最近一次落点按当前显示矩阵重映射到控件坐标，喂给方框覆盖层。
+     * 每帧都重映射一次：图传尺寸改变后 src→view 的比例会变，缓存控件坐标就会错位。
+     */
+    private void updateFocusBox() {
+        if (focusBoxOverlay == null || liveViewImage == null || liveViewBitmap == null) return;
+        if (Float.isNaN(lastFocusFrameX) || Float.isNaN(lastFocusFrameY)) {
+            focusBoxOverlay.clear();
+            return;
+        }
+        // 方框边长取帧宽的约 6%（"小一点"），并夹在 [48, 192] 像素之间，免得极端尺寸下离谱。
+        float half = Math.min(96f, Math.max(24f, liveViewBitmap.getWidth() * 0.03f));
+        float[] pts = {
+                lastFocusFrameX - half, lastFocusFrameY - half,
+                lastFocusFrameX + half, lastFocusFrameY + half,
+        };
+        liveViewImage.getImageMatrix().mapPoints(pts);
+        focusBoxOverlay.setBoxRect(pts[0], pts[1], pts[2], pts[3]);
     }
 
     @Override
@@ -2388,6 +2469,17 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             if (captureShootButton != null) captureShootButton.setEnabled(true);
             // 「本次未发现 JPEG」既落盘也不报错，只有这条回调能把按钮恢复成可用。
             setBusy(false);
+            // 自动合成的正确挂点：只有 App 发起的拍摄这一批才合成；机身自己拍（App 无操作）
+            // 批次窗口根本没开，consume() 取到 appInitiated=false，什么都不做。
+            // onFileSaved 的 post 排在本条之前，同一 main looper 队列按序执行，这里拿到的是完整批次。
+            FocusStackBatch.Batch batch = stackBatch.consume();
+            coordinator.setRetainLocalCopiesForStack(false);
+            if (batch.appInitiated() && batch.files().size() >= FocusStackBatch.MIN_SHOTS) {
+                startFocusStack(batch.files());
+            } else if (batch.appInitiated() && !batch.files().isEmpty()) {
+                statusView.setText("本批只取回 " + batch.files().size() + " 张，不足以做景深合成（至少 "
+                        + FocusStackBatch.MIN_SHOTS + " 张）。");
+            }
         });
     }
 

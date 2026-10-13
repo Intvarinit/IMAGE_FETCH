@@ -19,11 +19,14 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.LruCache;
 
+import com.imagefetch.capture.CaptureWaitPolicy;
+import com.imagefetch.ptp.AfMethodChoices;
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
 import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.PtpOperationService;
+import com.imagefetch.ptp.SensorPointMapper;
 import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.storage.GalleryExporter;
@@ -142,11 +145,12 @@ public final class CameraSessionCoordinator {
         }
 
         /**
-         * 对焦方式（0xD1BA）的可选值与当前值：{@code values} 为允许列表（相机顺序），
-         * {@code currentIndex} 为当前值在其中的下标（未知为 -1）；失败时 {@code values} 为 null、
-         * {@code error} 为原因。给默认空实现。
+         * 对焦方式（0xD1BA）的可选值与当前值：{@code values} 为下拉框选项（相机顺序，
+         * 相机没给允许列表时为候选全表），{@code currentIndex} 为当前值在其中的下标（未知为 -1）；
+         * {@code fromCamera} 表示 {@code values} 是否来自相机上报的允许列表；失败时
+         * {@code values} 为 null、{@code error} 为原因。给默认空实现。
          */
-        default void onFocusAreaResult(int[] values, int currentIndex, String error) {
+        default void onFocusAreaResult(int[] values, int currentIndex, boolean fromCamera, String error) {
         }
 
         /**
@@ -189,15 +193,10 @@ public final class CameraSessionCoordinator {
         void onError(String message, Throwable error);
     }
 
-    /** 拍后等待“写卡完成 + 新对象可读”的上限。 */
-    private static final long CAPTURE_DISCOVERY_TIMEOUT_MS = 20000L;
+    /** 单张拍摄的收图轮询间隔；多张批次见 {@link #CAPTURE_BATCH_POLL_MS}。 */
     private static final long CAPTURE_POLL_INTERVAL_MS = 1000L;
-    /**
-     * 多张拍摄（对焦包围 / HDR 包围）里，收到最后一张后还等这么久没有新对象才认为相机写完了。
-     * 不能按「预计张数」硬凑：相机实际出几张就交几张，但也不能少收——机内包围每张之间有间隔，
-     * 一收到头一张就返回会把它后面的全丢掉。
-     */
-    private static final long CAPTURE_BATCH_SETTLE_MS = 3000L;
+    /** 多张批次用更细的轮询粒度：每张之间只隔几百毫秒，1 s 的粒度容易错过写卡完成时刻。 */
+    private static final long CAPTURE_BATCH_POLL_MS = 500L;
     /** Canon EOS 对焦方式属性码（0xD1BA EOS_LvAfSystem），与 transport 侧一致。 */
     private static final int CANON_PROP_AF_METHOD = 0xd1ba;
 
@@ -314,6 +313,9 @@ public final class CameraSessionCoordinator {
     private volatile long liveViewGeneration;
     /** 当前取景画面尺寸（相机端推流分辨率）；由面板下拉框切换。 */
     private volatile LiveViewSize liveViewSize = LiveViewSize.LARGE;
+    /** 最近一帧取景画面解出来的像素宽/高（0 表示还没解出）；用于把点选坐标换算成感光器像素。 */
+    private volatile int liveViewFrameWidth;
+    private volatile int liveViewFrameHeight;
     /** 正在跑的取景循环；拍摄期间会暂时断开取景，拍完用它重置「无画面」计时，避免误报停滞。 */
     private volatile LiveViewPump activePump;
     /**
@@ -1168,6 +1170,8 @@ public final class CameraSessionCoordinator {
                 pump.consecutiveErrors = 0;
                 Bitmap frame = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
                 if (frame != null) {
+                    liveViewFrameWidth = frame.getWidth();
+                    liveViewFrameHeight = frame.getHeight();
                     mainHandler.post(() -> listener.onLiveViewFrame(frame));
                 }
             }
@@ -1311,33 +1315,26 @@ public final class CameraSessionCoordinator {
 
     /**
      * 读取对焦方式（0xD1BA）：可选值列表（0xC18A 允许值）+ 当前值，交给面板的下拉框。
-     * 相机没给允许列表时退化为「只有当前值一个选项」，不把下拉框留空。
+     * 相机没给允许列表时降级为候选全表（见 {@link AfMethodChoices}），并在回调里用
+     * {@code fromCamera=false} 标注，不把下拉框留空或只留当前值一项。
      */
     public void readFocusArea() {
         executor.submit(() -> {
             if (!isConnected()) {
-                mainHandler.post(() -> listener.onFocusAreaResult(null, -1, "请先连接相机。"));
+                mainHandler.post(() -> listener.onFocusAreaResult(null, -1, false, "请先连接相机。"));
                 return;
             }
             try {
                 int raw = (int) operations.readFocusArea();
                 int[] allowed = operations.supportedValues(CANON_PROP_AF_METHOD);
-                if (allowed == null || allowed.length == 0) {
-                    allowed = new int[]{raw};
-                }
-                int index = -1;
-                for (int i = 0; i < allowed.length; i++) {
-                    if (allowed[i] == raw) {
-                        index = i;
-                        break;
-                    }
-                }
-                final int[] values = allowed;
-                final int current = index;
-                mainHandler.post(() -> listener.onFocusAreaResult(values, current, null));
+                AfMethodChoices.Choices choices = AfMethodChoices.resolve(allowed, raw);
+                final int[] values = choices.values;
+                final int current = choices.currentIndex;
+                final boolean fromCamera = choices.fromCamera;
+                mainHandler.post(() -> listener.onFocusAreaResult(values, current, fromCamera, null));
             } catch (Exception error) {
                 String message = error.getMessage() != null ? error.getMessage() : "读取对焦方式失败";
-                mainHandler.post(() -> listener.onFocusAreaResult(null, -1, message));
+                mainHandler.post(() -> listener.onFocusAreaResult(null, -1, false, message));
             }
         });
     }
@@ -1450,7 +1447,8 @@ public final class CameraSessionCoordinator {
 
     /**
      * 把取景画面里的一个点设为对焦框（0x915B，<b>只移动对焦框、不触发对焦</b>）。
-     * 坐标由界面按取景帧像素坐标换算好再传进来。
+     * {@code x}/{@code y} 为取景帧像素坐标；这里按感光器分辨率换算成相机要求的感光器像素再下发，
+     * 否则落点会差一个推流倍率（相机端表现为对焦框几乎没动）。
      */
     public void touchAfPosition(final int x, final int y) {
         executor.submit(() -> {
@@ -1458,15 +1456,66 @@ public final class CameraSessionCoordinator {
                 mainHandler.post(() -> listener.onLiveViewStatus("实时取景未运行，无法移动对焦框。"));
                 return;
             }
+            int[] sensor = SensorPointMapper.toSensor(
+                    x, y, operations.liveViewSensorSize(), liveViewFrameWidth, liveViewFrameHeight);
             try {
-                operations.touchAfPosition(x, y);
+                if (sensor == null) {
+                    // 没拿到感光器分辨率：只能按原坐标下发，落点大概率不对，明确告知用户并附段类型。
+                    operations.touchAfPosition(x, y);
+                    String segments = operations.liveViewSegmentTypes();
+                    mainHandler.post(() -> listener.onLiveViewStatus(
+                            "对焦框未换算（相机未上报感光器分辨率，取景段类型："
+                                    + (segments == null ? "无" : segments)
+                                    + "），已按取景帧坐标下发 (" + x + ", " + y + ")。"));
+                    return;
+                }
+                operations.touchAfPosition(sensor[0], sensor[1]);
+                final int sensorX = sensor[0];
+                final int sensorY = sensor[1];
                 mainHandler.post(() -> listener.onLiveViewStatus(
-                        "对焦框已移到取景区 (" + x + ", " + y
-                                + ")（0x915B；需相机为单点对焦方式才会响应）"));
+                        "对焦框已移到感光器像素 (" + sensorX + ", " + sensorY + ")：取景帧 ("
+                                + x + ", " + y + ") 换算而来（0x915B；需相机为单点对焦方式才会响应）"));
             } catch (Exception error) {
                 String message = error.getMessage() != null ? error.getMessage() : "移动对焦框失败";
                 mainHandler.post(() -> listener.onLiveViewStatus("移动对焦框失败：" + message));
             }
+        });
+    }
+
+    /**
+     * 先按取景帧像素坐标把对焦框移到用户点选的那一点，再触发一次对焦——「自动对焦」落在用户点的
+     * 位置上，而不是相机当前的对焦点。取不到感光器分辨率时退化为 {@link #autofocus()}，
+     * 并在状态栏说明没按取景点对焦。
+     */
+    public void autofocusAtPoint(final int x, final int y) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onLiveViewStatus("请先连接相机。"));
+                mainHandler.post(listener::onAutofocusFinished);
+                return;
+            }
+            mainHandler.post(() -> listener.onLiveViewStatus("正在按取景点自动对焦…"));
+            int[] sensor = SensorPointMapper.toSensor(
+                    x, y, operations.liveViewSensorSize(), liveViewFrameWidth, liveViewFrameHeight);
+            boolean mapped = sensor != null;
+            String failure = null;
+            try {
+                if (mapped) {
+                    operations.autofocusAt(sensor[0], sensor[1]);
+                } else {
+                    operations.autofocus();
+                }
+            } catch (Exception error) {
+                failure = error.getMessage() != null ? error.getMessage() : "对焦失败";
+            }
+            final String result = failure;
+            if (result == null) {
+                mainHandler.post(() -> listener.onLiveViewStatus(
+                        mapped ? "已按取景点自动对焦完成" : "自动对焦完成（无感光器分辨率，未按取景点）"));
+            } else {
+                mainHandler.post(() -> listener.onLiveViewStatus("自动对焦失败：" + result));
+            }
+            mainHandler.post(listener::onAutofocusFinished);
         });
     }
 
@@ -1544,11 +1593,14 @@ public final class CameraSessionCoordinator {
 
                 listener.onStatus("触发相机快门…");
                 long[] directHandles = operations.capture();
+                boolean multiShot = shots > 1;
 
                 // 快门已经松开，取景不必再等文件取回：暂停期间相机停在 EVFOutputDevice=0
                 // 的状态，此时任何 0x9110 属性写入（快门/光圈/ISO）都会被回 0x2019——
                 // 「刚拍完就改参数报忙」就是这么来的。下载要花好几秒，必须先把取景还回去。
-                if (resumeLiveView) {
+                // 但多张包围期间不得提前还取景：恢复取景（重发 0x9151/0xD1B0）会打断机内
+                // 仍在跑的连拍序列（实测 8 张只剩 4 张）。这时留到取回结束再恢复。
+                if (resumeLiveView && (!multiShot || directHandles.length > 0)) {
                     liveViewResumed = resumeLiveViewAfterCapture(1) == null;
                 }
 
@@ -1587,13 +1639,19 @@ public final class CameraSessionCoordinator {
                         : "等待相机写卡并发现新对象…");
                 NewPhotoResolver.Resolution resolution = resolver.resolveBatch(
                         operations,
-                        CAPTURE_DISCOVERY_TIMEOUT_MS,
-                        CAPTURE_POLL_INTERVAL_MS,
+                        CaptureWaitPolicy.budgetMillisFor(shots),
+                        multiShot ? CAPTURE_BATCH_POLL_MS : CAPTURE_POLL_INTERVAL_MS,
                         CAPTURE_BASELINE_ITEMS,
                         shots,
-                        shots > 1 ? CAPTURE_BATCH_SETTLE_MS : 0L,
+                        CaptureWaitPolicy.settleMillisFor(shots),
                         item -> !item.isVideo(),
                         current);
+
+                // 多张批次的取景留到此刻才恢复（前面为了不打断连拍刻意没还）。
+                // 单张这一路在上面「快门一响就恢复」已做完，这里不重复。
+                if (resumeLiveView && !liveViewResumed) {
+                    liveViewResumed = resumeLiveViewAfterCapture(1) == null;
+                }
 
                 // 只保存 JPEG：RAW（.cr2/.cr3/.nef…）等不落盘。
                 // 相机设为仅 RAW 时只提示、不报错——这不算失败，只是没有可取回的格式。

@@ -149,9 +149,24 @@ public final class PtpOperationService {
         transport.writeFocusArea(value);
     }
 
-    /** 把取景画面里的一个点设为对焦框（取景帧像素坐标 x, y）；不触发对焦。 */
+    /** 把取景画面里的一个点设为对焦框（感光器像素坐标 x, y）；不触发对焦。 */
     public void touchAfPosition(int x, int y) throws Exception {
         transport.touchAfPosition(x, y);
+    }
+
+    /** 先按感光器像素坐标移动对焦框，再触发一次对焦。 */
+    public void autofocusAt(int x, int y) throws Exception {
+        transport.autofocusAt(x, y);
+    }
+
+    /** 最近一帧取景载荷里上报的感光器分辨率 [宽, 高]；没上报过返回 null。 */
+    public int[] liveViewSensorSize() {
+        return transport.liveViewSensorSize();
+    }
+
+    /** 最近一帧取景载荷里出现的 TLV 段类型列表（诊断用）；没收到过返回 null。 */
+    public String liveViewSegmentTypes() {
+        return transport.liveViewSegmentTypes();
     }
 
     public long download(

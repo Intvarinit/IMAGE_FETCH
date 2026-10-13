@@ -46,7 +46,7 @@
     <string name="exposure_unknown">—</string>
     <string name="exposure_hint">点数值直接选档，−/+ 逐档调整</string>
     <string name="af_mode_label">对焦方式</string>
-    <string name="live_view_tap_focus_hint">点按预览可移动对焦框（只移动、不触发对焦；需相机为单点对焦方式才会响应）</string>
+    <string name="live_view_tap_focus_hint">点按预览可移动对焦框（只移动、不触发对焦）。需先把「对焦方式」切到单点(Live)或定点(LiveSpotAF)——区域/面部追踪等方式下相机不响应移动命令。落点会用白色小方框标出。</string>
     <string name="pick_wifi">选择 Wi&#8209;Fi</string>
     <string name="pick_wifi_hint">已打开系统 Wi&#8209;Fi 设置；连上相机热点后回到本页即可连接。</string>
     <string name="session_notification_title">IMAGE_FETCH</string>
@@ -94,6 +94,7 @@
     <string name="focus_title">对焦包围设置（0xD208）</string>
     <string name="focus_read">读取当前值</string>
     <string name="focus_write">写入设置</string>
+    <string name="focus_write_and_open_capture">写入后打开拍摄面板</string>
     <string name="focus_enabled_label">开关</string>
     <string name="focus_enabled_off">关闭</string>
     <string name="focus_enabled_on">开启</string>

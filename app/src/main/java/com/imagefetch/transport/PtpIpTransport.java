@@ -178,10 +178,16 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int CANON_REQUEST_DEVICE_PROP_VALUE = 0x9127;
     /**
      * Canon EOS 触摸对焦框定位 {@code 0x915B EOS_TouchAfPosition(type, x, y)}：无数据段、
-     * 3 个参数（ptp.h:5082）。libgphoto2 注释坐标是取景帧像素、约 64px 粒度（config.c:8861）；
-     * {@code type} 的语义上游从未定义，这里取 0。
+     * 3 个参数（ptp.h:5082）。libgphoto2 注释说坐标是取景帧像素、约 64px 粒度（config.c:8861），
+     * 但那是把「取景帧」当成整个画面写的粗略说法；按抓包复现，X/Y 的实际量纲是感光器像素
+     * （见 {@link #CANON_LV_SEG_SENSOR_RESOLUTION}），且 {@code type} 必须发 3。
      */
     private static final int CANON_TOUCH_AF_POSITION = 0x915b;
+    /**
+     * {@code 0x915B} 的第一个参数（libgphoto2 里叫 {@code type}、语义未定义）。
+     * EOS Utility 抓包里固定发 {@code 3}；发 0 时相机静默忽略这条命令。
+     */
+    private static final long CANON_TOUCH_AF_TYPE = 3L;
 
     /** 事件块 TLV 记录类型：属性当前值变化（{@code 0xC189 EOS_PropValueChanged}）。 */
     private static final int CANON_EVENT_PROP_VALUE_CHANGED = 0xc189;
@@ -220,6 +226,15 @@ public final class PtpIpTransport implements CameraTransport {
     private static final int CANON_LV_SEG_JPEG = 1;
     private static final int CANON_LV_SEG_JPEG_MOVIE = 9;
     private static final int CANON_LV_SEG_JPEG_ALT = 11;
+    /**
+     * 取景载荷里的感光器分辨率段（TLV type {@code 0x0E}），载荷为两个 u32：传感器宽、高。
+     *
+     * <p>它决定了 {@code 0x915B TouchAfPosition} 的坐标空间：该操作的 X/Y 不是取景画面像素，
+     * 而是<b>感光器像素</b>（0..传感器宽/高）。依据是公开的 PTP/IP 协议逆向记录里 EOS Utility
+     * 抓包复现：SetTouchAfPosition 报文的 X/Y 与同一帧取景载荷中 TouchAutofocus 段的坐标同量级，
+     * 且后者的 X/Y 上限就是传感器宽/高。libgphoto2 未实现该操作，也不解析这个段。
+     */
+    private static final int CANON_LV_SEG_SENSOR_RESOLUTION = 0x0e;
 
     /** 相机「这一帧还没准备好」的响应码；属正常情况，退避重试即可。 */
     private static final int RESPONSE_CANON_OBJECT_NOT_READY = 0xa102;
@@ -1324,6 +1339,10 @@ public final class PtpIpTransport implements CameraTransport {
      * 不透明区域——能力探测（P0）需要原样字节，故单独存一份。同样只在 synchronized 方法里读写。
      */
     private final Map<Integer, byte[]> canonPropRaw = new LinkedHashMap<>();
+    /** 最近一帧取景载荷里上报的感光器分辨率（宽, 高）；没上报过为 null。 */
+    private int[] lvSensorSize;
+    /** 最近一帧取景载荷里出现的 TLV 段类型（诊断用，只增不减）。 */
+    private String lvSegmentTypes;
 
 
     /**
@@ -1427,7 +1446,75 @@ public final class PtpIpTransport implements CameraTransport {
             }
             throw notReady;
         }
-        return extractLiveViewJpeg(data);
+        byte[] jpeg = extractLiveViewJpeg(data);
+        recordLiveViewPayload(data);
+        return jpeg;
+    }
+
+    /**
+     * 解析取景载荷：记下感光器分辨率（供 0x915B 换算）与本帧出现过的段类型（诊断用，
+     * 便于在「对焦框仍不动」时判断相机到底发了哪些段）。解析失败不影响这一帧。
+     */
+    private void recordLiveViewPayload(byte[] data) {
+        if (data == null || data.length < 8) return;
+        StringBuilder types = new StringBuilder();
+        int offset = 0;
+        while (offset + 8 <= data.length) {
+            long length = u32(data, offset);
+            int type = (int) u32(data, offset + 4);
+            if (length < 8 || offset + length > data.length) break;
+            if (types.length() > 0) types.append(',');
+            types.append(type);
+            if (type == CANON_LV_SEG_SENSOR_RESOLUTION && length >= 16) {
+                long width = u32(data, offset + 8);
+                long height = u32(data, offset + 12);
+                // 只有像「横版传感器」才认：像素上限按 80 MP 卡，避免把别的段误读成分辨率。
+                if (width > height && height >= 480 && width <= 40000 && height <= 30000) {
+                    lvSensorSize = new int[]{(int) width, (int) height};
+                }
+            }
+            offset += (int) length;
+        }
+        if (types.length() > 0) lvSegmentTypes = types.toString();
+    }
+
+    @Override
+    public synchronized int[] liveViewSensorSize() {
+        return lvSensorSize == null ? null : lvSensorSize.clone();
+    }
+
+    @Override
+    public synchronized String liveViewSegmentTypes() {
+        return lvSegmentTypes;
+    }
+
+    /**
+     * 把取景画面里的一个点设为对焦框（{@code 0x915B EOS_TouchAfPosition}，<b>不触发</b>对焦）。
+     *
+     * <p>坐标是<b>感光器像素</b>（0..传感器宽/高），不是取景帧像素——这正是旧版「点了没反应」
+     * 的原因：把取景帧坐标（如 960×640）当感光器坐标发出去，落在画面左上角附近，看起来像没动。
+     * 第一个参数是固定常量 {@code 3}（EOS Utility 抓包值），旧版发 0 时相机静默忽略。</p>
+     */
+    @Override
+    public synchronized void touchAfPosition(int x, int y) throws Exception {
+        ensureConnected();
+        drainEosEvents();
+        int response = command(
+                CANON_TOUCH_AF_POSITION,
+                transactionId++,
+                new long[]{CANON_TOUCH_AF_TYPE, x & 0xffff_ffffL, y & 0xffff_ffffL});
+        if (response != RESPONSE_OK) {
+            throw new IOException("相机拒绝了对焦框移动（0x915B）：" + hexCode(response),
+                    rejected(response));
+        }
+        drainEosEvents();
+    }
+
+    /** 先按感光器坐标移动对焦框，再触发一次对焦——「自动对焦」按用户点的那一点对焦。 */
+    @Override
+    public synchronized void autofocusAt(int x, int y) throws Exception {
+        touchAfPosition(x, y);
+        autofocus();
     }
 
     /** 写入曝光参数（取值来自 {@link CanonExposure.entries} 的机上编码）。 */
@@ -1572,25 +1659,6 @@ public final class PtpIpTransport implements CameraTransport {
                     + Integer.toHexString(value & 0xffff) + "）：" + hexCode(code)
                     + (drainFailure == null ? "" : "\n" + drainFailure), rejected(code));
         }
-    }
-
-    /**
-     * 把取景画面里的一个点设为对焦框（{@code 0x915B EOS_TouchAfPosition}，<b>不触发</b>对焦）。
-     * {@code x}/{@code y} 是取景帧像素坐标（config.c:8861）；{@code type} 语义上游未定义，取 0。
-     */
-    @Override
-    public synchronized void touchAfPosition(int x, int y) throws Exception {
-        ensureConnected();
-        drainEosEvents();
-        int response = command(
-                CANON_TOUCH_AF_POSITION,
-                transactionId++,
-                new long[]{0L, x & 0xffff_ffffL, y & 0xffff_ffffL});
-        if (response != RESPONSE_OK) {
-            throw new IOException("相机拒绝了对焦框移动（0x915B）：" + hexCode(response),
-                    rejected(response));
-        }
-        drainEosEvents();
     }
 
     /**
