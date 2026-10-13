@@ -4,7 +4,8 @@
 
 1. **配准**：机内对焦包围是在不同对焦位置上拍的，机身未必锁死，画面前后景的位移也不一致。
    所以先对每张图求「到参考帧的单应矩阵」（SIFT 特征 + RANSAC），再把它们变换到同一个坐标系。
-   参考帧取中间那一张——前后景的位移都最小，warp 后越界最少。
+   参考帧取**整批里最锐的那张**——它是唯一不经过重采样的样张，在打分比较里天然占便宜，
+   底子最差的那张当基准会把整幅合成图锁死在虚焦上（见 _global_sharpness）。
 2. **融合**：逐像素算清晰度（拉普拉斯绝对值的局部平滑，越大越锐），每个像素取所有样张里最锐的那张。
    清晰度要先在**较大邻域**上平滑再比大小（见 _score_window）：否则在几张都不锐的地方分数彼此接近、
    由噪声定胜负，逐像素来回跳图，合出来是一层椒盐状的脏污。
@@ -12,8 +13,9 @@
 
 **融合在全分辨率上进行**（2600 万像素也照做），所以内存不能靠缩图来省，改用两条纪律压住峰值：
 
-* 单应矩阵是**等比缩放不变**的：配准在缩小的图上算（快、特征点少），算出的矩阵原样用在原图上，
-  结果与在原图上配准等价。所以配准图是缩小的，融合图是原尺寸。
+* 配准在缩小的图上算（快、特征点少），融合图是原尺寸。单应矩阵按像素坐标定义，**不随
+  图像缩放自动等价**：缩图上求出的矩阵必须按 scale 换算回原图坐标系才能用（见
+  _to_full_resolution）——直接套用会少移动一个 scale 倍，等于几乎没对齐。
 * 融合**分两条横向条带**做：清晰度打分一遍、按最优索引取像素一遍。任意时刻内存里只有
   一张原图 + 一张打分/索引图 + 一条带，不随张数线性增长。
 
@@ -24,7 +26,7 @@ import time
 import traceback
 
 # 配准用的工作分辨率。单应矩阵只要几十个可靠特征点就够，缩到几百万像素算得又快又稳；
-# 它是等比缩放的，把矩阵搬回原图不损失精度（缩放是解析的，不是二次估计）。
+# 算出的矩阵再按 scale 解析换算回原图坐标系（换算无损，只是坐标变换）。
 ALIGN_PIXELS = 3_000_000
 # 融合时的条带高度（像素）。条带越小峰值内存越低，但 warp 调用次数越多。
 STRIP_ROWS = 512
@@ -41,6 +43,12 @@ STRIP_ROWS = 512
 SCORE_SIGMA_RATIO = 1.0 / 390.0
 # 缩略图级别的小图下不至于把邻域压到近乎没有。
 SCORE_SIGMA_MIN = 4.0
+# 打分结果的定点放大倍数。平滑后的拉普拉斯在暗光、低反差的样张上常常只有 1~3，直接
+# 截成整数会把小数部分（乃至整个值）抹成 0：实测这组样张参考帧的均值 1.7、其余样张
+# 一律被截到 1.0 上下，等于「哪张更锐」这个比较在暗部直接废掉——更暗的样张上 1/8 以上
+# 的像素变成 0 分、无条件落到参考帧。放大 16 倍后量化步长 1/16 对选择已无影响，而
+# 16 × 2040 仍在 uint16 范围内，索引图的内存开销一点没涨。
+SCORE_SCALE = 16.0
 # 打分时的上下 halo 行数 = 这个系数 × σ。高斯核在 OpenCV 里按 4σ 取半径，条带四周必须
 # 多取这么多真实邻行，否则条带上下沿只能靠反射填充补邻域，每 STRIP_ROWS 行会留一道
 # 横向接缝（实测无 halo 时条带边界行的跳图率是别处的 1.75 倍）。
@@ -86,15 +94,34 @@ def _load(path):
     return image
 
 
-def _size_of(path):
-    """只取尺寸，不解码整幅：用 PIL 的惰性读取对 2600 万像素图几乎瞬时。"""
+def _global_sharpness(image):
+    """整幅清晰度，与融合打分同一口径：拉普拉斯绝对值的高斯平滑均值。
+
+    只用来**选参考帧**：参考帧是唯一不参与重采样的样张（其余都要 warp），打分时天然多
+    占一档便宜，所以它必须是全批里本身最锐的那张——否则整幅合成图的基准就被钉在一张
+    虚焦的中间帧上，后面无论怎么选像素都补不回来（实测中间帧比最锐帧软 19%，结果是
+    最锐帧明显更清楚的被子区只有 17% 的像素取自它）。
+    """
+    import cv2
+    import numpy
+
+    lap = numpy.absolute(cv2.Laplacian(_gray(image), cv2.CV_32F))
+    return float(cv2.GaussianBlur(lap, (0, 0), _score_window(image.shape[1])[0]).mean())
+
+
+def _probe(path):
+    """廉价探一次：只解 1/8 缩图，同时拿到尺寸与整幅清晰度。
+
+    cv2 没有「只读尺寸」的接口，1/8 缩图的解码代价对 2600 万像素图来说可以接受（每张
+    只做一次）。清晰度顺带同一张缩图上算：选参考帧要用它，而参考帧必须在配准之前定下来，
+    所以这趟探测省不掉。
+    """
     import cv2
 
-    # cv2 没有「只读尺寸」的接口；这一处用 imread 拿尺寸的代价是可接受的（每张只做一次）。
     image = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_8)
     if image is None:
         raise RuntimeError("读不出图像（格式不支持、文件损坏或路径不存在）")
-    return image.shape[1] * 8, image.shape[0] * 8
+    return image.shape[1] * 8, image.shape[0] * 8, _global_sharpness(image)
 
 
 def _detector():
@@ -139,6 +166,31 @@ def _homography(detector, norm, reference_gray, moving_gray):
     return matrix, inliers, len(good)
 
 
+def _to_full_resolution(matrix, scale):
+    """把在配准缩图上求出的单应矩阵换算到原图坐标系。
+
+    单应矩阵是按**像素坐标**定义的，并不等比缩放不变：在 0.34 倍的配准图上求得的平移
+    量原样套到原图上会缩小 2.94 倍。实测参考帧与第 2 张的真实平移是全图 (-13.1, -8.3)
+    像素，而配准矩阵直接套用只剩 (-2.9, -1.7)——约等于没对齐，正是被子薄结构上「双重
+    轮廓」鬼影的来源。
+
+    缩图与原图之间是同一个缩放因子，所以换算是解析的、不损失精度：
+    H_原图 = S · H_配准 · S⁻¹，其中 S = diag(1/scale, 1/scale, 1)。
+    """
+    import numpy
+
+    if scale >= 1.0:                     # 原图本来就够小，配准就发生在原尺寸上
+        return matrix
+    expand = 1.0 / scale
+    forward = numpy.array([[expand, 0.0, 0.0],
+                           [0.0, expand, 0.0],
+                           [0.0, 0.0, 1.0]])
+    backward = numpy.array([[scale, 0.0, 0.0],
+                            [0.0, scale, 0.0],
+                            [0.0, 0.0, 1.0]])
+    return forward.dot(matrix).dot(backward)
+
+
 def _shifted(matrix, y0):
     """把「源 → 参考帧」的单应矩阵平移，得到「源 → 参考帧第 y0 行起的条带」。"""
     import numpy
@@ -167,16 +219,18 @@ def _score_window(width):
 def _score_strip(strip, sigma):
     """一条带（含上下 halo）的逐像素清晰度：拉普拉斯绝对值的局部平滑，压成 uint16。
 
-    灰度差分的绝对值上限约 2040（8 邻域拉普拉斯 × 255），uint16 装得下，量化损失可忽略。
     σ 决定「取哪一张」这个决定在多大的邻域上保持一致，是压掉椒盐状脏污的关键（见
     SCORE_SIGMA_RATIO）。传入的条带要带 halo，调用方打分后再把 halo 裁掉。
+
+    存 uint16 前先乘 SCORE_SCALE：不是因为灰度差分超范围（上限约 2040，uint16 装得下），
+    而是平滑之后暗部的值只有 1~3，不放大就会被整数截断抹掉——详见 SCORE_SCALE。
     """
     import cv2
     import numpy
 
     lap = numpy.absolute(cv2.Laplacian(_gray(strip), cv2.CV_32F))
     smoothed = cv2.GaussianBlur(lap, (0, 0), sigma)
-    return numpy.clip(smoothed, 0.0, 65535.0).astype(numpy.uint16)
+    return numpy.clip(smoothed * SCORE_SCALE, 0.0, 65535.0).astype(numpy.uint16)
 
 
 def _fuse(paths, matrices, width, height, note):
@@ -286,23 +340,32 @@ def stack(paths, progress=None):
     import math
     import numpy
 
-    # ── 参考帧（中间那张）与配准比例 ──
-    # 先做一遍「读得出吗」的廉价探测：_size_of 只解 1/8 缩图，不解全图。
-    # 这一步只用来筛掉坏文件、定下参考帧，不把整批图抱在内存里。
+    # ── 参考帧（最锐那张）与配准比例 ──
+    # 先做一遍「读得出吗」的廉价探测：_probe 只解 1/8 缩图，不解全图，顺带量出每张的
+    # 整幅清晰度（选参考帧要用）。这一步既筛掉坏文件、又定下参考帧，不把整批图抱在内存里。
     readable = []
+    sizes = []
+    sharpness = []
     for path in used:
         try:
-            _size_of(path)
+            width, height, score = _probe(path)
         except Exception as error:
             lines.append("跳过 %s：%s" % (_basename(path), _one_line(error)))
             continue
         readable.append(path)
+        sizes.append((width, height))
+        sharpness.append(score)
     if len(readable) < 2:
         raise RuntimeError("可用的照片不足 2 张，无法合成。\n" + "\n".join(lines))
 
-    # 参考帧取中间那张——前后景的位移都最小，warp 后越界最少。
-    reference = len(readable) // 2
-    full_width, full_height = _size_of(readable[reference])
+    # 参考帧取**本身最锐**的那张，而不是位置居中的那张。参考帧不用重采样（其余样张都要
+    # warp 到它的坐标系里），打分时天然多占一档便宜，所以它得是全批底子最好的那张；若钉
+    # 在中间帧上，整幅合成图的基准就被锁死在中间帧的虚实上（见 _global_sharpness）。
+    # 越界风险仍在：远离参考帧的样张 warp 后越界更多，由 BORDER_REPLICATE 兜住。
+    reference = int(numpy.argmax(sharpness))
+    full_width, full_height = sizes[reference]
+    lines.append("参考帧取 %s（整批中最锐，清晰度 %.3f）。"
+                 % (_basename(readable[reference]), sharpness[reference]))
     scale = min(1.0, math.sqrt(ALIGN_PIXELS / float(full_width * full_height)))
     align_size = (max(1, int(round(full_width * scale))),
                   max(1, int(round(full_height * scale))))
@@ -350,6 +413,11 @@ def stack(paths, progress=None):
 
     # 参考帧的灰度缩图用完就放掉，进融合前把峰值让出来。
     del reference_gray
+
+    # 上面的矩阵是在配准缩图（约 0.34 倍）的像素坐标里求的，融合在全分辨率上进行，
+    # 必须换算到原图坐标系才能用——单应矩阵不随图像缩放自动等价（见 _to_full_resolution）。
+    # 参考帧是单位矩阵，原图坐标系里也是单位矩阵，不动。
+    matrices = [matrices[0]] + [_to_full_resolution(matrix, scale) for matrix in matrices[1:]]
 
     if len(paths_ok) < 2:
         raise RuntimeError("配准后只剩 1 张可用，无法合成。\n" + "\n".join(lines))
