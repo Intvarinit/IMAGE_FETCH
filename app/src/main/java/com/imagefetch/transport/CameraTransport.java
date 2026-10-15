@@ -181,6 +181,16 @@ public interface CameraTransport extends Closeable {
     }
 
     /**
+     * 读一个厂商属性允许值列表的**原始字节**（只读）。给「列表项不是固定 4 字节 u16」的属性用：
+     * 画质 {@code 0xD120 EOS_ImageFormat} 的每一项是变长 u32 序列，只能拿原始字节交给
+     * {@link com.imagefetch.ptp.CanonImageQuality} 解析；相机本次会话没上报过该列表时返回
+     * {@code null}（不支持的传输实现保持默认）。
+     */
+    default byte[] readVendorPropertyEnumsRaw(int propertyCode) throws Exception {
+        return null;
+    }
+
+    /**
      * 整体回写一个厂商属性的值区域（会真的写相机）。返回相机响应码。
      */
     default int writeVendorPropertyBlock(int propertyCode, byte[] block) throws Exception {

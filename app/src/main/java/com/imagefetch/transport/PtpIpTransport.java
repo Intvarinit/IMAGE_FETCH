@@ -13,6 +13,7 @@ package com.imagefetch.transport;
 
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CanonImageQuality;
 import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.StorageBrowser;
@@ -950,7 +951,7 @@ public final class PtpIpTransport implements CameraTransport {
             }
             // 顺手把这一块里的 0xC189/0xC18A 事件收进缓存：0xD1xx 属性的当前值与允许值列表
             // 只能从这里攒（见 harvestEosEventBlock）。
-            harvestEosEventBlock(block, canonPropValues, canonPropEnums, canonPropRaw);
+            harvestEosEventBlock(block, canonPropValues, canonPropEnums, canonPropRaw, canonPropEnumRaw);
             if (isEmptyEosEventBlock(block)) return null;
         }
         // 撞上限说明事件还在往外冒，队列**没排干净**。这里必须报出来：返回 null 会被上层
@@ -985,7 +986,7 @@ public final class PtpIpTransport implements CameraTransport {
                 // 队列已空（相机回纯 ResponseOK）：本轮没读到按钮事件。
                 return null;
             }
-            harvestEosEventBlock(block, canonPropValues, canonPropEnums, canonPropRaw);
+            harvestEosEventBlock(block, canonPropValues, canonPropEnums, canonPropRaw, canonPropEnumRaw);
             if (block.length < 8) return null;
             Integer button = parseButtonEvent(block);
             if (button != null) return button;
@@ -1013,20 +1014,26 @@ public final class PtpIpTransport implements CameraTransport {
      *
      * <p>只关心两类：{@code 0xC189} 属性当前值（收进 {@code values}，同时把原始字节原样收进
      * {@code raw}）与 {@code 0xC18A} 属性允许值列表（收进 {@code enums}，仅 {@code propxtype==3}
-     * 的枚举）。相机积攒很久的事件块里会混着属性描述等其它记录，逐个跳过即可。终止条件与
-     * libgphoto2 对齐：记录头不足 8 字节、{@code size==8 && code==0}（相机的「没有更多事件」
-     * 标记，ptp-pack.c:1881）、或声明长度越界，都立刻停止而不报错——截断/未知记录一律忽略。
+     * 的枚举；同时把列表的原始字节原样收进 {@code enumRaw}）。相机积攒很久的事件块里会混着
+     * 属性描述等其它记录，逐个跳过即可。终止条件与 libgphoto2 对齐：记录头不足 8 字节、
+     * {@code size==8 && code==0}（相机的「没有更多事件」标记，ptp-pack.c:1881）、或声明长度越界，
+     * 都立刻停止而不报错——截断/未知记录一律忽略。
      *
      * <p>{@code raw} 是给能力探测用的：{@code 0xD134}/{@code 0xD13D} 的当前值在 EOS RP 上是
      * 24 字节的不透明区域，{@code long} 装不下，必须原样留字节。
      *
-     * <p>做成 {@code static} 且只操作传入的三个 Map，便于脱离 socket 单测（见 EosEventHarvestTest）。
+     * <p>{@code enumRaw} 是给画质（{@code 0xD120}）用的：它的允许值列表项不是「每项 4 字节的
+     * u16」，而是变长 u32 序列，{@code propEnumOf} 解出来的 {@code int[]} 是错的，只能留原始
+     * 字节给 {@link com.imagefetch.ptp.CanonImageQuality} 解析。
+     *
+     * <p>做成 {@code static} 且只操作传入的四个 Map，便于脱离 socket 单测（见 EosEventHarvestTest）。
      */
     static void harvestEosEventBlock(
             byte[] block,
             Map<Integer, Long> values,
             Map<Integer, int[]> enums,
-            Map<Integer, byte[]> raw) {
+            Map<Integer, byte[]> raw,
+            Map<Integer, byte[]> enumRaw) {
         if (block == null) return;
         int offset = 0;
         while (offset + 8 <= block.length) {
@@ -1044,11 +1051,50 @@ public final class PtpIpTransport implements CameraTransport {
                 }
             } else if (code == CANON_EVENT_AVAIL_LIST_CHANGED) {
                 int property = recordProperty(block, offset, recordSize);
-                int[] allowed = propEnumOf(block, offset, recordSize);
-                if (property >= 0 && allowed != null) enums.put(property, allowed);
+                // 只有 propxtype==3 才是「允许值枚举」；1/7 等其它类型（属性描述）不是列表，
+                // 提前判掉，免得把描述块当成允许值收进来。
+                if (property >= 0 && propxtypeOf(block, offset, recordSize) == CANON_PROPX_TYPE_ENUM) {
+                    byte[] region = propEnumRawOf(block, offset, recordSize);
+                    if (region != null) enumRaw.put(property, region);
+                    // 画质（0xD120）那一族的列表项是变长 u32 序列，按 stride 取 u16 会解出
+                    // n/type 之类的垃圾值——只留原始字节，不往 enums 里塞错表。
+                    if (!isImageFormat(property)) {
+                        int[] allowed = propEnumOf(block, offset, recordSize);
+                        if (allowed != null) enums.put(property, allowed);
+                    }
+                }
             }
             offset += recordSize;
         }
+    }
+
+    /** 画质一族（{@code 0xD120–0xD123}）：值区域是变长 u32 序列，不能用通用枚举解析。 */
+    private static boolean isImageFormat(int propertyCode) {
+        return propertyCode == CanonImageQuality.IMAGE_FORMAT
+                || propertyCode == CanonImageQuality.IMAGE_FORMAT_CF
+                || propertyCode == CanonImageQuality.IMAGE_FORMAT_SD
+                || propertyCode == CanonImageQuality.IMAGE_FORMAT_EXT;
+    }
+
+    /**
+     * 0xC18A 记录的性质字段 {@code propxtype}（payload +0x0c）。{@code 3} 才是枚举；
+     * 1/7 等是属性描述，不是值列表。记录太短返回 -1。
+     */
+    private static long propxtypeOf(byte[] block, int offset, int size) {
+        return size >= 0x10 ? u32(block, offset + 0x0c) : -1;
+    }
+
+    /**
+     * {@code 0xC18A} 记录里允许值列表的**原始字节**（payload +0x14 到记录末尾）。
+     * 给画质（{@code 0xD120}）用：它的列表项是变长 u32 序列而不是 4 字节 u16，
+     * 只能原样留字节给 {@link com.imagefetch.ptp.CanonImageQuality} 解析。
+     * 记录里没有列表区域（不长于 0x14）时返回 {@code null}。
+     */
+    private static byte[] propEnumRawOf(byte[] block, int offset, int size) {
+        if (size <= 0x14) return null;
+        byte[] region = new byte[size - 0x14];
+        System.arraycopy(block, offset + 0x14, region, 0, region.length);
+        return region;
     }
 
     /** TLV 记录里的属性码（payload +0x08）；记录太短返回 -1。 */
@@ -1339,6 +1385,13 @@ public final class PtpIpTransport implements CameraTransport {
      * 不透明区域——能力探测（P0）需要原样字节，故单独存一份。同样只在 synchronized 方法里读写。
      */
     private final Map<Integer, byte[]> canonPropRaw = new LinkedHashMap<>();
+    /**
+     * 事件缓存：{@code 0xC18A} 推来的允许值列表的**原始字节**（属性码 → 列表区域）。
+     * {@code canonPropEnums} 只存「每项 4 字节 u16」那一族的解析结果；画质（{@code 0xD120}）
+     * 的列表项是变长 u32 序列，装不进 {@code int[]}，只能留原始字节给
+     * {@link com.imagefetch.ptp.CanonImageQuality} 解析。只在 synchronized 方法里读写。
+     */
+    private final Map<Integer, byte[]> canonPropEnumRaw = new LinkedHashMap<>();
     /** 最近一帧取景载荷里上报的感光器分辨率（宽, 高）；没上报过为 null。 */
     private int[] lvSensorSize;
     /** 最近一帧取景载荷里出现的 TLV 段类型（诊断用，只增不减）。 */
@@ -1754,6 +1807,25 @@ public final class PtpIpTransport implements CameraTransport {
         ensureConnected();
         ensureCanonRemoteMode();
         return readCanonPropertyRaw(propertyCode, false);
+    }
+
+    /**
+     * 读一个厂商属性允许值列表的**原始字节**（只读，来自 {@code 0xC18A} 事件缓存）。
+     *
+     * <p><b>为什么不在这里做 {@code 0x9127} 催读</b>：允许值列表不像当前值那样可以被
+     * {@code 0x9127 RequestDevicePropValue} 催出来——它只在 {@code SetEventMode(1)} 之后的
+     * 初始事件灌流（以及机身设置变化时）推一次。缓存为空就是「这次会话相机没给过」，
+     * 再催一轮也只会白等，所以直接返回 {@code null} 让上层降级。
+     *
+     * @param propertyCode 见 {@link com.imagefetch.ptp.VendorProperty}
+     */
+    @Override
+    public synchronized byte[] readVendorPropertyEnumsRaw(int propertyCode) throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        drainEosEvents();
+        byte[] cached = canonPropEnumRaw.get(propertyCode);
+        return cached == null || cached.length == 0 ? null : cached.clone();
     }
 
     /**

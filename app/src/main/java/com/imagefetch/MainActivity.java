@@ -39,6 +39,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.GridView;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -53,6 +54,7 @@ import com.imagefetch.capture.FocusStackBatch;
 import com.imagefetch.capture.HdrPlan;
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CanonImageQuality;
 import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.VendorProperty;
@@ -73,6 +75,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -95,6 +99,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final String PREF_CAMERA_SSID = "camera_ssid";
     private static final String PREF_CAMERA_PASSWORD = "camera_password";
     private static final String PREF_LIVE_VIEW_SIZE = "live_view_size";
+    /** 机身参数基线快照（{@link VendorPropertySnapshot#toText()} 的文本）；空串表示没有基线。 */
+    private static final String PREF_PROPERTY_BASELINE = "property_baseline";
     private static final int[] PAGE_SIZE_OPTIONS = {20, 50, 100};
     private static final int DEFAULT_PAGE_SIZE = PAGE_SIZE_OPTIONS[0];
 
@@ -223,6 +229,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private VendorPropertySnapshot diffBaseline;
     /** 下一次快照回调是「取基线」还是「对比」——回调本身分不清这两件事。 */
     private boolean snapshotIsBaseline;
+    /** 下一次快照回调是为了「恢复基线」前的差异统计（数出将写回几个属性）。 */
+    private boolean awaitingRestoreCount;
     private ImageView liveViewImage;
     /** 取景预览容器：只靠它给画面定高，让方框覆盖层与 ImageView 等大叠放。 */
     private FrameLayout liveViewFrame;
@@ -247,11 +255,34 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
      * 用户选择又写回相机。
      */
     private int lastAppliedAfValue;
+    /** 画质（0xD120）下拉框；面板关闭后置空。 */
+    private Spinner imageQualitySpinner;
+    /** 画质下拉框各项（与相机给的选项同序，带显示名与写回用原始字节）；未读到时为 null。 */
+    private List<CanonImageQuality.Option> imageQualityOptions;
+    /** 相机当前画质是否会产生 JPEG；未知时为 true（不能因为读不到就把快门拦下）。 */
+    private boolean imageQualityCurrentHasJpeg = true;
+    /**
+     * 下拉框当前由程序设定的画质选项下标。-1 表示未设定。用来区分「程序填充」与「用户点选」，
+     * 写法与 {@link #lastAppliedAfValue} 一致（选中回调可能是 setAdapter/setSelection 之后才到）。
+     */
+    private int lastAppliedImageQualityIndex = -1;
+    /** 画质不含 JPG 时的琥珀色警告行；面板关闭后置空。 */
+    private TextView imageQualityWarnView;
+    /** 对焦包围批次进度行；面板关闭后置空。 */
+    private TextView stackProgressView;
+    /** 对焦包围批次单张预览；面板关闭后置空。 */
+    private ImageView stackPreviewView;
+    /** 对焦包围预览缩略图（面板关闭后回收）。 */
+    private Bitmap stackPreviewBitmap;
+    /** 缩略图解码线程池：单线程串行下采样解码，绝不把整图读进 Java 堆。 */
+    private final ExecutorService thumbnailExecutor = Executors.newSingleThreadExecutor();
     private final List<ExposureRow> exposureRows = new ArrayList<>();
     /** 当前显示的取景帧；换帧后延迟回收，避免渲染线程仍在读它。 */
     private Bitmap liveViewBitmap;
     /** 拍摄取回进行中：面板上的快门按钮据此防重复触发。 */
     private boolean captureRunning;
+    /** 「切到含 JPG 的画质并继续」这条路上，等画质写入成功后再跑的真正拍摄。 */
+    private Runnable pendingShootAfterQualityWrite;
     /** 曝光写入的合并窗口：连点 −/+ 只把最终值发给相机一次。 */
     private static final long EXPOSURE_WRITE_DEBOUNCE_MS = 250L;
     private final Handler deferredRecycle = new Handler(Looper.getMainLooper());
@@ -310,6 +341,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
         // 开关与每页张数在本次启动前先恢复，再挂监听（避免恢复动作自身触发写盘）。
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        // 上次的机身参数基线快照（若存过）：重开 App 后仍能直接对比/恢复。
+        diffBaseline = VendorPropertySnapshot.fromText(
+                preferences.getString(PREF_PROPERTY_BASELINE, null));
         pickWifiButton.setOnClickListener(view -> openWifiPicker());
         boolean export = preferences.getBoolean(PREF_EXPORT_TO_GALLERY, true);
         int configuredPageSize = preferences.getInt(PREF_PAGE_SIZE, DEFAULT_PAGE_SIZE);
@@ -576,6 +610,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureAutofocusButton = content.findViewById(R.id.captureAutofocus);
         liveViewSizeSpinner = content.findViewById(R.id.liveViewSize);
         afModeSpinner = content.findViewById(R.id.afMode);
+        imageQualitySpinner = content.findViewById(R.id.imageQuality);
+        imageQualityWarnView = content.findViewById(R.id.imageQualityWarn);
+        stackProgressView = content.findViewById(R.id.stackProgress);
+        stackPreviewView = content.findViewById(R.id.stackPreview);
         captureShotsField = content.findViewById(R.id.captureShots);
         captureShotsField.setText(String.valueOf(expectedShots));
 
@@ -614,6 +652,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         });
         setUpLiveViewSizeSpinner();
         setUpAfModeSpinner();
+        setUpImageQualitySpinner();
 
         captureDialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.capture_panel_title)
@@ -627,6 +666,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         // 排在后面会让参数迟迟显示不出来。
         for (ExposureRow row : exposureRows) coordinator.readExposure(row.setting);
         coordinator.readFocusArea();
+        coordinator.readImageQuality();
         coordinator.startLiveView();
     }
 
@@ -652,9 +692,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         captureAutofocusButton = null;
         liveViewSizeSpinner = null;
         afModeSpinner = null;
+        imageQualitySpinner = null;
+        imageQualityOptions = null;
+        imageQualityWarnView = null;
+        lastAppliedImageQualityIndex = -1;
+        imageQualityCurrentHasJpeg = true;
         captureShotsField = null;
         afModeValues = null;
         lastAppliedAfValue = 0;
+        pendingShootAfterQualityWrite = null;
+        resetStackProgressUi();
         exposureRows.clear();
         // 先撤掉延迟回收任务，再回收当前帧；被撤掉的旧帧交给 GC 即可。
         deferredRecycle.removeCallbacksAndMessages(null);
@@ -773,6 +820,83 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     /**
+     * 画质（{@code 0xD120}）下拉框：选项来自相机上报的允许列表（读完才填），切换后写回 0xD120。
+     * 与「对焦方式」不同，这里<b>不发明候选值</b>——写错画质会改变相机的存储行为，比留空更糟。
+     */
+    private void setUpImageQualitySpinner() {
+        if (imageQualitySpinner == null) return;
+        setImageQualityPlaceholder(getString(R.string.live_view_starting));
+        imageQualitySpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (imageQualityOptions == null) return;
+                if (position < 0 || position >= imageQualityOptions.size()) return;
+                // 与程序当前设定一致说明只是填充/重复选中，不需要写回相机。
+                if (position == lastAppliedImageQualityIndex) return;
+                // 直接把选项的原始字节交给相机，不按下标让协调器重查允许列表：
+                // 两次读取之间列表/当前值可能变化，下标会错位到别的画质上。
+                CanonImageQuality.Option option = imageQualityOptions.get(position);
+                // 这里不推进 lastAppliedImageQualityIndex：写入还没定论，提前推进会让
+                // 「失败后重选同一项」被上面的早退忽略，用户无法原地重试。
+                coordinator.writeImageQualityRaw(option.raw, option.label);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
+    /** 用相机给的画质列表填充下拉框；{@code selectedIndex} 为当前值下标。 */
+    private void setImageQualityItems(List<CanonImageQuality.Option> options, int selectedIndex) {
+        if (imageQualitySpinner == null) return;
+        imageQualityOptions = options;
+        String[] labels = new String[options.size()];
+        for (int i = 0; i < options.size(); i++) labels[i] = options.get(i).label;
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        imageQualitySpinner.setAdapter(adapter);
+        int selected = (selectedIndex >= 0 && selectedIndex < options.size()) ? selectedIndex : 0;
+        imageQualitySpinner.setSelection(selected);
+        lastAppliedImageQualityIndex = selected;
+    }
+
+    /** 画质下拉框占位/不可用项（此时不设 imageQualityOptions，选中回调会直接忽略）。 */
+    private void setImageQualityPlaceholder(String label) {
+        if (imageQualitySpinner == null) return;
+        imageQualityOptions = null;
+        lastAppliedImageQualityIndex = -1;
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, new String[]{label});
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        imageQualitySpinner.setAdapter(adapter);
+    }
+
+    /** 按当前画质是否含 JPG 切换琥珀色警告行的可见性。 */
+    private void updateImageQualityWarn(boolean hasJpeg) {
+        if (imageQualityWarnView != null) {
+            imageQualityWarnView.setVisibility(hasJpeg ? View.GONE : View.VISIBLE);
+        }
+    }
+
+    /** 复位对焦包围进度与预览（开拍、关面板时都要做，避免上一批的残影）。 */
+    private void resetStackProgressUi() {
+        if (stackProgressView != null) {
+            stackProgressView.setVisibility(View.GONE);
+            stackProgressView.setText("");
+        }
+        if (stackPreviewView != null) {
+            stackPreviewView.setVisibility(View.GONE);
+            stackPreviewView.setImageDrawable(null);
+        }
+        if (stackPreviewBitmap != null && !stackPreviewBitmap.isRecycled()) {
+            stackPreviewBitmap.recycle();
+        }
+        stackPreviewBitmap = null;
+    }
+
+    /**
      * 0xD1BA 取值的中文标签，下标即机型编码。<br>
      * 取值名表取自 libgphoto2 {@code camlibs/ptp2/config.c:2977-2994 canon_eos_afmethod}
      * （0..14，配置项名 {@code "AF Method"}，config.c:12231），括号里保留该表的原始 token
@@ -878,6 +1002,48 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         if (captureRunning) return;
         // 先把张数读出来并记住：机内包围一次快门出多张，之后的收集要按这个数等。
         expectedShots = readExpectedShots();
+        // 画质不含 JPG 时先给一次前置提示（可一键切到含 JPG 的画质）；读不到画质不拦。
+        ensureJpegCapableQualityThen(this::startPanelCapture);
+    }
+
+    /**
+     * 画质不含 JPG 时的前置闸门：先让用户选择「切到含 JPG 的画质再拍」或「仍按现状拍」。
+     * 读不到画质（相机未给列表）时不拦——不能因为读不到就让快门按不下去。这条闸门是唯一的开拍入口，
+     * 单张拍摄、对焦包围、以及对焦包围面板进入的拍摄（最终都汇到这里）都受它覆盖。
+     */
+    private void ensureJpegCapableQualityThen(Runnable shoot) {
+        if (imageQualityCurrentHasJpeg || imageQualityOptions == null) {
+            shoot.run();
+            return;
+        }
+        CanonImageQuality.Option fallback = CanonImageQuality.firstJpegOption(imageQualityOptions);
+        if (fallback == null) {
+            // 相机给的可选画质里一个含 JPG 的都没有：无从兜底，不强行拦下用户。
+            shoot.run();
+            return;
+        }
+        String message = getString(R.string.image_quality_switch_message, fallback.label);
+        if (expectedShots > 1) {
+            message = message + "\n\n" + getString(R.string.image_quality_switch_extra_stack);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.image_quality_switch_title)
+                .setMessage(message)
+                .setPositiveButton(
+                        getString(R.string.image_quality_switch_and_shoot, fallback.label),
+                        (dialog, which) -> {
+                            pendingShootAfterQualityWrite = shoot;
+                            coordinator.writeImageQualityRaw(fallback.raw, fallback.label);
+                        })
+                .setNeutralButton(R.string.image_quality_shoot_anyway,
+                        (dialog, which) -> shoot.run())
+                .setNegativeButton(R.string.close, null)
+                .show();
+    }
+
+    /** 真正发起一次拍摄取回（画质闸门通过后调用）。 */
+    private void startPanelCapture() {
+        resetStackProgressUi();
         // 多张（对焦包围/HDR 包围）这一批要留给景深合成：先开收集窗，并让协调器在导出相册后
         // 保留应用内副本——否则原图导出成功即被清理，合成就没得读了。
         // 张数 = 1 时顺带把上一批残留取走丢掉，免得旧文件被之后的下载路径误拿去合成。
@@ -1063,6 +1229,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         dismissCapturePanel();
         deferredRecycle.removeCallbacksAndMessages(null);
         debounceHandler.removeCallbacksAndMessages(null);
+        thumbnailExecutor.shutdownNow();
         recycleLiveViewBitmap();
         if (coordinator != null) coordinator.shutdown();
         // 退出应用即结束会话，前台服务随之停止。
@@ -1167,12 +1334,59 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             // 对焦包围批次逐张收拢，等这一批全部取回后再统一做景深合成（见 onCaptureFinished）。
             stackBatch.add(file);
+            // 包围期间取景是暂停的，这里给「已取回 N/M 张」与单张缩略图做可视反馈，缓解卡死观感。
+            updateStackProgress(file);
             setBusy(false);
             progressBar.setProgress(100);
             // note 必须带上：否则相册导出结果会被这条消息覆盖掉，用户无从判断。
             statusView.setText("已保存 " + file.getName() + " · " + bytes
                     + " 字节 · " + elapsedMillis + " ms" + (note == null ? "" : note));
         });
+    }
+
+    /** 包围批次逐张更新进度行与单张预览；单张拍摄（张数 = 1）不显示这两块。 */
+    private void updateStackProgress(File file) {
+        if (expectedShots <= 1) return;
+        if (stackProgressView != null) {
+            stackProgressView.setVisibility(View.VISIBLE);
+            stackProgressView.setText(
+                    getString(R.string.stack_progress_format, stackBatch.size(), expectedShots));
+        }
+        showStackPreview(file);
+    }
+
+    /** 后台下采样解码一张缩略图（目标宽约 320px，绝不整图进 Java 堆），再贴到预览位。 */
+    private void showStackPreview(File file) {
+        if (stackPreviewView == null) return;
+        thumbnailExecutor.submit(() -> {
+            Bitmap bitmap = decodeThumbnail(file);
+            runOnUiThread(() -> {
+                if (stackPreviewView == null) {
+                    if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+                    return;
+                }
+                if (bitmap == null) return;
+                Bitmap previous = stackPreviewBitmap;
+                stackPreviewBitmap = bitmap;
+                stackPreviewView.setVisibility(View.VISIBLE);
+                stackPreviewView.setImageBitmap(bitmap);
+                if (previous != null && !previous.isRecycled()) previous.recycle();
+            });
+        });
+    }
+
+    /** 按目标宽度下采样解码；文件不可读时返回 {@code null}（预览缺一张不影响拍摄）。 */
+    private static Bitmap decodeThumbnail(File file) {
+        final int targetWidth = 320;
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0) return null;
+        int sample = 1;
+        while (bounds.outWidth / (sample * 2) >= targetWidth) sample *= 2;
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sample;
+        return BitmapFactory.decodeFile(file.getAbsolutePath(), options);
     }
 
     @Override
@@ -1312,6 +1526,56 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     @Override
+    public void onImageQualityResult(
+            List<CanonImageQuality.Option> options, int currentIndex,
+            boolean currentHasJpeg, boolean fromCamera, String error) {
+        runOnUiThread(() -> {
+            if (imageQualitySpinner == null) return;
+            if (error != null || options == null || options.isEmpty()) {
+                setImageQualityPlaceholder(getString(R.string.image_quality_unavailable));
+                // 读不到就当作未知：当前是否含 JPG 无从判断，不显示警告、也不拦快门。
+                imageQualityCurrentHasJpeg = true;
+                updateImageQualityWarn(true);
+                if (error != null && liveViewStatusView != null) {
+                    liveViewStatusView.setText("读取画质失败：" + error);
+                }
+                return;
+            }
+            setImageQualityItems(options, currentIndex);
+            imageQualityCurrentHasJpeg = currentHasJpeg;
+            updateImageQualityWarn(currentHasJpeg);
+        });
+    }
+
+    @Override
+    public void onImageQualityWritten(boolean success, String label, String error) {
+        runOnUiThread(() -> {
+            if (success) {
+                if (liveViewStatusView != null) {
+                    liveViewStatusView.setText("画质已切换：" + (label == null ? "（未知）" : label));
+                }
+                // 回读一次让下拉框与相机真实当前值对齐：兜底路径的选项不在下拉框里，
+                // 只改警告会让 Spinner 停在旧值上（界面显示 RAW、警告却消失，自相矛盾）。
+                // 这次回读同时也把 lastAppliedImageQualityIndex 校正到相机实际值上。
+                coordinator.readImageQuality();
+                // 回读先提交、拍摄后提交：两者走同一个单线程 executor，顺序即执行顺序。
+                Runnable pending = pendingShootAfterQualityWrite;
+                if (pending != null) {
+                    pendingShootAfterQualityWrite = null;
+                    pending.run();
+                }
+                return;
+            }
+            // 写入失败：清掉挂起的拍摄，绝不「画质没切成还硬拍」。
+            pendingShootAfterQualityWrite = null;
+            if (liveViewStatusView != null) {
+                liveViewStatusView.setText("切换画质失败："
+                        + (error == null ? "相机未正常应答" : error));
+            }
+        });
+    }
+
+    @Override
     public void onCapabilityReport(CapabilityReport report, String error) {
         runOnUiThread(() -> {
             if (error != null || report == null) {
@@ -1333,11 +1597,25 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             if (snapshot == null) {
                 if (diffMessageView != null) diffMessageView.setText("快照失败：" + error);
+                awaitingRestoreCount = false;
                 return;
             }
-            if (diffMessageView == null) return;
+            if (diffMessageView == null) {
+                awaitingRestoreCount = false;
+                return;
+            }
+            // 「恢复基线」前的差异统计：数出将与基线不同的属性个数，再弹二次确认。
+            if (awaitingRestoreCount) {
+                awaitingRestoreCount = false;
+                showRestoreConfirm(countRestorable(snapshot, diffBaseline));
+                return;
+            }
             if (snapshotIsBaseline) {
                 diffBaseline = snapshot;
+                // 基线持久化：重开 App 后仍能对比/恢复（原始字节是恢复的唯一依据，必须存下）。
+                preferences.edit()
+                        .putString(PREF_PROPERTY_BASELINE, snapshot.toText())
+                        .apply();
                 diffMessageView.setText("基线已取：" + snapshot.size() + " 个属性。\n\n"
                         + "现在去机身上改一项设置（比如「对焦包围」或「间隔定时拍摄」），"
                         + "改完回到这里点「对比」。\n\n"
@@ -1368,8 +1646,18 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         diffMessageView.setText(diffBaseline == null
                 ? "还没有基线快照。\n\n顺序：先点「取基线快照」→ 去机身上改一项设置 → 回来点「对比」。"
                 : "已有一份基线快照（" + diffBaseline.size() + " 个属性）。改完机身设置后点「对比」。");
+        // 恢复入口做成内容区里的一颗按钮：AlertDialog 只有正/中/负三个按钮位，
+        // 取基线、对比已经占了两个，再挤进去一个就没法「关闭」了。
+        Button restoreButton = new Button(this);
+        restoreButton.setText(R.string.property_restore_to_camera);
+        restoreButton.setEnabled(diffBaseline != null);
+        restoreButton.setOnClickListener(view -> confirmRestoreBaseline());
+        LinearLayout contentBox = new LinearLayout(this);
+        contentBox.setOrientation(LinearLayout.VERTICAL);
+        contentBox.addView(diffMessageView);
+        contentBox.addView(restoreButton);
         ScrollView scroll = new ScrollView(this);
-        scroll.addView(diffMessageView);
+        scroll.addView(contentBox);
         diffDialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.property_diff_title)
                 .setView(scroll)
@@ -1394,6 +1682,67 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             diffMessageView = null;
         });
         diffDialog.show();
+    }
+
+    /**
+     * 「恢复基线到相机」的二次确认：先取一次当前快照，数出与基线不同的属性个数再让用户确认。
+     * 不做「一键无声写回」——写错机身参数比多确认一次麻烦得多。
+     */
+    private void confirmRestoreBaseline() {
+        if (diffBaseline == null) {
+            if (diffMessageView != null) diffMessageView.setText(R.string.property_restore_none);
+            return;
+        }
+        if (coordinator == null || !coordinator.isConnected()) {
+            if (diffMessageView != null) diffMessageView.setText("请先连接相机，再恢复基线。");
+            return;
+        }
+        awaitingRestoreCount = true;
+        if (diffMessageView != null) diffMessageView.setText("正在取当前快照，统计与基线的差异…");
+        coordinator.snapshotVendorProperties();
+    }
+
+    /** 差异统计回来后弹确认框；用户确认才真正调用协调器写回。 */
+    private void showRestoreConfirm(int changedCount) {
+        if (diffMessageView == null) return;
+        if (changedCount <= 0) {
+            diffMessageView.setText(R.string.property_restore_none);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.property_restore_confirm_title)
+                .setMessage(getString(R.string.property_restore_confirm_message, changedCount))
+                .setPositiveButton(R.string.property_restore_to_camera, (dialog, which) -> {
+                    if (diffMessageView != null) diffMessageView.setText("正在把基线写回相机…");
+                    coordinator.restoreVendorProperties(diffBaseline);
+                })
+                .setNegativeButton(R.string.close, null)
+                .show();
+    }
+
+    /** 与基线确实不同的属性个数（只算有原始字节、能写回的项），与协调器的写回口径一致。 */
+    private static int countRestorable(VendorPropertySnapshot current, VendorPropertySnapshot baseline) {
+        if (current == null || baseline == null) return 0;
+        int count = 0;
+        for (VendorPropertySnapshot.Diff diff : current.diff(baseline)) {
+            if (diff.kind == VendorPropertySnapshot.Diff.CHANGED
+                    && diff.before != null && diff.before.hasRaw()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Override
+    public void onVendorPropertyRestoreFinished(int total, int written, String failedCodes) {
+        runOnUiThread(() -> {
+            String message = getString(R.string.property_restore_done, written, total);
+            if (failedCodes != null && !failedCodes.isEmpty()) {
+                message = message + "\n\n" + getString(R.string.property_restore_failed, failedCodes);
+            }
+            if (diffMessageView != null) diffMessageView.setText(message);
+            statusView.setText(message.replace('\n', ' '));
+        });
     }
 
     /**
@@ -2475,8 +2824,18 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             FocusStackBatch.Batch batch = stackBatch.consume();
             coordinator.setRetainLocalCopiesForStack(false);
             if (batch.appInitiated() && batch.files().size() >= FocusStackBatch.MIN_SHOTS) {
+                if (stackProgressView != null) {
+                    stackProgressView.setVisibility(View.VISIBLE);
+                    stackProgressView.setText(
+                            getString(R.string.stack_progress_done, batch.files().size()));
+                }
                 startFocusStack(batch.files());
             } else if (batch.appInitiated() && !batch.files().isEmpty()) {
+                if (stackProgressView != null) {
+                    stackProgressView.setVisibility(View.VISIBLE);
+                    stackProgressView.setText(
+                            getString(R.string.stack_progress_short, batch.files().size()));
+                }
                 statusView.setText("本批只取回 " + batch.files().size() + " 张，不足以做景深合成（至少 "
                         + FocusStackBatch.MIN_SHOTS + " 张）。");
             }

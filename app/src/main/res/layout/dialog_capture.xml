@@ -100,6 +100,29 @@
             android:minWidth="120dp" />
     </LinearLayout>
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="52dp"
+            android:layout_height="wrap_content"
+            android:text="@string/image_quality_label"
+            android:textColor="@color/ink"
+            android:textSize="13sp" />
+
+        <Spinner
+            android:id="@+id/imageQuality"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:contentDescription="@string/image_quality_label"
+            android:minWidth="120dp" />
+    </LinearLayout>
+
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -107,6 +130,24 @@
         android:text="@string/exposure_hint"
         android:textColor="#6B7280"
         android:textSize="11sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="@string/image_quality_hint"
+        android:textColor="#6B7280"
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/imageQualityWarn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="@string/image_quality_warn_raw_only"
+        android:textColor="#B45309"
+        android:textSize="11sp"
+        android:visibility="gone" />
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -171,6 +212,24 @@
         android:text="@string/capture_shots_hint"
         android:textColor="#6B7280"
         android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/stackProgress"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textColor="@color/ink"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
+    <ImageView
+        android:id="@+id/stackPreview"
+        android:layout_width="match_parent"
+        android:layout_height="96dp"
+        android:layout_marginTop="6dp"
+        android:contentDescription="@string/stack_preview_hint"
+        android:scaleType="centerCrop"
+        android:visibility="gone" />
 
     <Button
         android:id="@+id/captureShoot"

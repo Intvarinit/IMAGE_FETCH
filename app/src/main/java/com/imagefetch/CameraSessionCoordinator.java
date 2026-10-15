@@ -23,6 +23,7 @@ import com.imagefetch.capture.CaptureWaitPolicy;
 import com.imagefetch.ptp.AfMethodChoices;
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
+import com.imagefetch.ptp.CanonImageQuality;
 import com.imagefetch.ptp.CapabilityReport;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.PtpOperationService;
@@ -181,6 +182,31 @@ public final class CameraSessionCoordinator {
         }
 
         /**
+         * 画质（{@code 0xD120}）下拉框内容：{@code options} 为可选画质（保持相机给的顺序，
+         * 每项带显示名与写回用的原始字节），{@code currentIndex} 为当前值在其中的下标（未知为 -1），
+         * {@code currentHasJpeg} 表示当前画质是否会在卡上产生 JPEG，{@code fromCamera} 表示列表是否
+         * 来自相机上报；相机没给列表时 {@code options} 为 null（界面显示不可用占位，不去发明候选值）。
+         */
+        default void onImageQualityResult(
+                List<CanonImageQuality.Option> options, int currentIndex,
+                boolean currentHasJpeg, boolean fromCamera, String error) {
+        }
+
+        /**
+         * 画质写入结果：{@code success} 为真时相机受理了（响应码 {@code 0x2001}），
+         * {@code label} 是写入的选项名（可能为 null），失败时 {@code error} 为原因。
+         */
+        default void onImageQualityWritten(boolean success, String label, String error) {
+        }
+
+        /**
+         * 「恢复机身参数到基线」的结果：{@code total} 是需要写回的属性数（仅算确实与基线不同的），
+         * {@code written} 是其中写成功的个数，{@code failedCodes} 是失败属性码的清单（空串表示全成功）。
+         */
+        default void onVendorPropertyRestoreFinished(int total, int written, String failedCodes) {
+        }
+
+        /**
          * 一次「拍摄并取回」流程结束（含未取到 JPEG 与失败）。
          * 「未发现 JPEG」路径既不落盘也不报错，只发 onStatus，
          * 单靠 onFileSaved/onError 会把拍摄按钮永久留在禁用态。
@@ -199,6 +225,8 @@ public final class CameraSessionCoordinator {
     private static final long CAPTURE_BATCH_POLL_MS = 500L;
     /** Canon EOS 对焦方式属性码（0xD1BA EOS_LvAfSystem），与 transport 侧一致。 */
     private static final int CANON_PROP_AF_METHOD = 0xd1ba;
+    /** 厂商属性写入被相机受理的成功响应码（标准 PTP ResponseOK）。 */
+    private static final int PROPERTY_WRITE_OK = 0x2001;
 
     private final Context context;
     private final Listener listener;
@@ -1443,6 +1471,128 @@ public final class CameraSessionCoordinator {
                 mainHandler.post(() -> listener.onVendorPropertyBlockWritten(propertyCode, 0, message));
             }
         });
+    }
+
+    /**
+     * 读画质（{@code 0xD120 EOS_ImageFormat}）：可选列表（{@code 0xC18A} 原始字节）与当前值
+     * 交给 {@link CanonImageQuality} 解析后下发。那条属性的值区域是变长 u32 序列，不能用
+     * {@link #readExposure} 那一套通用解析。相机没给允许列表时不发明候选值——写错画质会改变
+     * 相机存储的既有行为，界面上宁可显示「不可用」。
+     */
+    public void readImageQuality() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onImageQualityResult(null, -1, false, false, "请先连接相机。"));
+                return;
+            }
+            try {
+                byte[] current = operations.readVendorPropertyBlock(CanonImageQuality.IMAGE_FORMAT);
+                byte[] allowed = operations.readVendorPropertyEnumsRaw(CanonImageQuality.IMAGE_FORMAT);
+                CanonImageQuality.Choices choices = CanonImageQuality.resolve(allowed, current);
+                // 相机没给允许列表时不下发选项（fromCamera=false），让界面显示不可用占位。
+                final List<CanonImageQuality.Option> options =
+                        choices.fromCamera ? choices.options : null;
+                mainHandler.post(() -> listener.onImageQualityResult(
+                        options, choices.currentIndex, choices.currentHasJpeg, choices.fromCamera, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "读取画质失败";
+                mainHandler.post(() -> listener.onImageQualityResult(null, -1, false, false, message));
+            }
+        });
+    }
+
+    /**
+     * 直接按选项的原始字节写画质（界面下拉框的选项与「自动 JPG 兜底」选项都走这条）。
+     *
+     * <p>为什么不让界面传下标：下标要在协调器这侧重新 resolve 一次允许列表才能映射回字节，
+     * 而「当前值不在列表里就追加到末尾」这条规则会让列表长度/末位随两次读取之间的相机状态
+     * 变化——末位下标就可能落到别的画质上。选项自带原始字节，直接回放没有这层歧义。
+     */
+    public void writeImageQualityRaw(final byte[] raw, final String label) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onImageQualityWritten(false, label, "请先连接相机。"));
+                return;
+            }
+            try {
+                int code = operations.writeVendorPropertyBlock(CanonImageQuality.IMAGE_FORMAT, raw);
+                postImageQualityWritten(code, label, null);
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "画质写入失败";
+                mainHandler.post(() -> listener.onImageQualityWritten(false, label, message));
+            }
+        });
+    }
+
+    private void postImageQualityWritten(int code, String label, String error) {
+        final boolean ok = error == null && code == PROPERTY_WRITE_OK;
+        final String failure = error != null ? error
+                : "相机拒绝写入（响应码 " + String.format(Locale.ROOT, "0x%04X", code) + "）";
+        mainHandler.post(() -> listener.onImageQualityWritten(ok, label, ok ? null : failure));
+    }
+
+    /**
+     * 「恢复机身参数到基线」：把基线里<b>与当前值确实不同</b>的属性逐个写回。
+     *
+     * <p>为什么不复用 {@link #writeVendorPropertyBlock(int, byte[])}：那条路每写一个属性都会自动
+     * 回读一次并回调 {@code onVendorPropertyBlockRead}，上层是按属性码分流给 HDR/对焦包围面板的，
+     * 批量恢复会把这些面板刷成无关内容。这里走 {@code operations} 直写并只汇总一条结果。
+     *
+     * <p>只写「变了」的那些：既避免无谓地动相机（每次写入都要排空事件、停对焦、等一拍），
+     * 也不会去写那些本次本来就没被改动过的属性。写失败不中断，逐个记下来一起报。
+     */
+    public void restoreVendorProperties(final VendorPropertySnapshot baseline) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onVendorPropertyRestoreFinished(0, 0, "请先连接相机。"));
+                return;
+            }
+            if (baseline == null) {
+                mainHandler.post(() -> listener.onVendorPropertyRestoreFinished(0, 0, "还没有基线快照。"));
+                return;
+            }
+            try {
+                VendorPropertySnapshot current = operations.snapshotVendorProperties();
+                List<VendorPropertySnapshot.Diff> diffs = current.diff(baseline);
+                int total = 0;
+                int written = 0;
+                StringBuilder failed = new StringBuilder();
+                for (VendorPropertySnapshot.Diff diff : diffs) {
+                    if (diff.kind != VendorPropertySnapshot.Diff.CHANGED
+                            || diff.before == null || !diff.before.hasRaw()) {
+                        continue;
+                    }
+                    total++;
+                    try {
+                        int code = operations.writeVendorPropertyBlock(
+                                diff.before.propertyCode, diff.before.raw);
+                        if (code == PROPERTY_WRITE_OK) {
+                            written++;
+                        } else {
+                            appendFailed(failed, diff.before.propertyCode, code);
+                        }
+                    } catch (Exception error) {
+                        appendFailed(failed, diff.before.propertyCode, 0);
+                    }
+                }
+                // 画质可能被恢复成仅 RAW（或反之），卡上的可见文件集合也会随之变化。
+                invalidateStorageCache();
+                final int totalWritten = total;
+                final int succeeded = written;
+                final String failureList = failed.toString();
+                mainHandler.post(() -> listener.onVendorPropertyRestoreFinished(
+                        totalWritten, succeeded, failureList));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "恢复机身参数失败";
+                mainHandler.post(() -> listener.onVendorPropertyRestoreFinished(0, 0, message));
+            }
+        });
+    }
+
+    private static void appendFailed(StringBuilder failed, int propertyCode, int code) {
+        if (failed.length() > 0) failed.append('、');
+        failed.append(VendorProperty.hex(propertyCode));
+        if (code != 0) failed.append("（0x").append(String.format(Locale.ROOT, "%04X", code)).append('）');
     }
 
     /**

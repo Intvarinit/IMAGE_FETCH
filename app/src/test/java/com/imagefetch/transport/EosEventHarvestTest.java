@@ -4,6 +4,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
+import com.imagefetch.ptp.CanonImageQuality;
 import com.imagefetch.testutil.Bytes;
 
 import org.junit.Test;
@@ -39,12 +40,13 @@ public class EosEventHarvestTest {
     private final Map<Integer, Long> values = new LinkedHashMap<>();
     private final Map<Integer, int[]> enums = new LinkedHashMap<>();
     private final Map<Integer, byte[]> raw = new LinkedHashMap<>();
+    private final Map<Integer, byte[]> enumRaw = new LinkedHashMap<>();
 
     @Test
     public void 当前值事件被收进缓存() {
         byte[] block = propValueRecord(PROP_APERTURE, 0x0020);
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertEquals("光圈当前值应取自 +0x0c 的低 16 位",
                 Long.valueOf(0x0020), values.get((int) PROP_APERTURE));
@@ -54,7 +56,7 @@ public class EosEventHarvestTest {
     public void 当前值事件的原始字节按原样收进缓存() {
         byte[] block = propValueRecord(PROP_AF_METHOD, RP_INTERVAL_SETTING_REGION);
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertArrayEquals("24 字节不透明区域必须逐字节保真（不做任何结构解读）",
                 RP_INTERVAL_SETTING_REGION, raw.get((int) PROP_AF_METHOD));
@@ -64,7 +66,7 @@ public class EosEventHarvestTest {
     public void 允许值列表按相机顺序收进缓存() {
         byte[] block = availListRecord(PROP_APERTURE, 3, new int[]{0x0050, 0x0020, 0x0038});
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertArrayEquals("允许值必须保持相机给的顺序",
                 new int[]{0x0050, 0x0020, 0x0038}, enums.get((int) PROP_APERTURE));
@@ -78,7 +80,7 @@ public class EosEventHarvestTest {
                 Bytes.concat(Bytes.u32(8), Bytes.u32(0)),
                 propValueRecord(PROP_AF_METHOD, 0x0004));
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertEquals("终止标记前的记录应被收下", Long.valueOf(0x0020), values.get((int) PROP_APERTURE));
         assertNull("终止标记之后的记录不得被解析", values.get((int) PROP_AF_METHOD));
@@ -90,7 +92,7 @@ public class EosEventHarvestTest {
                 propValueRecord(PROP_APERTURE, 0x0020),
                 availListRecord(PROP_AF_METHOD, 3, new int[]{0, 1, 2}));
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertEquals(Long.valueOf(0x0020), values.get((int) PROP_APERTURE));
         assertArrayEquals(new int[]{0, 1, 2}, enums.get((int) PROP_AF_METHOD));
@@ -102,7 +104,7 @@ public class EosEventHarvestTest {
         byte[] truncated = Bytes.concat(
                 Bytes.u32(0x40), Bytes.u32(PROP_VALUE_CHANGED), Bytes.u32(PROP_APERTURE));
 
-        PtpIpTransport.harvestEosEventBlock(truncated, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(truncated, values, enums, raw, enumRaw);
 
         assertEquals("越界记录不得被收下", 0, values.size());
         assertEquals("越界记录也不得留下原始字节", 0, raw.size());
@@ -113,7 +115,7 @@ public class EosEventHarvestTest {
         // propxtype=1 是别的类型：即使后面跟着「像」枚举的数据也不能收。
         byte[] block = availListRecord(PROP_APERTURE, 1, new int[]{0x0020, 0x0038});
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertNull("只有 propxtype==3 才是枚举", enums.get((int) PROP_APERTURE));
     }
@@ -124,9 +126,36 @@ public class EosEventHarvestTest {
         byte[] block = Bytes.concat(
                 Bytes.u32(0x0c), Bytes.u32(PROP_VALUE_CHANGED), Bytes.u32(PROP_APERTURE));
 
-        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw);
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
 
         assertNull("没有值区域时不得留下空字节数组", raw.get((int) PROP_APERTURE));
+    }
+
+    @Test
+    public void 画质列表的原始区域收进独立缓存且不进通用枚举表() {
+        // 0xD120 的列表项是变长 u32 序列（这里给 n=1 的 20 字节：n / 0x10 / type=JPG / size=L / 压缩）：
+        // 按 stride 4 取 u16 会解出 n/type 这类垃圾值，所以只能留原始字节、不许塞进通用枚举表。
+        byte[] region = Bytes.concat(
+                Bytes.u32(1), Bytes.u32(0x10), Bytes.u32(1), Bytes.u32(0), Bytes.u32(2));
+        byte[] block = availListRawRecord(CanonImageQuality.IMAGE_FORMAT, 3, 1, region);
+
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
+
+        assertArrayEquals("画质列表必须逐字节保真地留给专用解析器",
+                region, enumRaw.get(CanonImageQuality.IMAGE_FORMAT));
+        assertNull("画质不得塞进通用 u16 枚举表（否则下拉框会显示 n/type 之类的垃圾值）",
+                enums.get(CanonImageQuality.IMAGE_FORMAT));
+    }
+
+    @Test
+    public void 非3的propxtype不写进画质原始缓存() {
+        byte[] region = Bytes.concat(
+                Bytes.u32(1), Bytes.u32(0x10), Bytes.u32(1), Bytes.u32(0), Bytes.u32(2));
+        byte[] block = availListRawRecord(CanonImageQuality.IMAGE_FORMAT, 1, 1, region);
+
+        PtpIpTransport.harvestEosEventBlock(block, values, enums, raw, enumRaw);
+
+        assertNull("只有 propxtype==3 的 0xC18A 才是可选值列表", enumRaw.get(CanonImageQuality.IMAGE_FORMAT));
     }
 
     private static byte[] propValueRecord(long property, long value) {
@@ -148,6 +177,17 @@ public class EosEventHarvestTest {
             parts[i + 1] = Bytes.u32(items[i]);
         }
         byte[] payload = Bytes.concat(parts);
+        return Bytes.concat(Bytes.u32(8 + payload.length), Bytes.u32(AVAIL_LIST_CHANGED), payload);
+    }
+
+    /**
+     * {@code 0xC18A} 记录，列表区域按<b>原始字节</b>给（{@code +0x14} 起即 {@code region}）：
+     * 用来喂画质那种变长项，不走「4 字节 u16」的 {@link #availListRecord} 形状。
+     * {@code +0x10} 的计数字段照相机上报照填（画质这边它是条目个数）。
+     */
+    private static byte[] availListRawRecord(long property, long propxtype, long count, byte[] region) {
+        byte[] payload = Bytes.concat(
+                Bytes.u32(property), Bytes.u32(propxtype), Bytes.u32(count), region);
         return Bytes.concat(Bytes.u32(8 + payload.length), Bytes.u32(AVAIL_LIST_CHANGED), payload);
     }
 }

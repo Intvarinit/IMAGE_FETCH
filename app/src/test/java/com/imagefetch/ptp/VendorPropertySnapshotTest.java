@@ -1,5 +1,6 @@
 package com.imagefetch.ptp;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
@@ -152,13 +153,50 @@ public class VendorPropertySnapshotTest {
         assertTrue(text.contains(VendorProperty.label(PROP_INTERVAL)));
     }
 
+    @Test
+    public void 快照文本往返保真原始字节与时间戳() {
+        // 原始字节是恢复的唯一依据，序列化后必须逐字节还原，否则「恢复基线」会写回错值。
+        byte[] region = Bytes.concat(Bytes.u32(0x18), Bytes.zeros(12), Bytes.u32(0x0a), Bytes.u32(0x0a));
+        VendorPropertySnapshot original = new VendorPropertySnapshot(1234L, itemsOf(item(PROP_INTERVAL, region)));
+
+        VendorPropertySnapshot restored = VendorPropertySnapshot.fromText(original.toText());
+
+        assertEquals("时间戳要能还原", 1234L, restored.takenAt());
+        assertEquals(1, restored.size());
+        assertArrayEquals(region, restored.find(PROP_INTERVAL).raw);
+    }
+
+    @Test
+    public void 无原始字节的条目往返后值为解析值且无原始字节() {
+        Map<Integer, VendorPropertySnapshot.Item> items = new LinkedHashMap<>();
+        items.put(PROP_HDR, new VendorPropertySnapshot.Item(PROP_HDR, 7L, null));
+
+        VendorPropertySnapshot restored =
+                VendorPropertySnapshot.fromText(new VendorPropertySnapshot(0L, items).toText());
+
+        assertEquals(7L, restored.find(PROP_HDR).value);
+        assertFalse("没有原始字节就不该凭空造出字节数组", restored.find(PROP_HDR).hasRaw());
+    }
+
+    @Test
+    public void 空文本或垃圾文本都返回没有基线() {
+        assertNull(VendorPropertySnapshot.fromText(null));
+        assertNull(VendorPropertySnapshot.fromText("   \n\n"));
+        assertNull("字段不足的记录一律跳过，一条有效都没有时视作没有基线",
+                VendorPropertySnapshot.fromText("这不是一条有效记录"));
+    }
+
     private static VendorPropertySnapshot.Item item(int code, byte[] raw) {
         return new VendorPropertySnapshot.Item(code, VendorPropertySnapshot.UNSET, raw);
     }
 
-    private static VendorPropertySnapshot snapshotOf(VendorPropertySnapshot.Item item) {
+    private static Map<Integer, VendorPropertySnapshot.Item> itemsOf(VendorPropertySnapshot.Item item) {
         Map<Integer, VendorPropertySnapshot.Item> items = new LinkedHashMap<>();
         items.put(item.propertyCode, item);
-        return new VendorPropertySnapshot(1L, items);
+        return items;
+    }
+
+    private static VendorPropertySnapshot snapshotOf(VendorPropertySnapshot.Item item) {
+        return new VendorPropertySnapshot(1L, itemsOf(item));
     }
 }

@@ -23,6 +23,9 @@ public final class VendorPropertySnapshot {
     /** 清单最多打印多少条，防止把下拉框撑爆。 */
     private static final int MAX_LISTED = 200;
 
+    /** {@link #toText()}/{@link #fromText(String)} 里时间戳行的前缀。 */
+    private static final String TEXT_TIME_PREFIX = "takenAt=";
+
     /** 单个属性在一次快照里的样子。不可变；{@code raw} 为防御性拷贝。 */
     public static final class Item {
         public final int propertyCode;
@@ -200,6 +203,83 @@ public final class VendorPropertySnapshot {
             if (diff.after != null) text.append("    后：").append(diff.after.valueText()).append('\n');
         }
         return text.toString();
+    }
+
+    /**
+     * 把快照序列化成一行一条的纯文本，供 {@code SharedPreferences} 持久化。
+     * 格式：首行 {@code takenAt=<毫秒>}，其后每行 {@code 属性码|解析值|原始字节十六进制}
+     * （解析值或原始字节缺失时留空）。原始字节是恢复的唯一依据，必须完整保留。
+     */
+    public String toText() {
+        StringBuilder text = new StringBuilder();
+        text.append(TEXT_TIME_PREFIX).append(takenAt).append('\n');
+        for (Item item : items) {
+            text.append(item.propertyCode).append('|')
+                    .append(item.value == UNSET ? "" : Long.toString(item.value)).append('|')
+                    .append(hexOf(item.raw)).append('\n');
+        }
+        return text.toString();
+    }
+
+    /**
+     * 反序列化 {@link #toText()} 的输出。容错优先：空白行、字段不足、数字/十六进制非法的行
+     * 一律跳过；一条有效条目都没有时返回 {@code null}（调用方据此判断「没有基线」）。
+     * 时间戳缺失时用 0。
+     */
+    public static VendorPropertySnapshot fromText(String text) {
+        if (text == null || text.trim().isEmpty()) return null;
+        long takenAt = 0;
+        Map<Integer, Item> items = new LinkedHashMap<>();
+        for (String line : text.split("\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) continue;
+            if (trimmed.startsWith(TEXT_TIME_PREFIX)) {
+                takenAt = parseLong(trimmed.substring(TEXT_TIME_PREFIX.length()), 0);
+                continue;
+            }
+            String[] parts = trimmed.split("\\|", -1);
+            if (parts.length < 3) continue;
+            long code = parseLong(parts[0], -1);
+            if (code < 0 || code > 0xffff) continue;
+            long value = parts[1].isEmpty() ? UNSET : parseLong(parts[1], UNSET);
+            byte[] raw = parseHex(parts[2]);
+            int propertyCode = (int) code;
+            items.put(propertyCode, new Item(propertyCode, value, raw));
+        }
+        if (items.isEmpty()) return null;
+        return new VendorPropertySnapshot(takenAt, items);
+    }
+
+    private static long parseLong(String text, long fallback) {
+        try {
+            return Long.parseLong(text.trim());
+        } catch (NumberFormatException malformed) {
+            return fallback;
+        }
+    }
+
+    private static String hexOf(byte[] raw) {
+        if (raw == null || raw.length == 0) return "";
+        StringBuilder text = new StringBuilder(raw.length * 2);
+        for (byte value : raw) {
+            text.append(Character.forDigit((value >> 4) & 0xf, 16))
+                    .append(Character.forDigit(value & 0xf, 16));
+        }
+        return text.toString();
+    }
+
+    private static byte[] parseHex(String text) {
+        if (text == null) return null;
+        String trimmed = text.trim();
+        if (trimmed.isEmpty() || (trimmed.length() % 2) != 0) return null;
+        byte[] raw = new byte[trimmed.length() / 2];
+        for (int i = 0; i < raw.length; i++) {
+            int high = Character.digit(trimmed.charAt(2 * i), 16);
+            int low = Character.digit(trimmed.charAt(2 * i + 1), 16);
+            if (high < 0 || low < 0) return null;
+            raw[i] = (byte) ((high << 4) | low);
+        }
+        return raw;
     }
 
     private static String kindLabel(int kind) {

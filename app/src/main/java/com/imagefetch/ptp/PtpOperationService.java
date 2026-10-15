@@ -134,6 +134,14 @@ public final class PtpOperationService {
         return transport.readVendorPropertyBlock(propertyCode);
     }
 
+    /**
+     * 读一个厂商属性允许值列表的原始字节（只读）。列表项不是固定 4 字节 u16 的属性
+     * （如画质 {@code 0xD120}）靠它拿原始字节自行解析；相机没上报过则返回 {@code null}。
+     */
+    public byte[] readVendorPropertyEnumsRaw(int propertyCode) throws Exception {
+        return transport.readVendorPropertyEnumsRaw(propertyCode);
+    }
+
     /** 整体回写一个厂商属性的值区域（会真的写相机）。返回相机响应码。 */
     public int writeVendorPropertyBlock(int propertyCode, byte[] block) throws Exception {
         return transport.writeVendorPropertyBlock(propertyCode, block);

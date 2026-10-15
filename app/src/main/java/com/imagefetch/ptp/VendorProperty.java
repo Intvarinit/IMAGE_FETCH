@@ -22,6 +22,19 @@ public final class VendorProperty {
     public static final int AF_METHOD = 0xd1ba;
     /** 对焦模式。 */
     public static final int FOCUS_MODE = 0xd108;
+    /**
+     * 画质（机身菜单里的「图像画质」）。
+     *
+     * <p>值区域是<b>变长 u32 序列</b>而不是普通 u16，解析规则见 {@link CanonImageQuality}
+     * （libgphoto2 登记为 {@code PTP_DPC_CANON_EOS_ImageFormat}，ptp.h:2122）。
+     */
+    public static final int IMAGE_FORMAT = CanonImageQuality.IMAGE_FORMAT;
+    /** 画质的 CF 卡变体。 */
+    public static final int IMAGE_FORMAT_CF = CanonImageQuality.IMAGE_FORMAT_CF;
+    /** 画质的 SD 卡变体。 */
+    public static final int IMAGE_FORMAT_SD = CanonImageQuality.IMAGE_FORMAT_SD;
+    /** 画质的扩展存储变体。 */
+    public static final int IMAGE_FORMAT_EXT = CanonImageQuality.IMAGE_FORMAT_EXT;
     /** 包围模式（曝光/ISO/WB/FE 等）。 */
     public static final int BRACKET_MODE = 0xd11d;
     /** 间隔定时拍摄设置。 */
@@ -66,6 +79,14 @@ public final class VendorProperty {
                 return "实时取景对焦方式";
             case FOCUS_MODE:
                 return "对焦模式";
+            case IMAGE_FORMAT:
+                return "画质（图像格式）";
+            case IMAGE_FORMAT_CF:
+                return "画质（CF 卡）";
+            case IMAGE_FORMAT_SD:
+                return "画质（SD 卡）";
+            case IMAGE_FORMAT_EXT:
+                return "画质（扩展存储）";
             case BRACKET_MODE:
                 return "包围模式";
             case INTERVAL_SHOOT_SETTING:
@@ -96,6 +117,14 @@ public final class VendorProperty {
                 return "EOS_FocusShiftSetting";
             case FOCUS_MODE:
                 return "EOS_FocusMode";
+            case IMAGE_FORMAT:
+                return "EOS_ImageFormat";
+            case IMAGE_FORMAT_CF:
+                return "EOS_ImageFormatCF";
+            case IMAGE_FORMAT_SD:
+                return "EOS_ImageFormatSD";
+            case IMAGE_FORMAT_EXT:
+                return "EOS_ImageFormatExtHD";
             case AF_METHOD:
                 return "EOS_LvAfSystem";
             case EVF_OUTPUT_DEVICE:
