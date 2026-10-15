@@ -232,6 +232,14 @@
         android:visibility="gone" />
 
     <Button
+        android:id="@+id/captureCameraMenu"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:minHeight="44dp"
+        android:text="@string/camera_menu_open" />
+
+    <Button
         android:id="@+id/captureShoot"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

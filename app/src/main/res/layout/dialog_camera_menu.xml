@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  拍摄页的「相机设置」菜单。当前只有白平衡一项；后续新增设置按同样的「标签 + 控件」
+  行加进 @+id/cameraMenuItems 里即可，菜单骨架（状态行 / 提示行）不用动。
+  标题与关闭按钮都由 AlertDialog 提供，与 dialog_capture.xml 一致。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/cameraMenuStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+
+        <LinearLayout
+            android:id="@+id/cameraMenuItems"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="vertical">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="52dp"
+                    android:layout_height="wrap_content"
+                    android:text="@string/white_balance_label"
+                    android:textColor="@color/ink"
+                    android:textSize="13sp" />
+
+                <Spinner
+                    android:id="@+id/whiteBalance"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:contentDescription="@string/white_balance_label"
+                    android:minWidth="120dp" />
+            </LinearLayout>
+
+            <!--
+              色温小节：只有白平衡切到「色温」档时才显示（其余档位 gone）。
+              做成独立一栏而不是塞进白平衡那一行，是为了后面加别的设置时互不干扰。
+            -->
+            <LinearLayout
+                android:id="@+id/colorTemperatureSection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="52dp"
+                        android:layout_height="wrap_content"
+                        android:text="@string/color_temperature_label"
+                        android:textColor="@color/ink"
+                        android:textSize="13sp" />
+
+                    <EditText
+                        android:id="@+id/colorTemperatureInput"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:contentDescription="@string/color_temperature_label"
+                        android:hint="@string/color_temperature_hint"
+                        android:imeOptions="actionDone"
+                        android:inputType="number"
+                        android:maxLength="5"
+                        android:minWidth="90dp"
+                        android:textSize="14sp" />
+
+                    <Button
+                        android:id="@+id/colorTemperatureApply"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:minHeight="40dp"
+                        android:text="@string/color_temperature_apply" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/colorTemperatureHint"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/color_temperature_help"
+                    android:textColor="#6B7280"
+                    android:textSize="11sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/whiteBalanceHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/white_balance_hint"
+            android:textColor="#6B7280"
+            android:textSize="11sp" />
+    </LinearLayout>
+</ScrollView>

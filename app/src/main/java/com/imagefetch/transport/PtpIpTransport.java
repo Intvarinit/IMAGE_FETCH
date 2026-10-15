@@ -166,6 +166,15 @@ public final class PtpIpTransport implements CameraTransport {
      */
     private static final int CANON_PROP_AF_METHOD = 0xd1ba;
 
+    /** 白平衡（Canon EOS {@code 0xD109}，u8 枚举；经 0x9110 写入，见 {@link #writeWhiteBalance(int)}）。 */
+    private static final int CANON_PROP_WHITE_BALANCE = 0xd109;
+
+    /**
+     * 色温（Canon EOS {@code 0xD10A}，普通 u32 标量，单位为 K；经 0x9110 写入，
+     * 见 {@link #writeColorTemperature(int)}）。没有允许值列表，直接读写整数。
+     */
+    private static final int CANON_PROP_COLOR_TEMPERATURE = 0xd10a;
+
     /**
      * Canon EOS 请相机把某个 {@code 0xD1xx} 属性的当前值**推送**到事件队列
      * （{@code 0x9127 EOS_RequestDevicePropValue}，1 个参数 = 属性码）。
@@ -1677,6 +1686,76 @@ public final class PtpIpTransport implements CameraTransport {
             // 相机应答即可，拒绝不影响后面的等待。
         } catch (Exception ignored) {
             // 超时等失败同样不影响：值可能已经推到队列里，后面照常排空。
+        }
+    }
+
+    /**
+     * 读白平衡（{@code 0xD109}）。与 {@link #readFocusArea()} 同一条路：先看事件缓存，
+     * 缓存没有就补一次 0x9127。
+     */
+    @Override
+    public synchronized long readWhiteBalance() throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        return readCanonProperty(CANON_PROP_WHITE_BALANCE, "白平衡");
+    }
+
+    /**
+     * 写白平衡（{@code 0xD109}，机上编码值）。序列与 {@link #writeFocusArea(int)} 完全一致：
+     * 先排空事件、停掉可能还在跑的对焦驱动，再经 0x9110 写入并对 0x2019 DeviceBusy 退避重试，
+     * 重试仍失败就重建遥控态后补写一次。
+     */
+    @Override
+    public synchronized void writeWhiteBalance(int value) throws Exception {
+        ensureConnected();
+        String drainFailure = drainEosEvents();
+        cancelCanonAutofocus();
+        // 该属性在 libgphoto2 里是 u8（config.c:12092），只取低字节；0x9110 的载荷固定 4 字节，
+        // 高字节留 0 与 libgphoto2 的默认分支一致。
+        int code = writeCanonPropertyRetrying(CANON_PROP_WHITE_BALANCE, value & 0xffL);
+        if (code == RESPONSE_DEVICE_BUSY) {
+            rebuildCanonStateAfterBusy();
+            code = writeCanonProperty(CANON_PROP_WHITE_BALANCE, value & 0xffL);
+        }
+        if (code != RESPONSE_OK) {
+            throw new IOException("白平衡写入被相机拒绝（0x9110 属性 d109，值 " + value
+                    + "）：" + hexCode(code)
+                    + (drainFailure == null ? "" : "\n" + drainFailure), rejected(code));
+        }
+    }
+
+    /**
+     * 读色温（{@code 0xD10A}，单位 K）。这是普通 u32 标量，与 {@link #readWhiteBalance()} 同一条路：
+     * 先看事件缓存，缓存没有就补一次 0x9127。
+     */
+    @Override
+    public synchronized long readColorTemperature() throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
+        return readCanonProperty(CANON_PROP_COLOR_TEMPERATURE, "色温");
+    }
+
+    /**
+     * 写色温（{@code 0xD10A}，单位 K）。序列与 {@link #writeWhiteBalance(int)} 完全一致：
+     * 先排空事件、停掉可能还在跑的对焦驱动，再经 0x9110 写入并对 0x2019 DeviceBusy 退避重试。
+     *
+     * <p>与白平衡不同，这个属性在 libgphoto2 里是 u32（config.c:12093），不做 u8 截断，
+     * 直接把整个整数放进 0x9110 的 4 字节载荷。
+     */
+    @Override
+    public synchronized void writeColorTemperature(int kelvin) throws Exception {
+        ensureConnected();
+        String drainFailure = drainEosEvents();
+        cancelCanonAutofocus();
+        int code = writeCanonPropertyRetrying(CANON_PROP_COLOR_TEMPERATURE, kelvin & 0xffff_ffffL);
+        if (code == RESPONSE_DEVICE_BUSY) {
+            rebuildCanonStateAfterBusy();
+            code = writeCanonProperty(CANON_PROP_COLOR_TEMPERATURE, kelvin & 0xffff_ffffL);
+        }
+        if (code != RESPONSE_OK) {
+            throw new IOException("色温写入被相机拒绝（0x9110 属性 d10a，值 " + kelvin
+                    + "）：" + hexCode(code)
+                    + (drainFailure == null ? "" : "\n" + drainFailure), rejected(code));
         }
     }
 

@@ -148,4 +148,15 @@
     <string name="calc_apply">填入对焦包围面板</string>
     <string name="calc_hint">纯光学部分（超焦距、景深限）是标准公式；但「对焦增量」与物理步长的换算是本工具唯一没有实测依据的一环——它来自 5.2 mm/档 的经验标定常数，不同镜头与机身可能有差异。报告里的「对照」一栏按景深比例换算，那个模型等于 (1 − 重叠率) ÷ 0.12，与焦段、光圈、距离都无关（重叠率 40% 时恒为 5），只在两个模型不一致时提示经验成分较大。建议先按推荐值试拍一组：有模糊断层就减小增量或增大张数，想精简张数就缩小距离范围或收小光圈。</string>
     <string name="calc_invalid">输入不完整或有误，无法计算。</string>
+    <string name="camera_menu_open">相机设置</string>
+    <string name="camera_menu_title">相机设置</string>
+    <string name="white_balance_label">白平衡</string>
+    <string name="white_balance_unavailable">未读到相机的白平衡值</string>
+    <string name="white_balance_hint">可选档位由相机上报；相机没上报时用常见档位兜底，此时切换若被相机拒绝会如实报错。</string>
+    <string name="color_temperature_label">色温</string>
+    <string name="color_temperature_apply">应用</string>
+    <string name="color_temperature_hint">例如 5200</string>
+    <string name="color_temperature_help">填 K 值后点「应用」写入。范围 2500–10000、按 100 的整数倍取值，均为佳能菜单常见刻度，未在相机端实测证实；相机若拒绝会如实报错。</string>
+    <string name="color_temperature_invalid">请输入 2500–10000 之间的整数 K 值。</string>
+    <string name="color_temperature_unavailable">未读到相机的色温值</string>
 </resources>

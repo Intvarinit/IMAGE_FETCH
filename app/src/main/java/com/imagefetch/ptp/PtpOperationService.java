@@ -157,6 +157,26 @@ public final class PtpOperationService {
         transport.writeFocusArea(value);
     }
 
+    /** 读取白平衡（Canon 0xD109）的当前编码值。 */
+    public long readWhiteBalance() throws Exception {
+        return transport.readWhiteBalance();
+    }
+
+    /** 写入白平衡（机上编码值）。 */
+    public void writeWhiteBalance(int value) throws Exception {
+        transport.writeWhiteBalance(value);
+    }
+
+    /** 读取色温（Canon 0xD10A）的当前值，单位 K。 */
+    public long readColorTemperature() throws Exception {
+        return transport.readColorTemperature();
+    }
+
+    /** 写入色温（单位 K）。 */
+    public void writeColorTemperature(int kelvin) throws Exception {
+        transport.writeColorTemperature(kelvin);
+    }
+
     /** 把取景画面里的一个点设为对焦框（感光器像素坐标 x, y）；不触发对焦。 */
     public void touchAfPosition(int x, int y) throws Exception {
         transport.touchAfPosition(x, y);

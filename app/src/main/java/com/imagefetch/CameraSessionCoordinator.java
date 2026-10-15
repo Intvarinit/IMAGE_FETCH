@@ -30,6 +30,7 @@ import com.imagefetch.ptp.PtpOperationService;
 import com.imagefetch.ptp.SensorPointMapper;
 import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
+import com.imagefetch.ptp.WhiteBalanceChoices;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.storage.PhotoRepository;
 import com.imagefetch.transfer.HeartbeatMonitor;
@@ -152,6 +153,34 @@ public final class CameraSessionCoordinator {
          * {@code values} 为 null、{@code error} 为原因。给默认空实现。
          */
         default void onFocusAreaResult(int[] values, int currentIndex, boolean fromCamera, String error) {
+        }
+
+        /**
+         * 白平衡（0xD109）的可选值与当前值：语义与 {@link #onFocusAreaResult} 相同，
+         * 但 {@code values} 是机上编码（界面直接回传编码写入，不经过下标）。
+         */
+        default void onWhiteBalanceResult(int[] values, int currentIndex, boolean fromCamera, String error) {
+        }
+
+        /**
+         * 白平衡写入结果：{@code success} 为真时相机受理了（响应码 {@code 0x2001}），
+         * {@code value} 是写入的机上编码值，失败时 {@code error} 为原因。
+         */
+        default void onWhiteBalanceWritten(boolean success, int value, String error) {
+        }
+
+        /**
+         * 色温（0xD10A）当前值：成功时 {@code kelvin} 为相机上报的开尔文值、{@code error} 为 null；
+         * 失败时 {@code kelvin} 为 -1、{@code error} 为原因。
+         */
+        default void onColorTemperatureResult(long kelvin, String error) {
+        }
+
+        /**
+         * 色温写入结果：{@code success} 为真时相机受理了，{@code kelvin} 是写入的 K 值，
+         * 失败时 {@code error} 为原因。
+         */
+        default void onColorTemperatureWritten(boolean success, int kelvin, String error) {
         }
 
         /**
@@ -1337,6 +1366,92 @@ public final class CameraSessionCoordinator {
                 // 如果不额外报一句，失败就被静默吞掉了。
                 mainHandler.post(() -> listener.onLiveViewStatus(setting.label + "写入失败：" + message));
                 mainHandler.post(() -> listener.onExposureResult(setting, -1, null, message));
+            }
+        });
+    }
+
+    /**
+     * 读取白平衡（0xD109）：可选值列表（0xC18A 允许值）+ 当前值，交给设置面板的下拉框。
+     * 相机没给允许列表时降级为候选表（见 {@link WhiteBalanceChoices}），并用
+     * {@code fromCamera=false} 标注，不把下拉框留空或只留当前值一项。
+     */
+    public void readWhiteBalance() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onWhiteBalanceResult(null, -1, false, "请先连接相机。"));
+                return;
+            }
+            try {
+                int raw = (int) operations.readWhiteBalance();
+                int[] allowed = operations.supportedValues(VendorProperty.WHITE_BALANCE);
+                WhiteBalanceChoices.Choices choices = WhiteBalanceChoices.resolve(allowed, raw);
+                final int[] values = choices.values;
+                final int current = choices.currentIndex;
+                final boolean fromCamera = choices.fromCamera;
+                mainHandler.post(() -> listener.onWhiteBalanceResult(values, current, fromCamera, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "读取白平衡失败";
+                mainHandler.post(() -> listener.onWhiteBalanceResult(null, -1, false, message));
+            }
+        });
+    }
+
+    /**
+     * 写入白平衡。{@code value} 是机上编码值，直接取自定义面下拉框的选项（{@link #readWhiteBalance()}
+     * 回调里的列表）——传编码而不是下标，协调器这侧就不需要重查列表、也就没有下标错位的余地。
+     */
+    public void writeWhiteBalance(final int value) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onWhiteBalanceWritten(false, value, "请先连接相机。"));
+                return;
+            }
+            try {
+                operations.writeWhiteBalance(value);
+                mainHandler.post(() -> listener.onWhiteBalanceWritten(true, value, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "白平衡写入失败";
+                mainHandler.post(() -> listener.onWhiteBalanceWritten(false, value, message));
+            }
+        });
+    }
+
+    /**
+     * 读取色温（0xD10A，单位 K）。这个属性没有允许值列表，只回当前值；
+     * 界面在「色温」档被选中时才需要它。
+     */
+    public void readColorTemperature() {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onColorTemperatureResult(-1, "请先连接相机。"));
+                return;
+            }
+            try {
+                int kelvin = (int) operations.readColorTemperature();
+                mainHandler.post(() -> listener.onColorTemperatureResult(kelvin, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "读取色温失败";
+                mainHandler.post(() -> listener.onColorTemperatureResult(-1, message));
+            }
+        });
+    }
+
+    /**
+     * 写入色温（单位 K）。{@code kelvin} 由界面校验/对齐后传入，协调器不再加工——
+     * 传具体值而不是档位，与白平衡一致。
+     */
+    public void writeColorTemperature(final int kelvin) {
+        executor.submit(() -> {
+            if (!isConnected()) {
+                mainHandler.post(() -> listener.onColorTemperatureWritten(false, kelvin, "请先连接相机。"));
+                return;
+            }
+            try {
+                operations.writeColorTemperature(kelvin);
+                mainHandler.post(() -> listener.onColorTemperatureWritten(true, kelvin, null));
+            } catch (Exception error) {
+                String message = error.getMessage() != null ? error.getMessage() : "色温写入失败";
+                mainHandler.post(() -> listener.onColorTemperatureWritten(false, kelvin, message));
             }
         });
     }

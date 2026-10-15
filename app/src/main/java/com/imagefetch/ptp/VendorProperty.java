@@ -23,6 +23,21 @@ public final class VendorProperty {
     /** 对焦模式。 */
     public static final int FOCUS_MODE = 0xd108;
     /**
+     * 白平衡（机身菜单里的「白平衡」）。
+     *
+     * <p>libgphoto2 登记为 {@code PTP_DPC_CANON_EOS_WhiteBalance}（ptp.h:2100），u8 枚举，
+     * 取值与名称见 {@link WhiteBalanceChoices}。
+     */
+    public static final int WHITE_BALANCE = 0xd109;
+    /**
+     * 色温（白平衡切到「色温」档后可单独设置的 K 值）。
+     *
+     * <p>libgphoto2 登记为 {@code PTP_DPC_CANON_EOS_ColorTemperature}（ptp.h:2101），
+     * 类型是<b>普通 u32 标量</b>（config.c:12093 的 {@code _get_INT}/{@code _put_INT}），
+     * 没有允许值列表，直接读写 4 字节整数载荷，无需枚举解析。
+     */
+    public static final int COLOR_TEMPERATURE = 0xd10a;
+    /**
      * 画质（机身菜单里的「图像画质」）。
      *
      * <p>值区域是<b>变长 u32 序列</b>而不是普通 u16，解析规则见 {@link CanonImageQuality}
@@ -79,6 +94,10 @@ public final class VendorProperty {
                 return "实时取景对焦方式";
             case FOCUS_MODE:
                 return "对焦模式";
+            case WHITE_BALANCE:
+                return "白平衡";
+            case COLOR_TEMPERATURE:
+                return "色温";
             case IMAGE_FORMAT:
                 return "画质（图像格式）";
             case IMAGE_FORMAT_CF:
@@ -117,6 +136,10 @@ public final class VendorProperty {
                 return "EOS_FocusShiftSetting";
             case FOCUS_MODE:
                 return "EOS_FocusMode";
+            case WHITE_BALANCE:
+                return "EOS_WhiteBalance";
+            case COLOR_TEMPERATURE:
+                return "EOS_ColorTemperature";
             case IMAGE_FORMAT:
                 return "EOS_ImageFormat";
             case IMAGE_FORMAT_CF:

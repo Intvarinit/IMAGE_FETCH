@@ -211,6 +211,32 @@ public interface CameraTransport extends Closeable {
     }
 
     /**
+     * 读取白平衡（Canon {@code 0xD109 EOS_WhiteBalance}）的当前编码值，
+     * 与 {@link #readFocusArea()} 同属 0xD1xx 一族。不支持的传输实现保持默认。
+     */
+    default long readWhiteBalance() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持白平衡调整");
+    }
+
+    /** 写入白平衡（机上编码值）。不支持的传输实现保持默认。 */
+    default void writeWhiteBalance(int value) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持白平衡调整");
+    }
+
+    /**
+     * 读取色温（Canon {@code 0xD10A EOS_ColorTemperature}）的当前值，单位 K，普通 u32 标量。
+     * 不支持的传输实现保持默认。
+     */
+    default long readColorTemperature() throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持色温调整");
+    }
+
+    /** 写入色温（单位 K）。不支持的传输实现保持默认。 */
+    default void writeColorTemperature(int kelvin) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持色温调整");
+    }
+
+    /**
      * 把取景画面里的一个点设为对焦框（Canon {@code 0x915B EOS_TouchAfPosition}，
      * <b>不触发</b>对焦）。{@code x}/{@code y} 是<b>感光器像素</b>坐标
      * （可先用 {@link #liveViewSensorSize()} 把取景帧像素换算过来）。

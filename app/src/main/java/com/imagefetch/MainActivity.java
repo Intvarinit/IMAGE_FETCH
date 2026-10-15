@@ -56,9 +56,11 @@ import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
 import com.imagefetch.ptp.CanonImageQuality;
 import com.imagefetch.ptp.CapabilityReport;
+import com.imagefetch.ptp.ColorTemperature;
 import com.imagefetch.ptp.LiveViewSize;
 import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
+import com.imagefetch.ptp.WhiteBalanceChoices;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.ui.FocusBoxOverlayView;
 import com.imagefetch.ui.PhotoGridAdapter;
@@ -283,6 +285,30 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private boolean captureRunning;
     /** 「切到含 JPG 的画质并继续」这条路上，等画质写入成功后再跑的真正拍摄。 */
     private Runnable pendingShootAfterQualityWrite;
+    /** 面板上的「相机设置」按钮；面板关闭后置空。 */
+    private Button captureCameraMenuButton;
+    /** 「相机设置」菜单弹窗（白平衡等）；拍摄面板关闭时一并收起。 */
+    private AlertDialog cameraMenuDialog;
+    /** 白平衡（0xD109）下拉框；菜单关闭后置空。 */
+    private Spinner whiteBalanceSpinner;
+    /** 菜单里的状态行（读取/切换结果都写这里）；菜单关闭后置空。 */
+    private TextView cameraMenuStatusView;
+    /** 白平衡下拉框各项对应的机上编码值（与选项同序）；未读到时为 null。 */
+    private int[] whiteBalanceValues;
+    /**
+     * 下拉框当前由程序设定的白平衡编码值。语义同 {@link #lastAppliedAfValue}：
+     * 把「程序填充」与「用户点选」区分开，且<b>写入成功后才推进</b>，失败后能原地重试。
+     */
+    private int lastAppliedWhiteBalanceValue = Integer.MIN_VALUE;
+    /** 色温输入小节（仅白平衡切到「色温」档时可见）；菜单关闭后置空。 */
+    private View colorTemperatureSection;
+    /** 色温 K 值输入框；菜单关闭后置空。 */
+    private EditText colorTemperatureInput;
+    /**
+     * 色温小节当前是否已可见。用它把「首次切到色温档读一次相机」与「反复选中同一档」
+     * 区分开，避免每次选中回调都多读一次相机。
+     */
+    private boolean colorTemperatureSectionShown;
     /** 曝光写入的合并窗口：连点 −/+ 只把最终值发给相机一次。 */
     private static final long EXPOSURE_WRITE_DEBOUNCE_MS = 250L;
     private final Handler deferredRecycle = new Handler(Looper.getMainLooper());
@@ -607,6 +633,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         lastFocusFrameY = Float.NaN;
         liveViewStatusView = content.findViewById(R.id.liveViewStatus);
         captureShootButton = content.findViewById(R.id.captureShoot);
+        captureCameraMenuButton = content.findViewById(R.id.captureCameraMenu);
         captureAutofocusButton = content.findViewById(R.id.captureAutofocus);
         liveViewSizeSpinner = content.findViewById(R.id.liveViewSize);
         afModeSpinner = content.findViewById(R.id.afMode);
@@ -640,6 +667,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         exposureRows.add(bindExposureRow(content, R.id.isoRow, CanonExposure.Setting.ISO));
 
         captureShootButton.setOnClickListener(view -> shootFromPanel());
+        captureCameraMenuButton.setOnClickListener(view -> openCameraMenu());
         captureAutofocusButton.setOnClickListener(view -> {
             // 对焦要等相机执行完才回，期间禁用按钮避免连点排队。
             captureAutofocusButton.setEnabled(false);
@@ -672,6 +700,11 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 面板收起：停取景、丢掉画面引用（否则整个 Activity 会被这几张位图拖住）。 */
     private void closeCapturePanel() {
+        // 「相机设置」菜单挂在拍摄面板上，面板收起时一并关掉（菜单的 onDismiss 会清引用）。
+        if (cameraMenuDialog != null && cameraMenuDialog.isShowing()) cameraMenuDialog.dismiss();
+        // 菜单没在显示时上面的 dismiss 不会触发 onDismiss，这里兜底清一遍。
+        clearCameraMenuRefs();
+        captureCameraMenuButton = null;
         // 还有合并中没发出去的档位调整：立刻补发，别让用户以为改好了其实没生效。
         for (ExposureRow row : exposureRows) flushPendingExposureWrite(row);
         // 拆取景必须排在补发之后：补发档位要趁相机还在遥控态（写属性需要这个状态），
@@ -878,6 +911,137 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         if (imageQualityWarnView != null) {
             imageQualityWarnView.setVisibility(hasJpeg ? View.GONE : View.VISIBLE);
         }
+    }
+
+    /**
+     * 打开「相机设置」菜单。菜单挂在拍摄面板之上，目前有白平衡（+ 选中「色温」档后露出的
+     * 色温输入行）；后续新增设置加进 dialog_camera_menu.xml 的 {@code cameraMenuItems} 容器即可。
+     */
+    private void openCameraMenu() {
+        if (cameraMenuDialog != null && cameraMenuDialog.isShowing()) return;
+        View content = getLayoutInflater().inflate(R.layout.dialog_camera_menu, null);
+        whiteBalanceSpinner = content.findViewById(R.id.whiteBalance);
+        cameraMenuStatusView = content.findViewById(R.id.cameraMenuStatus);
+        colorTemperatureSection = content.findViewById(R.id.colorTemperatureSection);
+        colorTemperatureInput = content.findViewById(R.id.colorTemperatureInput);
+        colorTemperatureSectionShown = false;
+        Button applyColorTemperature = content.findViewById(R.id.colorTemperatureApply);
+        applyColorTemperature.setOnClickListener(view -> applyColorTemperature());
+        setUpWhiteBalanceSpinner();
+        cameraMenuDialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.camera_menu_title)
+                .setView(content)
+                .setNegativeButton(R.string.close, null)
+                .create();
+        cameraMenuDialog.setOnDismissListener(ignored -> clearCameraMenuRefs());
+        cameraMenuDialog.show();
+        coordinator.readWhiteBalance();
+    }
+
+    /** 菜单关闭时清掉挂在它上面的控件引用与状态（弹窗销毁后这些控件没有别处引用）。 */
+    private void clearCameraMenuRefs() {
+        cameraMenuDialog = null;
+        whiteBalanceSpinner = null;
+        cameraMenuStatusView = null;
+        whiteBalanceValues = null;
+        lastAppliedWhiteBalanceValue = Integer.MIN_VALUE;
+        colorTemperatureSection = null;
+        colorTemperatureInput = null;
+        colorTemperatureSectionShown = false;
+    }
+
+    /**
+     * 白平衡（{@code 0xD109}）下拉框：切换后按<b>编码</b>写回相机。传编码而不是下标，
+     * 协调器那侧就不必重查允许列表（画质那条路踩过下标错位的坑，这里不重复）。
+     */
+    private void setUpWhiteBalanceSpinner() {
+        if (whiteBalanceSpinner == null) return;
+        setWhiteBalancePlaceholder(getString(R.string.live_view_starting));
+        whiteBalanceSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (whiteBalanceValues == null) return;
+                if (position < 0 || position >= whiteBalanceValues.length) return;
+                int value = whiteBalanceValues[position];
+                // 色温输入行的显隐必须先于下面的写入判断更新：程序回填相机当前档位时
+                // 会走「与相机值相同」的早退，若把显隐放在早退之后，切到色温档就永远露不出来。
+                updateColorTemperatureSection(value);
+                // 与相机当前值一致说明只是填充/重复选中，不需要写回。
+                if (value == lastAppliedWhiteBalanceValue) return;
+                // 不在这里推进 lastAppliedWhiteBalanceValue：写入还没定论，提前推进会让
+                // 「失败后重选同一档」被上面的早退忽略；成功后由回读统一校正。
+                coordinator.writeWhiteBalance(value);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
+    /** 用相机给的档位填白平衡下拉框；{@code selectedIndex} 为当前值下标。 */
+    private void setWhiteBalanceItems(int[] values, int selectedIndex, boolean fromCamera) {
+        if (whiteBalanceSpinner == null) return;
+        whiteBalanceValues = values;
+        String[] labels = new String[values.length];
+        for (int i = 0; i < values.length; i++) labels[i] = WhiteBalanceChoices.label(values[i]);
+        int selected = (selectedIndex >= 0 && selectedIndex < values.length) ? selectedIndex : 0;
+        // 先记下相机当前值，再换 adapter/选中项：否则选中回调会拿旧值比对，
+        // 把这次填充当成用户切换、对着相机白写一次。
+        lastAppliedWhiteBalanceValue = values[selected];
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        whiteBalanceSpinner.setAdapter(adapter);
+        whiteBalanceSpinner.setSelection(selected);
+        if (cameraMenuStatusView != null) {
+            cameraMenuStatusView.setText(fromCamera
+                    ? "档位来自相机上报。"
+                    : "相机未上报档位，使用常见档位兜底（未获相机确认），切换可能被拒。");
+        }
+    }
+
+    /** 白平衡下拉框占位（读取中/读不到）；此时 {@code whiteBalanceValues} 为 null，选中回调直接忽略。 */
+    private void setWhiteBalancePlaceholder(String label) {
+        if (whiteBalanceSpinner == null) return;
+        whiteBalanceValues = null;
+        lastAppliedWhiteBalanceValue = Integer.MIN_VALUE;
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_item, new String[]{label});
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        whiteBalanceSpinner.setAdapter(adapter);
+    }
+
+    /**
+     * 按当前白平衡档位显隐色温输入行：只有「色温」档（编码 {@link WhiteBalanceChoices#COLOR_TEMPERATURE}）
+     * 才露出，其他档位不显示（用户要求「其他的可以先不弹」）。首次露出时读一次相机的 K 值填进输入框。
+     */
+    private void updateColorTemperatureSection(int whiteBalanceCode) {
+        if (colorTemperatureSection == null) return;
+        boolean show = whiteBalanceCode == WhiteBalanceChoices.COLOR_TEMPERATURE;
+        if (show == colorTemperatureSectionShown) return;
+        colorTemperatureSectionShown = show;
+        colorTemperatureSection.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) coordinator.readColorTemperature();
+    }
+
+    /**
+     * 「应用」按钮：校验输入 → 对齐到 100 K 刻度 → 写入相机。传具体 K 值而不是档位，
+     * 与白平衡一致，避免下标错位。
+     */
+    private void applyColorTemperature() {
+        if (colorTemperatureInput == null) return;
+        Integer kelvin = ColorTemperature.parse(colorTemperatureInput.getText().toString());
+        if (kelvin == null) {
+            if (cameraMenuStatusView != null) {
+                cameraMenuStatusView.setText(R.string.color_temperature_invalid);
+            }
+            return;
+        }
+        int aligned = ColorTemperature.align(kelvin);
+        // 把对齐后的值回填输入框，让用户看到实际要写入的刻度（例如 5234 → 5200）。
+        colorTemperatureInput.setText(String.valueOf(aligned));
+        coordinator.writeColorTemperature(aligned);
     }
 
     /** 复位对焦包围进度与预览（开拍、关面板时都要做，避免上一批的残影）。 */
@@ -1506,6 +1670,67 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             // 与 onExposureResult 的「不盖掉用户选择」保持一致。
             if (row.pinned || row.pendingWrite != null) return;
             row.value.setText(CanonExposure.display(setting, choices.get(row.index).label));
+        });
+    }
+
+    @Override
+    public void onWhiteBalanceResult(int[] values, int currentIndex, boolean fromCamera, String error) {
+        runOnUiThread(() -> {
+            if (whiteBalanceSpinner == null) return;
+            if (error != null || values == null || values.length == 0) {
+                setWhiteBalancePlaceholder(getString(R.string.white_balance_unavailable));
+                if (cameraMenuStatusView != null) {
+                    cameraMenuStatusView.setText(error == null ? "" : "读取白平衡失败：" + error);
+                }
+                return;
+            }
+            setWhiteBalanceItems(values, currentIndex, fromCamera);
+        });
+    }
+
+    @Override
+    public void onWhiteBalanceWritten(boolean success, int value, String error) {
+        runOnUiThread(() -> {
+            if (success) {
+                if (cameraMenuStatusView != null) {
+                    cameraMenuStatusView.setText("白平衡已切换为 " + WhiteBalanceChoices.label(value));
+                }
+                // 回读一次：下拉框与 lastAppliedWhiteBalanceValue 都按相机真实当前值校正。
+                coordinator.readWhiteBalance();
+                return;
+            }
+            if (cameraMenuStatusView != null) {
+                cameraMenuStatusView.setText("切换白平衡失败："
+                        + (error == null ? "相机未正常应答" : error));
+            }
+        });
+    }
+
+    @Override
+    public void onColorTemperatureResult(long kelvin, String error) {
+        runOnUiThread(() -> {
+            if (colorTemperatureInput == null) return;
+            if (error != null || kelvin <= 0) {
+                if (cameraMenuStatusView != null) {
+                    cameraMenuStatusView.setText("读取色温失败："
+                            + (error == null ? getString(R.string.color_temperature_unavailable) : error));
+                }
+                return;
+            }
+            int aligned = ColorTemperature.align((int) kelvin);
+            colorTemperatureInput.setText(String.valueOf(aligned));
+            colorTemperatureInput.setSelection(colorTemperatureInput.getText().length());
+        });
+    }
+
+    @Override
+    public void onColorTemperatureWritten(boolean success, int kelvin, String error) {
+        runOnUiThread(() -> {
+            if (cameraMenuStatusView != null) {
+                cameraMenuStatusView.setText(success
+                        ? "色温已写入 " + kelvin + "K（写入被相机受理，未回读确认）"
+                        : "色温写入失败：" + (error == null ? "相机未正常应答" : error));
+            }
         });
     }
 
