@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 曝光行中间那格「点一下选档」：浅底圆角，点按时反馈主色，明确它是可点的控件。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/accent_soft" />
+            <corners android:radius="@dimen/radius_control" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/surface_muted" />
+            <corners android:radius="@dimen/radius_control" />
+        </shape>
+    </item>
+</selector>

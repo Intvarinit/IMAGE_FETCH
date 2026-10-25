@@ -26,7 +26,8 @@ public final class PhotoGridAdapter extends BaseAdapter {
         void onSelectionChanged(int count);
     }
 
-    private static final int TARGET_THUMBNAIL_PX = 256;
+    /** 缩略图解码目标边长：网格格子约 120dp，256px 足够清晰又不占内存。 */
+    public static final int THUMBNAIL_TARGET_PX = 256;
 
     private final Context context;
     private final LayoutInflater inflater;
@@ -55,13 +56,16 @@ public final class PhotoGridAdapter extends BaseAdapter {
         notifyDataSetChanged();
     }
 
-    /** 缩略图 JPEG 就绪：按网格尺寸降采样解码后缓存。 */
-    public void putThumbnailJpeg(long handle, byte[] jpeg) {
-        if (jpeg == null || jpeg.length == 0) return;
-        Bitmap bitmap = decode(jpeg, TARGET_THUMBNAIL_PX);
+    /**
+     * 缩略图位图就绪：只写缓存，不改适配器数据。
+     *
+     * <p>解码已挪到后台线程（见 MainActivity），这里必须留在主线程调用，
+     * 与 {@link #thumbnail(long)} 共用同一份 HashMap。
+     */
+    public void putThumbnailBitmap(long handle, Bitmap bitmap) {
         if (bitmap == null) return;
-        thumbnails.put(handle, bitmap);
-        notifyDataSetChanged();
+        Bitmap previous = thumbnails.put(handle, bitmap);
+        if (previous != null && previous != bitmap && !previous.isRecycled()) previous.recycle();
     }
 
     /**
@@ -126,6 +130,12 @@ public final class PhotoGridAdapter extends BaseAdapter {
         return items.get(position).handle;
     }
 
+    /** 当前页某张照片；越界返回 null（看图页用）。 */
+    public CameraStorage.Item itemAt(int position) {
+        if (position < 0 || position >= items.size()) return null;
+        return items.get(position);
+    }
+
     @Override
     public View getView(int position, View convertView, ViewGroup parent) {
         View cell = convertView;
@@ -168,7 +178,8 @@ public final class PhotoGridAdapter extends BaseAdapter {
     }
 
     /** 两遍解码：先读尺寸算 inSampleSize，再真正解码，避免原图位图撑爆内存。 */
-    private static Bitmap decode(byte[] jpeg, int targetPx) {
+    public static Bitmap decodeJpeg(byte[] jpeg, int targetPx) {
+        if (jpeg == null || jpeg.length == 0) return null;
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, bounds);

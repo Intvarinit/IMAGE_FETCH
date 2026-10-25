@@ -13,238 +13,237 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:paddingLeft="12dp"
-        android:paddingTop="4dp"
-        android:paddingRight="12dp"
-        android:paddingBottom="8dp">
+        android:paddingStart="@dimen/space_m"
+        android:paddingTop="@dimen/space_xs"
+        android:paddingEnd="@dimen/space_m"
+        android:paddingBottom="@dimen/space_s">
 
-    <!-- 黑底容器 + 方框覆盖层：高度定在容器上，覆盖层与画面等大叠放（点按仍落到下层 ImageView）。 -->
-    <FrameLayout
-        android:id="@+id/liveViewFrame"
-        android:layout_width="match_parent"
-        android:layout_height="240dp"
-        android:background="#000000">
+        <!-- 黑底容器 + 方框覆盖层：高度定在容器上，覆盖层与画面等大叠放（点按仍落到下层 ImageView）。 -->
+        <FrameLayout
+            android:id="@+id/liveViewFrame"
+            android:layout_width="match_parent"
+            android:layout_height="240dp"
+            android:background="@drawable/bg_live_view"
+            android:clipToOutline="true">
+
+            <ImageView
+                android:id="@+id/liveViewImage"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="@string/live_view_hint"
+                android:scaleType="fitCenter" />
+
+            <com.imagefetch.ui.FocusBoxOverlayView
+                android:id="@+id/focusBoxOverlay"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:clickable="false"
+                android:focusable="false" />
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/liveViewStatus"
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/live_view_starting"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/liveViewTapHint"
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="@string/live_view_tap_focus_hint" />
+
+        <include
+            android:id="@+id/shutterRow"
+            layout="@layout/view_exposure_row"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s" />
+
+        <include
+            android:id="@+id/apertureRow"
+            layout="@layout/view_exposure_row"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_xs" />
+
+        <include
+            android:id="@+id/isoRow"
+            layout="@layout/view_exposure_row"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_xs" />
+
+        <!-- 对焦 / 画质 / 取景尺寸三行参数，样式统一：左侧字段名固定宽，右侧控件占满。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                style="@style/Text.Label"
+                android:layout_width="@dimen/field_label_width"
+                android:layout_height="wrap_content"
+                android:text="@string/af_mode_label" />
+
+            <Spinner
+                android:id="@+id/afMode"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/af_mode_label"
+                android:minWidth="120dp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_xs"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                style="@style/Text.Label"
+                android:layout_width="@dimen/field_label_width"
+                android:layout_height="wrap_content"
+                android:text="@string/image_quality_label" />
+
+            <Spinner
+                android:id="@+id/imageQuality"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/image_quality_label"
+                android:minWidth="120dp" />
+        </LinearLayout>
+
+        <TextView
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_xs"
+            android:text="@string/exposure_hint" />
+
+        <TextView
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="@string/image_quality_hint" />
+
+        <TextView
+            android:id="@+id/imageQualityWarn"
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="@string/image_quality_warn_raw_only"
+            android:textColor="@color/warning"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_xs"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                style="@style/Text.Label"
+                android:layout_width="@dimen/field_label_width"
+                android:layout_height="wrap_content"
+                android:text="@string/live_view_size_label" />
+
+            <Spinner
+                android:id="@+id/liveViewSize"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/live_view_size_label"
+                android:minWidth="72dp" />
+
+            <Button
+                android:id="@+id/captureAutofocus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/space_s"
+                android:minHeight="@dimen/touch_min"
+                android:text="@string/autofocus" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                style="@style/Text.Label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/capture_shots_label" />
+
+            <EditText
+                android:id="@+id/captureShots"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:contentDescription="@string/capture_shots_label"
+                android:inputType="number"
+                android:maxLines="1"
+                android:text="1" />
+        </LinearLayout>
+
+        <TextView
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_xs"
+            android:text="@string/capture_shots_hint" />
+
+        <TextView
+            android:id="@+id/stackProgress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:textColor="@color/ink"
+            android:textSize="13sp"
+            android:visibility="gone" />
 
         <ImageView
-            android:id="@+id/liveViewImage"
+            android:id="@+id/stackPreview"
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:contentDescription="@string/live_view_hint"
-            android:scaleType="fitCenter" />
-
-        <com.imagefetch.ui.FocusBoxOverlayView
-            android:id="@+id/focusBoxOverlay"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:clickable="false"
-            android:focusable="false" />
-    </FrameLayout>
-
-    <TextView
-        android:id="@+id/liveViewStatus"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:text="@string/live_view_starting"
-        android:textColor="#6B7280"
-        android:textSize="12sp" />
-
-    <TextView
-        android:id="@+id/liveViewTapHint"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:text="@string/live_view_tap_focus_hint"
-        android:textColor="#6B7280"
-        android:textSize="11sp" />
-
-    <include
-        android:id="@+id/shutterRow"
-        layout="@layout/view_exposure_row"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp" />
-
-    <include
-        android:id="@+id/apertureRow"
-        layout="@layout/view_exposure_row"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
-
-    <include
-        android:id="@+id/isoRow"
-        layout="@layout/view_exposure_row"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <TextView
-            android:layout_width="52dp"
-            android:layout_height="wrap_content"
-            android:text="@string/af_mode_label"
-            android:textColor="@color/ink"
-            android:textSize="13sp" />
-
-        <Spinner
-            android:id="@+id/afMode"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:contentDescription="@string/af_mode_label"
-            android:minWidth="120dp" />
-    </LinearLayout>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <TextView
-            android:layout_width="52dp"
-            android:layout_height="wrap_content"
-            android:text="@string/image_quality_label"
-            android:textColor="@color/ink"
-            android:textSize="13sp" />
-
-        <Spinner
-            android:id="@+id/imageQuality"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:contentDescription="@string/image_quality_label"
-            android:minWidth="120dp" />
-    </LinearLayout>
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="@string/exposure_hint"
-        android:textColor="#6B7280"
-        android:textSize="11sp" />
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:text="@string/image_quality_hint"
-        android:textColor="#6B7280"
-        android:textSize="11sp" />
-
-    <TextView
-        android:id="@+id/imageQualityWarn"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:text="@string/image_quality_warn_raw_only"
-        android:textColor="#B45309"
-        android:textSize="11sp"
-        android:visibility="gone" />
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/live_view_size_label"
-            android:textColor="@color/ink"
-            android:textSize="13sp" />
-
-        <Spinner
-            android:id="@+id/liveViewSize"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:contentDescription="@string/live_view_size_label"
-            android:minWidth="72dp" />
+            android:layout_height="96dp"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_thumb"
+            android:clipToOutline="true"
+            android:contentDescription="@string/stack_preview_hint"
+            android:scaleType="centerCrop"
+            android:visibility="gone" />
 
         <Button
-            android:id="@+id/captureAutofocus"
-            android:layout_width="wrap_content"
+            android:id="@+id/captureCameraMenu"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:minHeight="44dp"
-            android:text="@string/autofocus" />
-    </LinearLayout>
+            android:layout_marginTop="@dimen/space_m"
+            android:minHeight="@dimen/touch_min"
+            android:text="@string/camera_menu_open" />
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
-
-        <TextView
-            android:layout_width="wrap_content"
+        <Button
+            android:id="@+id/captureShoot"
+            style="@style/Widget.Button.Primary"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/capture_shots_label"
-            android:textColor="@color/ink"
-            android:textSize="13sp" />
-
-        <EditText
-            android:id="@+id/captureShots"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:contentDescription="@string/capture_shots_label"
-            android:inputType="number"
-            android:maxLines="1"
-            android:text="1" />
-    </LinearLayout>
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="@string/capture_shots_hint"
-        android:textColor="#6B7280"
-        android:textSize="11sp" />
-
-    <TextView
-        android:id="@+id/stackProgress"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
-        android:textColor="@color/ink"
-        android:textSize="13sp"
-        android:visibility="gone" />
-
-    <ImageView
-        android:id="@+id/stackPreview"
-        android:layout_width="match_parent"
-        android:layout_height="96dp"
-        android:layout_marginTop="6dp"
-        android:contentDescription="@string/stack_preview_hint"
-        android:scaleType="centerCrop"
-        android:visibility="gone" />
-
-    <Button
-        android:id="@+id/captureCameraMenu"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
-        android:minHeight="44dp"
-        android:text="@string/camera_menu_open" />
-
-    <Button
-        android:id="@+id/captureShoot"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
-        android:minHeight="48dp"
-        android:text="@string/capture_and_fetch" />
+            android:layout_marginTop="@dimen/space_s"
+            android:minHeight="48dp"
+            android:text="@string/capture_and_fetch" />
     </LinearLayout>
 </ScrollView>

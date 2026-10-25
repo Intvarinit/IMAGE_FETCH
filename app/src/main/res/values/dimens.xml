@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 4dp 基准的间距与圆角刻度：界面里不再散落魔法数字，改一处即整体变。 -->
+<resources>
+    <dimen name="space_xs">4dp</dimen>
+    <dimen name="space_s">8dp</dimen>
+    <dimen name="space_m">12dp</dimen>
+    <dimen name="space_l">16dp</dimen>
+
+    <dimen name="card_padding">@dimen/space_m</dimen>
+    <dimen name="radius_card">14dp</dimen>
+    <dimen name="radius_control">10dp</dimen>
+    <dimen name="radius_thumb">12dp</dimen>
+
+    <!-- 触控目标下限 44dp（iOS HIG）/ 48dp（Material）之间取整，保证拇指可点。 -->
+    <dimen name="touch_min">44dp</dimen>
+    <dimen name="field_label_width">52dp</dimen>
+</resources>

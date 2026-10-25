@@ -1,9 +1,87 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+      零 AndroidX 工程，主题只能基于系统 Material。这里统一状态栏/导航栏颜色与默认控件样式，
+      让主界面和各弹窗共用同一套视觉语言（按钮、输入框不再各写各的）。
+    -->
     <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorPrimary">@color/accent</item>
+        <item name="android:colorPrimaryDark">@color/accent_pressed</item>
+        <item name="android:statusBarColor">@color/background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">@color/surface</item>
         <item name="android:windowBackground">@color/background</item>
         <item name="android:windowNoTitle">true</item>
+        <!-- 全局默认控件：普通按钮统一为白底描边的次按钮，输入框统一为圆角白底。 -->
+        <item name="android:buttonStyle">@style/Widget.Button.Secondary</item>
+        <item name="android:editTextStyle">@style/Widget.Input</item>
+    </style>
+
+    <!-- 分组卡片。 -->
+    <style name="Widget.Card" parent="">
+        <item name="android:background">@drawable/bg_card</item>
+        <item name="android:padding">@dimen/card_padding</item>
+        <item name="android:orientation">vertical</item>
+    </style>
+
+    <style name="Widget.Input" parent="android:style/Widget.Material.EditText">
+        <item name="android:background">@drawable/bg_input</item>
+        <item name="android:minHeight">@dimen/touch_min</item>
+        <item name="android:paddingStart">@dimen/space_m</item>
+        <item name="android:paddingEnd">@dimen/space_m</item>
+        <item name="android:paddingTop">10dp</item>
+        <item name="android:paddingBottom">10dp</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:textColor">@color/ink</item>
+        <item name="android:textColorHint">@color/ink_muted</item>
+    </style>
+
+    <!-- 按钮基类：去全大写、去阴影、统一 44dp 触控高度与左右内边距。 -->
+    <style name="Widget.Button" parent="android:style/Widget.Material.Button">
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:minHeight">@dimen/touch_min</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:paddingStart">@dimen/space_m</item>
+        <item name="android:paddingEnd">@dimen/space_m</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <style name="Widget.Button.Primary">
+        <item name="android:background">@drawable/bg_button_primary</item>
+        <item name="android:textColor">@color/btn_primary_text</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="Widget.Button.Secondary">
+        <item name="android:background">@drawable/bg_button_secondary</item>
+        <item name="android:textColor">@color/btn_secondary_text</item>
+    </style>
+
+    <style name="Widget.Button.Danger">
+        <item name="android:background">@drawable/bg_button_danger</item>
+        <item name="android:textColor">@color/btn_danger_text</item>
+    </style>
+
+    <!-- 文字三档：字段名、正文辅助说明、区块小标题。 -->
+    <style name="Text.Label" parent="">
+        <item name="android:textSize">13sp</item>
+        <item name="android:textColor">@color/ink</item>
+    </style>
+
+    <style name="Text.Caption" parent="">
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">@color/ink_muted</item>
+        <item name="android:lineSpacingExtra">1dp</item>
+    </style>
+
+    <style name="Text.Section" parent="">
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/ink_muted</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.04</item>
     </style>
 </resources>

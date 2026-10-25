@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 缩略图格子：圆角裁切 + 底部文件名条 + 右上角选中点。点击缩略图仍放大预览。 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="120dp"
-    android:layout_margin="4dp"
-    android:background="#22000000">
+    android:layout_margin="3dp"
+    android:background="@drawable/bg_thumb"
+    android:clipToOutline="true">
 
     <ImageView
         android:id="@+id/thumb"
@@ -17,27 +19,27 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
-        android:background="#99000000"
+        android:background="@drawable/bg_caption"
         android:ellipsize="middle"
         android:maxLines="1"
-        android:paddingLeft="4dp"
-        android:paddingRight="4dp"
-        android:paddingTop="2dp"
-        android:paddingBottom="2dp"
+        android:paddingStart="6dp"
+        android:paddingTop="3dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="3dp"
         android:textColor="#FFFFFF"
         android:textSize="10sp" />
 
     <!-- 选中指示点：常驻可见，点击它即切换选中（点击缩略图其它区域仍是放大预览）。 -->
     <TextView
         android:id="@+id/selectIndicator"
-        android:layout_width="28dp"
-        android:layout_height="28dp"
+        android:layout_width="26dp"
+        android:layout_height="26dp"
         android:layout_gravity="top|end"
-        android:layout_margin="4dp"
+        android:layout_margin="6dp"
         android:background="@drawable/select_indicator"
         android:contentDescription="@string/select_hint"
         android:gravity="center"
         android:textColor="#FFFFFF"
-        android:textSize="16sp"
+        android:textSize="15sp"
         android:textStyle="bold" />
 </FrameLayout>

@@ -37,7 +37,6 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.GridView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -63,7 +62,9 @@ import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.ptp.WhiteBalanceChoices;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.ui.FocusBoxOverlayView;
+import com.imagefetch.ui.PagedGridScroll;
 import com.imagefetch.ui.PhotoGridAdapter;
+import com.imagefetch.ui.PhotoViewerDialog;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -73,7 +74,9 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -140,8 +143,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private ProgressBar progressBar;
     private TextView statusView;
     private TextView selectionCountView;
-    private GridView photoGrid;
     private PhotoGridAdapter gridAdapter;
+    /** 横向翻页的缩略图网格容器。 */
+    private PagedGridScroll gridPager;
+    private LinearLayout gridPagerContent;
+    private TextView gridIndexView;
+    /** 每屏能放几张（3 列 × N 行），用于把照片序号换算成屏号。 */
+    private int gridPageCapacity;
+    /** 图片栏代数：换页/断链时自增，用来丢弃迟到的铺格任务与缩略图解码结果。 */
+    private int gridGeneration;
+    /** 句柄 → 网格单元：缩略图/选中状态到达时就地更新，不重建整页。 */
+    private final Map<Long, View> gridCells = new HashMap<>();
+    /** 全屏看图页；不持有图片引用，关掉即释放。 */
+    private PhotoViewerDialog viewerDialog;
 
     /** 遥控拍摄面板（点「拍摄并取回」打开）；关闭后置空。 */
     private AlertDialog captureDialog;
@@ -351,14 +365,17 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         });
         setUpShotPanel();
         selectionCountView = findViewById(R.id.selectionCount);
-        photoGrid = findViewById(R.id.grid);
+        gridPager = findViewById(R.id.gridPager);
+        gridPagerContent = findViewById(R.id.gridPagerContent);
+        gridIndexView = findViewById(R.id.gridIndex);
+        gridPager.setOnScreenSettledListener(this::updateGridIndex);
 
         gridAdapter = new PhotoGridAdapter(this);
-        gridAdapter.setSelectionListener(count -> selectionCountView.setText(
-                count == 0 ? getString(R.string.selected_count) : "已选 " + count + " 张"));
-        photoGrid.setAdapter(gridAdapter);
-        // 点击缩略图放大预览；选中改由缩略图右上角的指示点完成（不再需要长按）。
-        photoGrid.setOnItemClickListener(this::onGridItemClick);
+        gridAdapter.setSelectionListener(count -> {
+            selectionCountView.setText(
+                    count == 0 ? getString(R.string.selected_count) : "已选 " + count + " 张");
+            refreshGridSelection();
+        });
 
         coordinator = new CameraSessionCoordinator(
                 this, this::ensureUsbPermission, this);
@@ -541,71 +558,17 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         nextPageButton.setEnabled(page.hasNext());
     }
 
-    /** 图片栏点击：放大预览（选中请点缩略图右上角的指示点）。 */
-    private void onGridItemClick(AdapterView<?> parent, View view, int position, long id) {
-        showPreview((CameraStorage.Item) parent.getItemAtPosition(position));
-    }
-
     /**
-     * 放大预览：先立即显示已缓存的缩略图，再异步向相机取原图替换
-     * （RAW/视频或取图失败时保持缩略图）。预览图只在弹窗存活期间需要，随弹窗关闭放弃引用。
+     * 全屏看图：交给独立的 PhotoViewerDialog，先立即显示已缓存的缩略图，
+     * 再异步向相机取原图替换（RAW/视频或取图失败时保持缩略图）。
      */
-    private void showPreview(final CameraStorage.Item item) {
-        if (item == null) return;
-        final View content = getLayoutInflater().inflate(R.layout.dialog_photo_preview, null);
-        final ImageView image = content.findViewById(R.id.previewImage);
-        final TextView info = content.findViewById(R.id.previewInfo);
-        final Button toggle = content.findViewById(R.id.previewToggle);
-
-        Bitmap thumbnail = gridAdapter.thumbnail(item.handle);
-        if (thumbnail != null) image.setImageBitmap(thumbnail);
-        image.setMaxHeight((int) (getResources().getDisplayMetrics().heightPixels * 0.6f));
-        info.setText(describe(item) + "\n" + getString(R.string.preview_loading));
-
-        final AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle(item.filename)
-                .setView(content)
-                .setNegativeButton(R.string.close, null)
-                .create();
-        final AtomicBoolean showing = new AtomicBoolean(true);
-        dialog.setOnDismissListener(ignored -> showing.set(false));
-
-        updatePreviewToggle(toggle, item);
-        toggle.setOnClickListener(view -> {
-            gridAdapter.toggle(item);
-            updatePreviewToggle(toggle, item);
-        });
-
-        dialog.show();
-        coordinator.loadPreview(item, (handle, bitmap) -> {
-            if (!showing.get()) return;
-            if (bitmap == null) {
-                info.setText(describe(item) + "\n" + getString(R.string.preview_thumbnail_only));
-                return;
-            }
-            image.setImageBitmap(bitmap);
-            info.setText(describe(item));
-        });
-    }
-
-    private void updatePreviewToggle(Button toggle, CameraStorage.Item item) {
-        // 任意格式都可选中（选中后既能删除，JPEG 还能下载），因此全部显示切换按钮。
-        toggle.setVisibility(View.VISIBLE);
-        toggle.setText(gridAdapter.isSelected(item.handle)
-                ? R.string.preview_toggle_unselect
-                : R.string.preview_toggle_select);
-    }
-
-    private static String describe(CameraStorage.Item item) {
-        StringBuilder text = new StringBuilder(item.capturedAt);
-        if (item.width > 0 && item.height > 0) {
-            text.append(" · ").append(item.width).append(" × ").append(item.height);
-        }
-        if (item.sizeBytes > 0) {
-            text.append(String.format(
-                    Locale.ROOT, " · %.1f MB", item.sizeBytes / (1024.0 * 1024.0)));
-        }
-        return text.toString();
+    private void showPreview(int position) {
+        if (position < 0 || position >= gridAdapter.getCount()) return;
+        viewerDialog = new PhotoViewerDialog(this, gridAdapter, position,
+                (item, result) -> coordinator.loadPreview(item,
+                        (handle, bitmap) -> result.onPreview(handle, bitmap)));
+        viewerDialog.setOnPageChangedListener(this::scrollToPhoto);
+        viewerDialog.show();
     }
 
     // ── 遥控拍摄面板（实时取景 + 快门/光圈/ISO） ──
@@ -1390,6 +1353,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     @Override
     protected void onDestroy() {
         // 先收起遥控面板：它持有取景位图，且停取景要在 executor 关闭之前发出。
+        if (viewerDialog != null) {
+            viewerDialog.dismiss();
+            viewerDialog = null;
+        }
         dismissCapturePanel();
         deferredRecycle.removeCallbacksAndMessages(null);
         debounceHandler.removeCallbacksAndMessages(null);
@@ -1457,6 +1424,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             diffBaseline = null;
             // 链路已断：清掉图片栏，避免展示已经无法下载/预览的旧缩略图。
             gridAdapter.reset();
+            clearGridPager();
             statusView.setText(R.string.status_idle);
             // 手动断开即结束会话，前台服务随之停止。
             CameraConnectionService.stop(this);
@@ -1471,6 +1439,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             dismissCapturePanel();
             // 链路丢失即清空图片栏（重连成功后 onConnected 会重新读卡填充第一页）。
             gridAdapter.reset();
+            clearGridPager();
             statusView.setText("链路丢失，自动重连第 " + attempt + " 次，"
                     + (delayMillis / 1000) + " 秒后重试…");
             // 重连期间保持前台服务运行：进程一旦被回收，退避重连就再也跑不完了。
@@ -3087,11 +3056,143 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 填充图片栏，并异步逐张拉取缩略图（与相机事务串行，不会与下载交错）。 */
     private void populate(CameraStorage.Page page) {
         gridAdapter.setItems(page.items);
-        // 翻页后回到顶端：否则上一页的滚动位置会带过来，看起来像没换页。
-        photoGrid.setSelection(0);
-        coordinator.loadThumbnails(
-                new ArrayList<>(page.items),
-                (handle, jpeg) -> gridAdapter.putThumbnailJpeg(handle, jpeg));
+        final List<CameraStorage.Item> items = new ArrayList<>(page.items);
+        final int generation = ++gridGeneration;
+        // 铺格要为整页每张图 inflate 视图：排到下一轮消息再建，别堵住紧随其后的相机回调。
+        gridPager.post(() -> {
+            if (generation != gridGeneration) return;
+            rebuildPagedGrid(items);
+        });
+        coordinator.loadThumbnails(items, (handle, jpeg) -> {
+            // 一页最多 100 张，解码全部放主线程会和相机结果回调抢同一个消息队列。
+            if (isDestroyed()) return;
+            thumbnailExecutor.submit(() -> {
+                Bitmap bitmap = PhotoGridAdapter.decodeJpeg(
+                        jpeg, PhotoGridAdapter.THUMBNAIL_TARGET_PX);
+                if (bitmap == null) return;
+                runOnUiThread(() -> {
+                    if (generation != gridGeneration) {
+                        bitmap.recycle();
+                        return;
+                    }
+                    gridAdapter.putThumbnailBitmap(handle, bitmap);
+                    refreshGridThumbnail(handle);
+                });
+            });
+        });
+    }
+
+    /**
+     * 把本页照片铺成横向翻页的网格：每屏 3 列 × N 行（N 由可用高度决定），
+     * 先向下排满一列再往右开下一列，左右滑动整屏翻页。
+     */
+    private void rebuildPagedGrid(final List<CameraStorage.Item> items) {
+        gridPagerContent.removeAllViews();
+        gridCells.clear();
+        int width = gridPager.getWidth();
+        int height = gridPager.getHeight();
+        if (width <= 0 || height <= 0) {
+            // 首次填充可能早于布局完成：等测量出来再建。
+            gridPager.post(() -> rebuildPagedGrid(items));
+            return;
+        }
+
+        int columnsPerScreen = 3;
+        int cellWidth = width / columnsPerScreen;
+        int cellHeightDp = 120;
+        int rows = Math.max(1, Math.round(height / (float) dp(cellHeightDp)));
+        int cellHeight = height / rows;
+        gridPageCapacity = columnsPerScreen * rows;
+
+        LinearLayout column = null;
+        for (int index = 0; index < items.size(); index++) {
+            if (index % rows == 0) {
+                column = new LinearLayout(this);
+                column.setOrientation(LinearLayout.VERTICAL);
+                column.setLayoutParams(new LinearLayout.LayoutParams(cellWidth, height));
+                gridPagerContent.addView(column);
+            }
+            CameraStorage.Item item = items.get(index);
+            final int position = index;
+            View cell = gridAdapter.getView(index, null, column);
+            // 格子之间留 3dp 间隙：宽度/高度按去掉两侧间隙后的尺寸分配。
+            int gap = Math.round(dp(3));
+            LinearLayout.LayoutParams cellParams =
+                    new LinearLayout.LayoutParams(cellWidth - gap * 2, cellHeight - gap * 2);
+            cellParams.setMargins(gap, gap, gap, gap);
+            cell.setLayoutParams(cellParams);
+            // 点缩略图（右上角选中点除外）进入全屏看图。
+            cell.setOnClickListener(view -> showPreview(position));
+            gridCells.put(item.handle, cell);
+            column.addView(cell);
+        }
+
+        gridPager.scrollTo(0, 0);
+        gridPager.post(() -> updateGridIndex(0, gridScreenCount()));
+    }
+
+    private float dp(float value) {
+        return value * getResources().getDisplayMetrics().density;
+    }
+
+    private int gridScreenCount() {
+        int width = Math.max(1, gridPager.getWidth());
+        return Math.max(1, (gridPagerContent.getWidth() + width - 1) / width);
+    }
+
+    /** 停稳在某屏后更新右下角「第 x-y 张 / 共 n 张」。 */
+    private void updateGridIndex(int screen, int screenCount) {
+        int total = gridAdapter.getCount();
+        if (total == 0 || gridPageCapacity <= 0) {
+            gridIndexView.setText("");
+            gridIndexView.setVisibility(View.GONE);
+            return;
+        }
+        int start = Math.min(total, screen * gridPageCapacity + 1);
+        int end = Math.min(total, (screen + 1) * gridPageCapacity);
+        String text = String.format(Locale.ROOT, "第 %d-%d 张 / 共 %d 张", start, end, total);
+        if (screenCount > 1) {
+            text += String.format(Locale.ROOT, "（%d/%d 屏）", screen + 1, screenCount);
+        }
+        gridIndexView.setText(text);
+        gridIndexView.setVisibility(View.VISIBLE);
+    }
+
+    /** 某张缩略图就绪后只更新那一格，避免整页重建导致滑动位置跳动。 */
+    private void refreshGridThumbnail(long handle) {
+        View cell = gridCells.get(handle);
+        if (cell == null) return;
+        Bitmap bitmap = gridAdapter.thumbnail(handle);
+        if (bitmap == null) return;
+        ((ImageView) cell.findViewById(R.id.thumb)).setImageBitmap(bitmap);
+    }
+
+    /** 选中状态变化时同步网格里每格的指示点。 */
+    private void refreshGridSelection() {
+        for (Map.Entry<Long, View> entry : gridCells.entrySet()) {
+            TextView indicator = entry.getValue().findViewById(R.id.selectIndicator);
+            boolean checked = gridAdapter.isSelected(entry.getKey());
+            indicator.setSelected(checked);
+            indicator.setText(checked ? getString(R.string.selected_mark) : "");
+        }
+    }
+
+    /** 全屏看图翻到某张时，主界面网格跟着滑到那张所在的屏。 */
+    private void scrollToPhoto(int position) {
+        if (gridPageCapacity <= 0) return;
+        int screen = position / gridPageCapacity;
+        gridPager.smoothScrollTo(screen * gridPager.getWidth(), 0);
+    }
+
+    /** 链路断开时清空网格与序号。 */
+    private void clearGridPager() {
+        // 代数自增：把还没执行的铺格任务和在途缩略图解码结果一并作废。
+        gridGeneration++;
+        gridPagerContent.removeAllViews();
+        gridCells.clear();
+        gridPageCapacity = 0;
+        gridIndexView.setText("");
+        gridIndexView.setVisibility(View.GONE);
     }
 
     private void setBusy(boolean busy) {

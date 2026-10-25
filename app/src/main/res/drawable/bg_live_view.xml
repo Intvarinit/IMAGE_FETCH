@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 实时取景黑底容器：圆角 + clipToOutline，让画面与弹窗其它圆角控件统一。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#000000" />
+    <corners android:radius="@dimen/radius_card" />
+</shape>

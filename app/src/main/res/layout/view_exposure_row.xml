@@ -8,31 +8,33 @@
 
     <TextView
         android:id="@+id/rowLabel"
-        android:layout_width="52dp"
-        android:layout_height="wrap_content"
-        android:textColor="@color/ink"
-        android:textSize="13sp" />
+        style="@style/Text.Label"
+        android:layout_width="@dimen/field_label_width"
+        android:layout_height="wrap_content" />
 
     <Button
         android:id="@+id/rowMinus"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:contentDescription="@string/exposure_minus"
-        android:minWidth="52dp"
+        android:minWidth="48dp"
         android:text="@string/exposure_minus" />
 
+    <!-- 中间这格是「点一下直接选档」，用浅底圆角与两侧按钮区分：它是数值区，不是按钮。 -->
     <TextView
         android:id="@+id/rowValue"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
+        android:layout_marginStart="@dimen/space_s"
+        android:layout_marginEnd="@dimen/space_s"
         android:layout_weight="1"
-        android:background="?android:attr/selectableItemBackground"
+        android:background="@drawable/bg_value"
         android:clickable="true"
         android:ellipsize="end"
         android:focusable="true"
         android:gravity="center"
         android:maxLines="1"
-        android:minHeight="40dp"
+        android:minHeight="@dimen/touch_min"
         android:text="@string/exposure_unknown"
         android:textColor="@color/ink"
         android:textSize="15sp"
@@ -43,6 +45,6 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:contentDescription="@string/exposure_plus"
-        android:minWidth="52dp"
+        android:minWidth="48dp"
         android:text="@string/exposure_plus" />
 </LinearLayout>

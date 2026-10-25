@@ -12,20 +12,19 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:padding="@dimen/space_l">
 
         <TextView
             android:id="@+id/cameraMenuStatus"
+            style="@style/Text.Caption"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textColor="#6B7280"
-            android:textSize="11sp" />
+            android:layout_height="wrap_content" />
 
         <LinearLayout
             android:id="@+id/cameraMenuItems"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="@dimen/space_s"
             android:orientation="vertical">
 
             <LinearLayout
@@ -35,11 +34,10 @@
                 android:orientation="horizontal">
 
                 <TextView
-                    android:layout_width="52dp"
+                    style="@style/Text.Label"
+                    android:layout_width="@dimen/field_label_width"
                     android:layout_height="wrap_content"
-                    android:text="@string/white_balance_label"
-                    android:textColor="@color/ink"
-                    android:textSize="13sp" />
+                    android:text="@string/white_balance_label" />
 
                 <Spinner
                     android:id="@+id/whiteBalance"
@@ -58,7 +56,7 @@
                 android:id="@+id/colorTemperatureSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
+                android:layout_marginTop="@dimen/space_m"
                 android:orientation="vertical"
                 android:visibility="gone">
 
@@ -69,11 +67,10 @@
                     android:orientation="horizontal">
 
                     <TextView
-                        android:layout_width="52dp"
+                        style="@style/Text.Label"
+                        android:layout_width="@dimen/field_label_width"
                         android:layout_height="wrap_content"
-                        android:text="@string/color_temperature_label"
-                        android:textColor="@color/ink"
-                        android:textSize="13sp" />
+                        android:text="@string/color_temperature_label" />
 
                     <EditText
                         android:id="@+id/colorTemperatureInput"
@@ -85,36 +82,32 @@
                         android:imeOptions="actionDone"
                         android:inputType="number"
                         android:maxLength="5"
-                        android:minWidth="90dp"
-                        android:textSize="14sp" />
+                        android:minWidth="90dp" />
 
                     <Button
                         android:id="@+id/colorTemperatureApply"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:layout_marginStart="8dp"
-                        android:minHeight="40dp"
+                        android:layout_marginStart="@dimen/space_s"
                         android:text="@string/color_temperature_apply" />
                 </LinearLayout>
 
                 <TextView
                     android:id="@+id/colorTemperatureHint"
+                    style="@style/Text.Caption"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:text="@string/color_temperature_help"
-                    android:textColor="#6B7280"
-                    android:textSize="11sp" />
+                    android:layout_marginTop="@dimen/space_xs"
+                    android:text="@string/color_temperature_help" />
             </LinearLayout>
         </LinearLayout>
 
         <TextView
             android:id="@+id/whiteBalanceHint"
+            style="@style/Text.Caption"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/white_balance_hint"
-            android:textColor="#6B7280"
-            android:textSize="11sp" />
+            android:layout_marginTop="@dimen/space_xs"
+            android:text="@string/white_balance_hint" />
     </LinearLayout>
 </ScrollView>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 缩略图底板：配合 clipToOutline 把图片裁成圆角，未加载时也有稳定的占位底色。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/surface_muted" />
+    <corners android:radius="@dimen/radius_thumb" />
+</shape>
