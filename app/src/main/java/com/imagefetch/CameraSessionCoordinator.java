@@ -40,6 +40,7 @@ import com.imagefetch.transfer.ReconnectPolicy;
 import com.imagefetch.transfer.TransferControl;
 import com.imagefetch.transport.CameraTransport;
 import com.imagefetch.transport.PtpIpTransport;
+import com.imagefetch.transport.PtpResponseException;
 import com.imagefetch.transport.UsbPtpTransport;
 
 import java.io.File;
@@ -1865,7 +1866,11 @@ public final class CameraSessionCoordinator {
                 // 「刚拍完就改参数报忙」就是这么来的。下载要花好几秒，必须先把取景还回去。
                 // 但多张包围期间不得提前还取景：恢复取景（重发 0x9151/0xD1B0）会打断机内
                 // 仍在跑的连拍序列（实测 8 张只剩 4 张）。这时留到取回结束再恢复。
-                if (resumeLiveView && (!multiShot || directHandles.length > 0)) {
+                // 相机仍在忙时不能碰取景输出：机内 HDR/合成/连拍写卡期间重发 EVF 开启序列
+                // （0x9151/0xD1B0）会打断剩余曝光，表现就是「只拍了一张、相机一直 busy、
+                // 卡里也找不到成品」。先探一次，忙就等取回流程结束再恢复取景。
+                if (resumeLiveView && (!multiShot || directHandles.length > 0)
+                        && !isCameraStillBusy()) {
                     liveViewResumed = resumeLiveViewAfterCapture(1) == null;
                 }
 
@@ -1995,6 +2000,23 @@ public final class CameraSessionCoordinator {
                 mainHandler.post(listener::onCaptureFinished);
             }
         });
+    }
+
+    /**
+     * 快门后相机是否仍处于忙态（机内合成 / 写卡）。
+     *
+     * <p>用一次轻量句柄读取探路：回可重试的忙码说明快门序列还没走完，此时恢复取景
+     * 会反过来打断它；其它异常按「不忙」处理，交给后续取回流程去报错。
+     */
+    private boolean isCameraStillBusy() {
+        try {
+            operations.snapshot(1);
+            return false;
+        } catch (PtpResponseException busy) {
+            return busy.isTransient();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     /**

@@ -2,6 +2,7 @@ package com.imagefetch.transfer;
 
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.PtpOperationService;
+import com.imagefetch.transport.PtpResponseException;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -118,7 +119,19 @@ public final class NewPhotoResolver {
                 hasEventCandidate = !eventHandles.isEmpty();
             }
 
-            CameraStorage.Snapshot snapshot = operations.snapshot(maxItems);
+            CameraStorage.Snapshot snapshot;
+            try {
+                snapshot = operations.snapshot(maxItems);
+            } catch (PtpResponseException busy) {
+                // HDR/机内合成/连拍写卡期间相机回 0xA106（屏幕同时显示 busy），
+                // 这一轮读不到卡并不代表拍摄失败，等处理完继续轮询即可。
+                if (!busy.isTransient()) throw busy;
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw busy;
+                // 退避比正常轮询更久：相机忙着合成/写卡时，100ms 一次的读卡只会继续撞忙。
+                sleep(Math.min(Math.max(500L, pollIntervalMillis), remaining / 1_000_000L));
+                continue;
+            }
             List<CameraStorage.Item> matches = new ArrayList<>();
             if (hasEventCandidate) {
                 eventSeen = true;

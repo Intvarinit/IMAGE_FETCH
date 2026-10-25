@@ -14,9 +14,19 @@ public final class PtpResponseException extends IOException {
         responseCode = response;
     }
 
-    /** DeviceBusy(0x2019) / GeneralError(0x2006)：写卡尚未完成等可重试情形。 */
+    /**
+     * DeviceBusy(0x2019) / GeneralError(0x2006) / ObjectNotReady(0xA102) /
+     * MemoryStatusNotReady(0xA106)：写卡或机内合成尚未完成等可重试情形。
+     *
+     * <p>0xA106 是 Canon EOS 的「内存状态未就绪」：HDR、机内合成、连拍写卡期间
+     * 相机屏幕会显示 busy，此时任何读卡/取对象命令都可能被它顶回来。它不是永久失败，
+     * 等相机处理完再发就能成功。
+     */
     public boolean isTransient() {
-        return responseCode == 0x2019 || responseCode == 0x2006;
+        return responseCode == 0x2019
+                || responseCode == 0x2006
+                || responseCode == 0xa102
+                || responseCode == 0xa106;
     }
 
     /** SessionNotOpen(0x2003) / InvalidTransactionID(0x2004) / SessionAlreadyOpen(0x201E)。 */

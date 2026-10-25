@@ -249,6 +249,12 @@ public final class PtpIpTransport implements CameraTransport {
     /** 相机「这一帧还没准备好」的响应码；属正常情况，退避重试即可。 */
     private static final int RESPONSE_CANON_OBJECT_NOT_READY = 0xa102;
     private static final int RESPONSE_DEVICE_BUSY = 0x2019;
+    /**
+     * 相机内存/写卡尚未就绪（Canon EOS 的 MemoryStatusNotReady）。
+     * HDR、机内合成、连拍写卡期间相机屏幕会显示 busy，此时取景帧、属性写入、读卡命令
+     * 都可能被这个码顶回来；等相机处理完再发即可，不是永久失败。
+     */
+    private static final int RESPONSE_CANON_MEMORY_NOT_READY = 0xa106;
     /** 操作不被支持：0x100E 在 EOS 上的典型应答，也是此处区分报错文案的依据。 */
     private static final int RESPONSE_OPERATION_NOT_SUPPORTED = 0x2005;
     /** 参数不被支持：厂商快门参数形态不一致时的典型应答，用于决定是否换参数重试。 */
@@ -1213,18 +1219,23 @@ public final class PtpIpTransport implements CameraTransport {
      */
     private ReleaseResult releaseCommandRetrying(int operation, long[] parameters) throws Exception {
         ReleaseResult result = releaseCommand(operation, parameters);
-        for (int retry = 1; result.code == RESPONSE_DEVICE_BUSY
+        for (int retry = 1; isCanonBusy(result.code)
                 && retry <= CANON_RELEASE_BUSY_RETRIES; retry++) {
             sleepQuietly(CANON_RELEASE_BUSY_BACKOFF_MS * retry);
             drainEosEventsForCapture();
             result = releaseCommand(operation, parameters);
         }
-        if (result.code == RESPONSE_DEVICE_BUSY) {
+        if (isCanonBusy(result.code)) {
             rebuildCanonStateAfterBusy();
             drainEosEventsForCapture();
             result = releaseCommand(operation, parameters);
         }
         return result;
+    }
+
+    /** 相机暂时忙、可退避重试的响应码：通用 DeviceBusy 与 EOS 的内存未就绪。 */
+    private static boolean isCanonBusy(int code) {
+        return code == RESPONSE_DEVICE_BUSY || code == RESPONSE_CANON_MEMORY_NOT_READY;
     }
 
     // ── Canon EOS 实时取景与曝光参数 ──
@@ -1503,7 +1514,7 @@ public final class PtpIpTransport implements CameraTransport {
                     new long[]{CANON_VIEWFINDER_PARAMETER, 0, 0});
         } catch (PtpResponseException notReady) {
             if (notReady.responseCode == RESPONSE_CANON_OBJECT_NOT_READY
-                    || notReady.responseCode == RESPONSE_DEVICE_BUSY) {
+                    || isCanonBusy(notReady.responseCode)) {
                 return null;
             }
             throw notReady;
@@ -1594,7 +1605,7 @@ public final class PtpIpTransport implements CameraTransport {
         // 取景中相机繁忙时 0x9110 会瞬时回 0x2019，退避重试几次（libgphoto2 同样把 0x9110 的
         // DeviceBusy 当「暂时忙」，config.c:355）。
         int code = writeCanonPropertyRetrying(setting.vendorProperty, value & 0xffffL);
-        if (code == RESPONSE_DEVICE_BUSY) {
+        if (isCanonBusy(code)) {
             // 退避重试仍然被拒：相机很可能已经不在遥控/事件态了（真机实测：按过一次自动对焦
             // 之后就是这种状态，0x9110 此后再也写不进去，只能关面板重开或重连才恢复）。
             // 先把状态重建回来，再补写一次——状态重建好的话，这一次立刻就能成。
@@ -1713,7 +1724,7 @@ public final class PtpIpTransport implements CameraTransport {
         // 该属性在 libgphoto2 里是 u8（config.c:12092），只取低字节；0x9110 的载荷固定 4 字节，
         // 高字节留 0 与 libgphoto2 的默认分支一致。
         int code = writeCanonPropertyRetrying(CANON_PROP_WHITE_BALANCE, value & 0xffL);
-        if (code == RESPONSE_DEVICE_BUSY) {
+        if (isCanonBusy(code)) {
             rebuildCanonStateAfterBusy();
             code = writeCanonProperty(CANON_PROP_WHITE_BALANCE, value & 0xffL);
         }
@@ -1748,7 +1759,7 @@ public final class PtpIpTransport implements CameraTransport {
         String drainFailure = drainEosEvents();
         cancelCanonAutofocus();
         int code = writeCanonPropertyRetrying(CANON_PROP_COLOR_TEMPERATURE, kelvin & 0xffff_ffffL);
-        if (code == RESPONSE_DEVICE_BUSY) {
+        if (isCanonBusy(code)) {
             rebuildCanonStateAfterBusy();
             code = writeCanonProperty(CANON_PROP_COLOR_TEMPERATURE, kelvin & 0xffff_ffffL);
         }
@@ -1782,7 +1793,7 @@ public final class PtpIpTransport implements CameraTransport {
         String drainFailure = drainEosEvents();
         cancelCanonAutofocus();
         int code = writeCanonPropertyRetrying(CANON_PROP_AF_METHOD, value & 0xffffL);
-        if (code == RESPONSE_DEVICE_BUSY) {
+        if (isCanonBusy(code)) {
             rebuildCanonStateAfterBusy();
             code = writeCanonProperty(CANON_PROP_AF_METHOD, value & 0xffffL);
         }
@@ -2030,7 +2041,7 @@ public final class PtpIpTransport implements CameraTransport {
     private int writeCanonPropertyBlobRetrying(int propertyCode, byte[] region) throws Exception {
         int code = RESPONSE_DEVICE_BUSY;
         for (int attempt = 0;
-                attempt <= CANON_PROP_WRITE_BUSY_RETRIES && code == RESPONSE_DEVICE_BUSY;
+                attempt <= CANON_PROP_WRITE_BUSY_RETRIES && isCanonBusy(code);
                 attempt++) {
             if (attempt > 0) {
                 sleepQuietly(CANON_RELEASE_BUSY_BACKOFF_MS * attempt);
@@ -2038,7 +2049,7 @@ public final class PtpIpTransport implements CameraTransport {
             }
             code = writeCanonPropertyBlob(propertyCode, region);
         }
-        if (code == RESPONSE_DEVICE_BUSY) {
+        if (isCanonBusy(code)) {
             rebuildCanonStateAfterBusy();
             code = writeCanonPropertyBlob(propertyCode, region);
         }
@@ -2075,7 +2086,7 @@ public final class PtpIpTransport implements CameraTransport {
     private int writeCanonPropertyRetrying(int propertyCode, long value) throws Exception {
         int code = RESPONSE_DEVICE_BUSY;
         for (int attempt = 0;
-                attempt <= CANON_PROP_WRITE_BUSY_RETRIES && code == RESPONSE_DEVICE_BUSY;
+                attempt <= CANON_PROP_WRITE_BUSY_RETRIES && isCanonBusy(code);
                 attempt++) {
             if (attempt > 0) {
                 sleepQuietly(CANON_RELEASE_BUSY_BACKOFF_MS * attempt);
