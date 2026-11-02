@@ -26,6 +26,7 @@ import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -142,6 +143,7 @@ public final class FilmSimulationDialog extends Dialog {
     private SeekBar tintBar;
     private SeekBar grainBar;
     private SeekBar halationBar;
+    private CheckBox monochromeBox;
     private TextView exposureValue;
     private TextView temperatureValue;
     private TextView tintValue;
@@ -228,6 +230,7 @@ public final class FilmSimulationDialog extends Dialog {
         tintBar = findViewById(R.id.filmTintBar);
         grainBar = findViewById(R.id.filmGrainBar);
         halationBar = findViewById(R.id.filmHalationBar);
+        monochromeBox = findViewById(R.id.filmMonochrome);
         exposureValue = findViewById(R.id.filmExposureValue);
         temperatureValue = findViewById(R.id.filmTemperatureValue);
         tintValue = findViewById(R.id.filmTintValue);
@@ -387,6 +390,10 @@ public final class FilmSimulationDialog extends Dialog {
                 schedulePreview();
             }
         });
+        monochromeBox.setOnCheckedChangeListener((button, checked) -> {
+            settings.monochrome = checked;
+            schedulePreview();
+        });
     }
 
     private void updateSliderLabels() {
@@ -415,6 +422,7 @@ public final class FilmSimulationDialog extends Dialog {
         tintBar.setProgress(TINT_DEFAULT);
         grainBar.setProgress(GRAIN_DEFAULT);
         halationBar.setProgress(HALATION_DEFAULT);
+        monochromeBox.setChecked(false);
     }
 
     // ── 相机 RAW 列表 ──

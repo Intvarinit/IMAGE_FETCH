@@ -199,6 +199,7 @@
     <string name="film_status_ready_upscaled">%1$s · %2$d × %3$d（RAW 内嵌预览 2× 放大）· 长按画面可对比原图</string>
     <string name="film_positive">正片（无相纸）</string>
     <string name="film_positive_tag">正片</string>
+    <string name="film_monochrome">先转黑白（保留颗粒与光晕）</string>
     <string name="film_params">%1$s → %2$s\n曝光 %3$s · 色温 %4$s · 色调 %5$s · 颗粒 %6$d%% · 光晕 %7$d%%\n密度曲线来自 spektrafilm（CC BY-SA 4.0）；本页为半物理近似，非逐像素复刻。</string>
     <string name="film_no_catalog">没有读到内置胶片数据。</string>
     <string name="film_data_load_failed">内置胶片数据读取失败。</string>

@@ -32,6 +32,8 @@ public final class FilmSimulator {
         public double grain = 0.35;
         /** 光晕强度（0…1）。 */
         public double halation = 0.35;
+        /** 先转黑白：任意胶片都可以只保留明暗、颗粒与光晕，输出中性灰。 */
+        public boolean monochrome;
 
         public Settings copy() {
             Settings copy = new Settings();
@@ -40,6 +42,7 @@ public final class FilmSimulator {
             copy.tint = tint;
             copy.grain = grain;
             copy.halation = halation;
+            copy.monochrome = monochrome;
             return copy;
         }
     }
@@ -117,18 +120,34 @@ public final class FilmSimulator {
                 float green = toneLut[1][(argb >>> 8) & 0xff];
                 float blue = toneLut[2][argb & 0xff];
 
+                if (tuned.monochrome) {
+                    // 先转黑白：色调映射后的三通道取亮度，去掉胶片的成色偏色。
+                    float gray = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
+                    red = gray;
+                    green = gray;
+                    blue = gray;
+                }
+
                 if (grainAmount > 0.0) {
                     float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
                     float weight = 4.0f * luminance * (1.0f - luminance);
                     if (weight < 0.0f) weight = 0.0f;
-                    float common = hashNoise(x, y, 0x51ed) * 0.7f;
-                    float nr = common + hashNoise(x, y, 0x2f1b) * 0.3f;
-                    float ng = common + hashNoise(x, y, 0x71a3) * 0.3f;
-                    float nb = common + hashNoise(x, y, 0x19c7) * 0.3f;
                     float scale = (float) grainAmount * weight;
-                    red *= 1.0f + nr * scale;
-                    green *= 1.0f + ng * scale;
-                    blue *= 1.0f + nb * scale;
+                    if (tuned.monochrome) {
+                        // 黑白颗粒是同一颗银盐，三通道用同一噪声，避免彩色噪点。
+                        float factor = 1.0f + hashNoise(x, y, 0x51ed) * scale;
+                        red *= factor;
+                        green = red;
+                        blue = red;
+                    } else {
+                        float common = hashNoise(x, y, 0x51ed) * 0.7f;
+                        float nr = common + hashNoise(x, y, 0x2f1b) * 0.3f;
+                        float ng = common + hashNoise(x, y, 0x71a3) * 0.3f;
+                        float nb = common + hashNoise(x, y, 0x19c7) * 0.3f;
+                        red *= 1.0f + nr * scale;
+                        green *= 1.0f + ng * scale;
+                        blue *= 1.0f + nb * scale;
+                    }
                 }
 
                 if (glow != null) {
@@ -136,9 +155,16 @@ public final class FilmSimulator {
                     float gy = (y + 0.5f) / GLOW_DOWNSCALE - 0.5f;
                     float value = sampleGlow(glow, glowWidth, glowHeight, gx, gy);
                     float strength = (float) halationStrength * value;
-                    red += strength;
-                    green += strength * 0.40f;
-                    blue += strength * 0.16f;
+                    if (tuned.monochrome) {
+                        // 黑白的光晕是中性灰溢出，不带暖色。
+                        red += strength;
+                        green += strength;
+                        blue += strength;
+                    } else {
+                        red += strength;
+                        green += strength * 0.40f;
+                        blue += strength * 0.16f;
+                    }
                 }
 
                 int r = encode(red, encodeLut);
