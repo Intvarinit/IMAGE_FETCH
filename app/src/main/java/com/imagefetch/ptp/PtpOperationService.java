@@ -61,6 +61,11 @@ public final class PtpOperationService {
         return transport.listStoragePage(pageSize, pageIndex, jpegOnly);
     }
 
+    /** 按照片分页（JPG + RAW）：胶片模拟页的两种来源都用它。 */
+    public CameraStorage.Page photoPage(int pageSize, int pageIndex) throws Exception {
+        return transport.listStoragePhotoPage(pageSize, pageIndex);
+    }
+
     /** 存储卡结构变化后清掉句柄缓存。 */
     public void invalidateStorageCache() {
         transport.invalidateStorageCache();

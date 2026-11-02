@@ -55,6 +55,11 @@ public interface CameraTransport extends Closeable {
     CameraStorage.Page listStoragePage(int pageSize, int pageIndex, boolean jpegOnly)
             throws Exception;
 
+    /** 按照片分页（JPG + RAW）：胶片模拟页的两种来源都用它。 */
+    default CameraStorage.Page listStoragePhotoPage(int pageSize, int pageIndex) throws Exception {
+        throw new UnsupportedOperationException("当前连接方式不支持按照片分页");
+    }
+
     /** 存储卡结构变化后（拍摄、删除、换卡）清掉句柄缓存。 */
     default void invalidateStorageCache() {
         // 默认无缓存。

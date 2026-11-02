@@ -1,0 +1,413 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  胶片模拟的独立全屏页（Dialog，零 AndroidX 工程不使用 Fragment/Activity 切换）。
+  深色底是为了让照片本身成为视觉主体：顶栏只有标题与关闭，中间是可长按对比的预览，
+  下方是胶片选择、RAW 来源与五个参数滑杆，最底部是参数说明与导出。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/filmRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/film_background">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="@dimen/space_l">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/film_simulation_title"
+                android:textColor="@color/film_text"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/filmClose"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/close" />
+        </LinearLayout>
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_marginTop="@dimen/space_s"
+            android:layout_weight="1"
+            android:background="@drawable/bg_film_preview">
+
+            <ImageView
+                android:id="@+id/filmPreview"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="@string/film_simulation_title"
+                android:padding="2dp"
+                android:scaleType="fitCenter" />
+
+            <ProgressBar
+                android:id="@+id/filmProgress"
+                style="?android:attr/progressBarStyleLarge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/filmCompareHint"
+                style="@style/Text.Caption"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:background="@drawable/bg_caption"
+                android:paddingStart="@dimen/space_s"
+                android:paddingTop="2dp"
+                android:paddingEnd="@dimen/space_s"
+                android:paddingBottom="2dp"
+                android:text="@string/film_long_press_compare"
+                android:textColor="#FFFFFF"
+                android:visibility="gone" />
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/filmStatus"
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:text="@string/film_status_waiting_raw"
+            android:textColor="@color/film_text_muted" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                style="@style/Text.Caption"
+                android:layout_width="@dimen/field_label_width"
+                android:layout_height="wrap_content"
+                android:text="@string/film_stock_label"
+                android:textColor="@color/film_text_muted" />
+
+            <Spinner
+                android:id="@+id/filmStockSpinner"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_film_input"
+                android:contentDescription="@string/film_stock_label"
+                android:paddingStart="@dimen/space_s"
+                android:paddingEnd="@dimen/space_s" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                style="@style/Text.Caption"
+                android:layout_width="@dimen/field_label_width"
+                android:layout_height="wrap_content"
+                android:text="@string/film_source_label"
+                android:textColor="@color/film_text_muted" />
+
+            <Spinner
+                android:id="@+id/filmSourceSpinner"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_film_input"
+                android:contentDescription="@string/film_source_label"
+                android:paddingStart="@dimen/space_s"
+                android:paddingEnd="@dimen/space_s" />
+
+            <Button
+                android:id="@+id/filmPrevPage"
+                android:layout_width="44dp"
+                android:layout_height="40dp"
+                android:layout_marginStart="6dp"
+                android:minWidth="0dp"
+                android:paddingStart="0dp"
+                android:paddingEnd="0dp"
+                android:text="@string/film_page_prev" />
+
+            <Button
+                android:id="@+id/filmNextPage"
+                android:layout_width="44dp"
+                android:layout_height="40dp"
+                android:layout_marginStart="4dp"
+                android:minWidth="0dp"
+                android:paddingStart="0dp"
+                android:paddingEnd="0dp"
+                android:text="@string/film_page_next" />
+        </LinearLayout>
+
+        <!-- 参数滑杆：两列三行，最后一行右侧放「重置参数」，避免出现半格空白。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:orientation="horizontal">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="@dimen/space_s"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        style="@style/Text.Caption"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/film_exposure_label"
+                        android:textColor="@color/film_text_muted" />
+
+                    <TextView
+                        android:id="@+id/filmExposureValue"
+                        style="@style/Text.Caption"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/film_text" />
+                </LinearLayout>
+
+                <SeekBar
+                    android:id="@+id/filmExposureBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="34dp"
+                    android:max="60"
+                    android:progress="30" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        style="@style/Text.Caption"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/film_temperature_label"
+                        android:textColor="@color/film_text_muted" />
+
+                    <TextView
+                        android:id="@+id/filmTemperatureValue"
+                        style="@style/Text.Caption"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/film_text" />
+                </LinearLayout>
+
+                <SeekBar
+                    android:id="@+id/filmTemperatureBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="34dp"
+                    android:max="100"
+                    android:progress="50" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:orientation="horizontal">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="@dimen/space_s"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        style="@style/Text.Caption"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/film_tint_label"
+                        android:textColor="@color/film_text_muted" />
+
+                    <TextView
+                        android:id="@+id/filmTintValue"
+                        style="@style/Text.Caption"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/film_text" />
+                </LinearLayout>
+
+                <SeekBar
+                    android:id="@+id/filmTintBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="34dp"
+                    android:max="100"
+                    android:progress="50" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        style="@style/Text.Caption"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/film_grain_label"
+                        android:textColor="@color/film_text_muted" />
+
+                    <TextView
+                        android:id="@+id/filmGrainValue"
+                        style="@style/Text.Caption"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/film_text" />
+                </LinearLayout>
+
+                <SeekBar
+                    android:id="@+id/filmGrainBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="34dp"
+                    android:max="100"
+                    android:progress="35" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:orientation="horizontal">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="@dimen/space_s"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        style="@style/Text.Caption"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/film_halation_label"
+                        android:textColor="@color/film_text_muted" />
+
+                    <TextView
+                        android:id="@+id/filmHalationValue"
+                        style="@style/Text.Caption"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/film_text" />
+                </LinearLayout>
+
+                <SeekBar
+                    android:id="@+id/filmHalationBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="34dp"
+                    android:max="100"
+                    android:progress="35" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/filmReset"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_gravity="center_vertical"
+                android:layout_weight="1"
+                android:text="@string/film_reset" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/filmLoad"
+                style="@style/Widget.Button.Primary"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/film_load_raw"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/filmPickLocal"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:text="@string/film_pick_local"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/filmExport"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:text="@string/film_export"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/filmParams"
+            style="@style/Text.Caption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:maxLines="3"
+            android:textColor="@color/film_text_muted" />
+    </LinearLayout>
+</FrameLayout>

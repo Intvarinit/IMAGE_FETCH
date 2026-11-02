@@ -23,10 +23,13 @@
         android:maxSdkVersion="28" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
+    <!-- 胶片模拟的全尺寸导出要在内存里同时持有源图、像素缓冲与成品位图
+         （4096 边长源图约 45MB，峰值 130MB 以上），默认堆容易 OOM，申请大堆。 -->
     <application
         android:allowBackup="true"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
+        android:largeHeap="true"
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"

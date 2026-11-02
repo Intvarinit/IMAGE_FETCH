@@ -29,34 +29,47 @@ public final class StorageBrowser {
     }
 
     /**
-     * 快速分页的会话缓存：按存储卷缓存句柄列表，外加「仅 JPG」的筛查结果。
+     * 快速分页的会话缓存：按存储卷缓存句柄列表，外加「仅 JPG / 照片」的筛查结果。
      * 卡内结构变化后（拍摄、删除、换卡）必须 {@link #clear()}。
      */
     public static final class PageCache {
         final Map<Long, List<Long>> handles = new LinkedHashMap<>();
-        JpegIndex jpegIndex;
+        FilteredIndex jpegIndex;
+        FilteredIndex photoIndex;
 
         public void clear() {
             handles.clear();
             jpegIndex = null;
+            photoIndex = null;
         }
     }
 
+    /** 筛查目标：仅 JPEG，或 JPEG + RAW（照片）。 */
+    private static final int KIND_JPEG = 0;
+    private static final int KIND_PHOTO = 1;
+
     /**
-     * JPG 索引：把「句柄越大越新」的全量句柄序列按需筛查成 JPG 序列。
+     * 按扩展名筛出的对象索引：把「句柄越大越新」的全量句柄序列按需筛查成目标格式序列。
      *
-     * <p>JPG 与否只能从 ObjectInfo 的文件名判断，所以「仅 JPG」分页必须逐个取 ObjectInfo；
+     * <p>格式只能从 ObjectInfo 的文件名判断，所以按格式分页必须逐个取 ObjectInfo；
      * 但只在需要时往后扫（要第 N 页才扫到第 N 页所需的量），扫描结果缓存，
      * 因此顺序往后翻只扫一遍，且页内对象在筛查时就已解析好，取页不再额外往返。
      */
-    private static final class JpegIndex {
+    private static final class FilteredIndex {
         final List<Long> orderedHandles;
-        final List<CameraStorage.Item> jpegs = new ArrayList<>();
+        final List<CameraStorage.Item> items = new ArrayList<>();
+        final int kind;
         int scanned;
         boolean scannedAll;
 
-        JpegIndex(List<Long> orderedHandles) {
+        FilteredIndex(List<Long> orderedHandles, int kind) {
             this.orderedHandles = orderedHandles;
+            this.kind = kind;
+        }
+
+        boolean matches(CameraStorage.Item item) {
+            if (kind == KIND_JPEG) return item.isJpeg();
+            return item.isRaw() || item.isJpeg();
         }
 
         boolean hasUnscanned() {
@@ -90,7 +103,23 @@ public final class StorageBrowser {
         if (!jpegOnly) {
             return allObjectPage(invoker, orderedHandles, size, index);
         }
-        return jpegOnlyPage(invoker, orderedHandles, store, size, index);
+        return filteredPage(invoker, orderedHandles, store, size, index, KIND_JPEG);
+    }
+
+    /**
+     * 按照片分页：JPG 与 RAW 都算（视频除外）。胶片模拟页既支持相机 JPEG，
+     * 也支持 RAW 内嵌预览，所以列表要同时给出两种来源。
+     */
+    public static CameraStorage.Page loadPhotoPage(
+            Invoker invoker,
+            int pageSize,
+            int pageIndex,
+            PageCache cache) throws Exception {
+        int size = Math.max(1, pageSize);
+        int index = Math.max(0, pageIndex);
+        PageCache store = cache == null ? new PageCache() : cache;
+        return filteredPage(
+                invoker, orderedHandles(invoker, store), store, size, index, KIND_PHOTO);
     }
 
     /** 全部对象（含 RAW/视频）分页：总数即句柄计数。 */
@@ -109,35 +138,43 @@ public final class StorageBrowser {
     }
 
     /**
-     * 「仅 JPG」分页：先把句柄序列筛查成 JPG 序列，再按 JPG 序列切片，
-     * 因此每页都是实打实的 {@code size} 张 JPG。
+     * 「仅 JPG」/「照片」分页：先把句柄序列筛查成目标格式序列，再按该序列切片，
+     * 因此每页都是实打实的 {@code size} 个对象。
      */
-    private static CameraStorage.Page jpegOnlyPage(
-            Invoker invoker, List<Long> orderedHandles, PageCache store, int size, int index)
-            throws Exception {
-        JpegIndex jpegs = store.jpegIndex;
+    private static CameraStorage.Page filteredPage(
+            Invoker invoker, List<Long> orderedHandles, PageCache store,
+            int size, int index, int kind) throws Exception {
+        FilteredIndex filtered = kind == KIND_JPEG ? store.jpegIndex : store.photoIndex;
         // 句柄列表变了（新增/删除/换卡）就重扫：旧索引里的切片位置已对不上。
-        if (jpegs == null || !jpegs.orderedHandles.equals(orderedHandles)) {
-            jpegs = new JpegIndex(new ArrayList<>(orderedHandles));
-            store.jpegIndex = jpegs;
+        if (filtered == null || !filtered.orderedHandles.equals(orderedHandles)) {
+            filtered = new FilteredIndex(new ArrayList<>(orderedHandles), kind);
+            if (kind == KIND_JPEG) store.jpegIndex = filtered;
+            else store.photoIndex = filtered;
         }
         // 扫到“够本页用”为止：少于这个量下一页必然拿不满。
         int needed = (index + 1) * size;
-        while (jpegs.jpegs.size() < needed && jpegs.hasUnscanned()) {
-            long handle = jpegs.orderedHandles.get(jpegs.scanned++);
+        // 「照片」页的筛查量设上限：若卡里几乎都是视频/其它对象，不能一口气把几千个对象
+        // 全查一遍，否则相机链路会被长时间占住。没查完的部分由 moreUnscanned 标记，下一页
+        // 继续扫。仅 JPG 的列表仍要全扫，因为它的总数会直接展示给用户。
+        int scanBudget = kind == KIND_JPEG ? Integer.MAX_VALUE : size * 6;
+        int examined = 0;
+        while (filtered.items.size() < needed && filtered.hasUnscanned()) {
+            if (examined >= scanBudget) break;
+            examined++;
+            long handle = filtered.orderedHandles.get(filtered.scanned++);
             CameraStorage.Item item = objectInfo(invoker, handle);
-            if (item != null && item.isJpeg()) jpegs.jpegs.add(item);
+            if (item != null && filtered.matches(item)) filtered.items.add(item);
         }
-        jpegs.scannedAll = !jpegs.hasUnscanned();
+        filtered.scannedAll = !filtered.hasUnscanned();
 
-        int total = jpegs.jpegs.size();
-        // 指定的页可能已不存在（上一页筛查后才发现没那么多 JPG）：退回最后一页而不是给空页。
+        int total = filtered.items.size();
+        // 指定的页可能已不存在（上一页筛查后才发现没那么多对象）：退回最后一页而不是给空页。
         int safeIndex = index > 0 && index * size >= total ? Math.max(0, (total - 1) / size) : index;
         int from = Math.min(safeIndex * size, total);
         int to = Math.min(from + size, total);
-        List<CameraStorage.Item> items = new ArrayList<>(jpegs.jpegs.subList(from, to));
+        List<CameraStorage.Item> items = new ArrayList<>(filtered.items.subList(from, to));
         sortNewestFirst(items);
-        return new CameraStorage.Page(items, safeIndex, size, total, false, !jpegs.scannedAll);
+        return new CameraStorage.Page(items, safeIndex, size, total, false, !filtered.scannedAll);
     }
 
     /** 取对象的 ObjectInfo 并解析；目录（关联对象）与解析不出的都当没有。 */

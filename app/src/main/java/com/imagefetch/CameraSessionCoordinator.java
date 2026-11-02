@@ -253,6 +253,8 @@ public final class CameraSessionCoordinator {
     private static final long CAPTURE_POLL_INTERVAL_MS = 1000L;
     /** 多张批次用更细的轮询粒度：每张之间只隔几百毫秒，1 s 的粒度容易错过写卡完成时刻。 */
     private static final long CAPTURE_BATCH_POLL_MS = 500L;
+    /** 胶片模拟页的图片来源分页大小：只给下拉框用，不需要跟主界面的每页张数一致。 */
+    private static final int FILM_PAGE_SIZE = 10;
     /** Canon EOS 对焦方式属性码（0xD1BA EOS_LvAfSystem），与 transport 侧一致。 */
     private static final int CANON_PROP_AF_METHOD = 0xd1ba;
     /** 厂商属性写入被相机受理的成功响应码（标准 PTP ResponseOK）。 */
@@ -2106,6 +2108,101 @@ public final class CameraSessionCoordinator {
                 mainHandler.post(listener::onDownloadFinished);
             }
         });
+    }
+
+    /**
+     * 读取一页图片来源（JPG + RAW）（胶片模拟页专用）。
+     *
+     * <p>与 {@link #loadStoragePage} 共用执行器与句柄缓存，因此不会和其它相机事务交错；
+     * 页大小固定 {@link #FILM_PAGE_SIZE}，避免胶片页的下拉框被整页几十项撑爆。
+     */
+    public void loadFilmPhotoPage(final int pageIndex, final StoragePageCallback callback) {
+        executor.submit(() -> {
+            final PtpOperationService session = operations;
+            if (session == null || !isConnected()) {
+                mainHandler.post(() -> callback.onError("请先连接相机。", null));
+                return;
+            }
+            try {
+                final CameraStorage.Page page = session.photoPage(FILM_PAGE_SIZE, pageIndex);
+                mainHandler.post(() -> callback.onLoaded(page));
+            } catch (Exception error) {
+                mainHandler.post(() -> callback.onError(
+                        error.getMessage() == null ? "读取照片列表失败" : error.getMessage(), error));
+            }
+        });
+    }
+
+    /** 图片来源取回回调：进度与结果都已切回主线程。 */
+    public interface FilmSourceCallback {
+        void onProgress(long received, long total);
+
+        void onReady(File file);
+
+        void onError(String message, Throwable error);
+    }
+
+    /**
+     * 把一张相机照片（JPEG 或 RAW）取回到应用缓存目录，供胶片模拟读取。
+     *
+     * <p>RAW 有几十兆，JPEG 一般几兆，都不进 {@link PhotoRepository}（那是给可入库的 JPG 用的），
+     * 只落在 {@code cacheDir/film_src} 下，下一次取回会替换同名句柄文件，
+     * 系统空间紧张时也可以直接回收。相机未声明长度的按实际字节数收下。
+     */
+    public void fetchFilmSource(final CameraStorage.Item item, final FilmSourceCallback callback) {
+        executor.submit(() -> {
+            final PtpOperationService session = operations;
+            if (session == null || !isConnected()) {
+                mainHandler.post(() -> callback.onError("请先连接相机。", null));
+                return;
+            }
+            if (item == null || (!item.isRaw() && !item.isJpeg())) {
+                mainHandler.post(() -> callback.onError("所选对象既不是 JPEG 也不是 RAW。", null));
+                return;
+            }
+            File staging = null;
+            try {
+                File directory = new File(context.getCacheDir(), "film_src");
+                if (!directory.exists() && !directory.mkdirs()) {
+                    throw new IOException("无法创建胶片缓存目录。");
+                }
+                File target = new File(directory, filmCacheName(item));
+                staging = new File(directory, target.getName() + ".part");
+                long received;
+                try (FileOutputStream output = new FileOutputStream(staging)) {
+                    received = session.download(
+                            item.handle,
+                            output,
+                            (bytes, total) -> mainHandler.post(
+                                    () -> callback.onProgress(bytes, total)));
+                    output.flush();
+                }
+                if (item.sizeBytes > 0 && received != item.sizeBytes) {
+                    throw new IOException("文件长度与相机声明不一致：声明 "
+                            + item.sizeBytes + " 字节，实际 " + received + " 字节");
+                }
+                if (received <= 0) throw new IOException("相机返回了空文件。");
+                if (target.exists() && !target.delete()) {
+                    throw new IOException("无法覆盖同名胶片缓存文件。");
+                }
+                if (!staging.renameTo(target)) {
+                    throw new IOException("无法提交胶片缓存文件。");
+                }
+                final File ready = target;
+                mainHandler.post(() -> callback.onReady(ready));
+            } catch (Exception error) {
+                if (staging != null) staging.delete();
+                final String message = error.getMessage() == null ? "照片取回失败" : error.getMessage();
+                mainHandler.post(() -> callback.onError(message, error));
+            }
+        });
+    }
+
+    /** 胶片缓存文件名：句柄唯一且保留扩展名，模拟器按扩展名选择解码方式。 */
+    private static String filmCacheName(CameraStorage.Item item) {
+        String name = item.filename == null ? "photo" : item.filename;
+        String safe = name.replaceAll("[\\\\/:?%*|\"<>]", "_");
+        return item.handle + "-" + safe;
     }
 
     private static String interruptedMessage(TransferControl control) {

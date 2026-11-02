@@ -2370,6 +2370,13 @@ public final class PtpIpTransport implements CameraTransport {
     }
 
     @Override
+    public synchronized CameraStorage.Page listStoragePhotoPage(int pageSize, int pageIndex)
+            throws Exception {
+        ensureConnected();
+        return StorageBrowser.loadPhotoPage(this::invokeOperation, pageSize, pageIndex, pageCache);
+    }
+
+    @Override
     public void invalidateStorageCache() {
         synchronized (pageCache) {
             pageCache.clear();

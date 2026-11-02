@@ -62,6 +62,7 @@ import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.ptp.WhiteBalanceChoices;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.ui.FocusBoxOverlayView;
+import com.imagefetch.ui.FilmSimulationDialog;
 import com.imagefetch.ui.PagedGridScroll;
 import com.imagefetch.ui.PhotoGridAdapter;
 import com.imagefetch.ui.PhotoViewerDialog;
@@ -156,6 +157,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private final Map<Long, View> gridCells = new HashMap<>();
     /** 全屏看图页；不持有图片引用，关掉即释放。 */
     private PhotoViewerDialog viewerDialog;
+    /** 胶片模拟独立页；关闭后置空。 */
+    private FilmSimulationDialog filmDialog;
+    /** 侧栏里的「胶片模拟」项：可只用手机图片，所以不随连接状态置灰。 */
+    private TextView filmItem;
 
     /** 遥控拍摄面板（点「拍摄并取回」打开）；关闭后置空。 */
     private AlertDialog captureDialog;
@@ -569,6 +574,18 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                         (handle, bitmap) -> result.onPreview(handle, bitmap)));
         viewerDialog.setOnPageChangedListener(this::scrollToPhoto);
         viewerDialog.show();
+    }
+
+    /** 打开「胶片模拟」独立页：页面自己读 RAW 列表、下载、模拟与导出。 */
+    private void openFilmSimulation() {
+        if (filmDialog != null) {
+            filmDialog.dismiss();
+            filmDialog = null;
+        }
+        FilmSimulationDialog dialog = new FilmSimulationDialog(this, coordinator);
+        dialog.setOnDismissListener(ignored -> filmDialog = null);
+        filmDialog = dialog;
+        dialog.show();
     }
 
     // ── 遥控拍摄面板（实时取景 + 快门/光圈/ISO） ──
@@ -1356,6 +1373,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         if (viewerDialog != null) {
             viewerDialog.dismiss();
             viewerDialog = null;
+        }
+        if (filmDialog != null) {
+            filmDialog.dismiss();
+            filmDialog = null;
         }
         dismissCapturePanel();
         deferredRecycle.removeCallbacksAndMessages(null);
@@ -2603,6 +2624,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        // 胶片页的「从手机选图」结果交回给它自己处理，一个对话框只选一张。
+        if (requestCode == FilmSimulationDialog.REQUEST_PICK_LOCAL_IMAGE) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null
+                    && filmDialog != null) {
+                filmDialog.onLocalImagePicked(data.getData());
+            }
+            return;
+        }
         // 运行时权限申请走 onRequestPermissionsResult，与这里互不干扰；不认识的请求码交回父类。
         if (requestCode != REQUEST_PICK_STACK) {
             super.onActivityResult(requestCode, resultCode, data);
@@ -3230,6 +3259,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         hdrItem = findViewById(R.id.shotHdr);
         stackCheckItem = findViewById(R.id.shotStackCheck);
         stackPickItem = findViewById(R.id.shotStackPick);
+        filmItem = findViewById(R.id.shotFilm);
 
         Button openButton = findViewById(R.id.shotOptions);
         openButton.setOnClickListener(view -> openShotPanel());
@@ -3254,6 +3284,11 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         stackPickItem.setOnClickListener(view -> {
             closeShotPanel();
             pickStackPhotos();
+        });
+        // 胶片模拟是独立页面：未连接也能打开（可直接用手机里的图片）。
+        filmItem.setOnClickListener(view -> {
+            closeShotPanel();
+            openFilmSimulation();
         });
         capabilityItem.setOnClickListener(view -> {
             closeShotPanel();
@@ -3553,6 +3588,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             return;
         }
         if (requestCode == REQUEST_NOTIFICATIONS) return;
+        // 胶片页自己发起的存储权限申请：结果交回它，授予后续做那次导出。
+        if (requestCode == FilmSimulationDialog.REQUEST_WRITE_STORAGE) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (filmDialog != null) filmDialog.onStoragePermissionResult(granted);
+            return;
+        }
         if (requestCode != REQUEST_WRITE_STORAGE) return;
         boolean granted = grantResults.length > 0
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED;

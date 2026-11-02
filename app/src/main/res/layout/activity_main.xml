@@ -182,6 +182,7 @@
                     android:layout_marginStart="@dimen/space_s"
                     android:text="@string/delete_selected" />
             </LinearLayout>
+
         </LinearLayout>
 
         <!-- ③ 文件：占满剩余高度，网格随屏幕伸缩 -->
@@ -424,6 +425,22 @@
             android:paddingEnd="20dp"
             android:paddingBottom="14dp"
             android:text="@string/shot_stack_pick"
+            android:textColor="@color/ink"
+            android:textSize="15sp" />
+
+        <!-- 胶片模拟：也能直接用手机图片，所以不随相机连接状态置灰。 -->
+        <TextView
+            android:id="@+id/shotFilm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:paddingStart="20dp"
+            android:paddingTop="14dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="14dp"
+            android:text="@string/film_simulation"
             android:textColor="@color/ink"
             android:textSize="15sp" />
 
