@@ -20,8 +20,9 @@ import java.util.List;
  * {@code log_exposure}（本仓库里所有胶片/相纸都是 -3.0…4.0，步长 0.02745）。
  * 生成脚本把它压成 1/400 精度的整数表以控制体积，这里还原成双精度供模拟器查表。
  *
- * <p>只挑选了 {@code stage = filming} 且声明了 {@code target_print} 的胶片，
- * 相纸曲线直接随胶片一起打包，避免运行时再做配对。
+ * <p>只挑选了 {@code stage = filming} 的胶片：负片带上声明的 {@code target_print}
+ * 相纸曲线一起打包，避免运行时再做配对；正片（反转片）没有相纸，直接按幻灯片
+ * 密度成像。
  */
 public final class FilmStock {
     /** 每条的曲线点数。 */
@@ -34,7 +35,12 @@ public final class FilmStock {
 
     public final String id;
     public final String name;
+    /** 品牌（Fujifilm / Kodak / Ilford / CineStill），界面上按它分组。 */
+    public final String brand;
+    /** {@code negative} 或 {@code positive}（反转片）。 */
     public final String type;
+    /** 黑白胶片：三条通道密度相同，相纸按中性灰近似，避免逐通道偏色。 */
+    public final boolean monochrome;
     public final String antihalation;
     public final String printName;
     /** 胶片密度曲线的 log 曝光范围（含端点）。 */
@@ -49,7 +55,9 @@ public final class FilmStock {
     private FilmStock(
             String id,
             String name,
+            String brand,
             String type,
+            boolean monochrome,
             String antihalation,
             String printName,
             double logExposureMin,
@@ -58,13 +66,28 @@ public final class FilmStock {
             short[][] print) {
         this.id = id;
         this.name = name;
+        this.brand = brand;
         this.type = type;
+        this.monochrome = monochrome;
         this.antihalation = antihalation;
         this.printName = printName;
         this.logExposureMin = logExposureMin;
         this.logExposureMax = logExposureMax;
         this.curve = curve;
         this.print = print;
+    }
+
+    /** 正片（反转片）：直接观看，不经过相纸。 */
+    public boolean isPositive() {
+        return "positive".equals(type);
+    }
+
+    /** 去掉品牌前缀的名字，下拉框里品牌已经单独分组，不必重复。 */
+    public String shortName() {
+        if (!brand.isEmpty() && name.startsWith(brand + " ")) {
+            return name.substring(brand.length() + 1);
+        }
+        return name;
     }
 
     /** 胶片密度（0 起算的光学密度）。 */
@@ -139,13 +162,20 @@ public final class FilmStock {
         return new FilmStock(
                 object.getString("id"),
                 object.optString("name", object.getString("id")),
+                object.optString("brand", ""),
                 object.optString("type", ""),
+                object.optBoolean("monochrome", false),
                 object.optString("antihalation", ""),
                 object.optString("printName", ""),
                 object.getDouble("logExposureMin"),
                 object.getDouble("logExposureMax"),
                 parseCurve(object.getJSONArray("curve")),
-                parseCurve(object.getJSONArray("print")));
+                object.has("print") ? parseCurve(object.getJSONArray("print")) : emptyCurve());
+    }
+
+    /** 正片没有相纸曲线；给一张全零表，避免下游判空。 */
+    private static short[][] emptyCurve() {
+        return new short[3][CURVE_POINTS];
     }
 
     /** 把 [[r,g,b] × 256] 展开成 [通道][256]。 */

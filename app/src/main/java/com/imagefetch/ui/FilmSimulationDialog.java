@@ -118,8 +118,20 @@ public final class FilmSimulationDialog extends Dialog {
     private Spinner stockSpinner;
     private Spinner sourceSpinner;
     private FilmSpinnerAdapter stockAdapter;
+    /** 胶片下拉的行：分组标题（film 为 null）或具体胶片。 */
+    private final List<StockRow> stockRows = new ArrayList<>();
     /** 每次换源图递增，迟到的缩略图结果直接丢弃。 */
     private int thumbnailGeneration;
+
+    private static final class StockRow {
+        final String label;
+        final FilmStock film;
+
+        StockRow(String label, FilmStock film) {
+            this.label = label;
+            this.film = film;
+        }
+    }
     private Button prevPageButton;
     private Button nextPageButton;
     private Button loadButton;
@@ -258,17 +270,41 @@ public final class FilmSimulationDialog extends Dialog {
                     : catalogError);
             return;
         }
-        List<String> names = new ArrayList<>(catalog.films.size());
-        for (FilmStock film : catalog.films) names.add(film.name);
-        stockAdapter = new FilmSpinnerAdapter(getContext(), names);
+        stockRows.clear();
+        List<String> names = new ArrayList<>();
+        List<Boolean> headers = new ArrayList<>();
+        String brand = null;
+        for (FilmStock film : catalog.films) {
+            if (brand == null || !brand.equals(film.brand)) {
+                brand = film.brand;
+                stockRows.add(new StockRow(
+                        brand.isEmpty() ? "其他" : brand.toUpperCase(java.util.Locale.ROOT), null));
+                names.add(stockRows.get(stockRows.size() - 1).label);
+                headers.add(true);
+            }
+            String label = film.shortName();
+            if (film.isPositive()) {
+                label += " · " + getContext().getString(R.string.film_positive_tag);
+            }
+            stockRows.add(new StockRow(label, film));
+            names.add(label);
+            headers.add(false);
+        }
+        stockAdapter = new FilmSpinnerAdapter(getContext(), names, headers);
         stockSpinner.setAdapter(stockAdapter);
-        int defaultIndex = Math.max(0, indexOfStock("kodak_portra_400"));
-        stockSpinner.setSelection(defaultIndex);
+        stockSpinner.setSelection(indexOfStock("kodak_portra_400"));
         stockSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                FilmStock stock = selectedStock();
+                if (stock == null) {
+                    // 部分 ROM 的 Spinner 仍会把标题行当成选项，这里自动落到下一张胶片。
+                    int next = nextFilmIndex(position);
+                    if (next >= 0 && next != position) stockSpinner.setSelection(next);
+                    return;
+                }
                 if (sourceBitmap != null) schedulePreview();
-                updateParams(selectedStock());
+                updateParams(stock);
             }
 
             @Override
@@ -278,9 +314,23 @@ public final class FilmSimulationDialog extends Dialog {
         updateParams(selectedStock());
     }
 
+    private int nextFilmIndex(int from) {
+        for (int i = from + 1; i < stockRows.size(); i++) {
+            if (stockRows.get(i).film != null) return i;
+        }
+        for (int i = from - 1; i >= 0; i--) {
+            if (stockRows.get(i).film != null) return i;
+        }
+        return -1;
+    }
+
     private int indexOfStock(String id) {
-        for (int i = 0; i < catalog.films.size(); i++) {
-            if (catalog.films.get(i).id.equals(id)) return i;
+        for (int i = 0; i < stockRows.size(); i++) {
+            FilmStock film = stockRows.get(i).film;
+            if (film != null && film.id.equals(id)) return i;
+        }
+        for (int i = 0; i < stockRows.size(); i++) {
+            if (stockRows.get(i).film != null) return i;
         }
         return 0;
     }
@@ -916,9 +966,11 @@ public final class FilmSimulationDialog extends Dialog {
         referenceSettings.grain = 0;
         referenceSettings.halation = 0;
 
-        List<Bitmap> thumbs = new ArrayList<>(catalog.films.size());
-        for (FilmStock film : catalog.films) {
-            thumbs.add(FilmSimulator.render(reference, film, referenceSettings, THUMB_MAX_EDGE));
+        List<Bitmap> thumbs = new ArrayList<>(stockRows.size());
+        for (StockRow row : stockRows) {
+            thumbs.add(row.film == null
+                    ? null
+                    : FilmSimulator.render(reference, row.film, referenceSettings, THUMB_MAX_EDGE));
         }
         if (reference != source) reference.recycle();
         return thumbs;
@@ -927,15 +979,18 @@ public final class FilmSimulationDialog extends Dialog {
     private FilmStock selectedStock() {
         if (catalog == null) return null;
         int index = stockSpinner.getSelectedItemPosition();
-        if (index < 0 || index >= catalog.films.size()) return null;
-        return catalog.films.get(index);
+        if (index < 0 || index >= stockRows.size()) return null;
+        return stockRows.get(index).film;
     }
 
     private void updateParams(FilmStock stock) {
         if (stock == null) return;
+        String printLabel = stock.isPositive()
+                ? getContext().getString(R.string.film_positive)
+                : stock.printName;
         paramsView.setText(getContext().getString(R.string.film_params,
                 stock.name,
-                stock.printName,
+                printLabel,
                 formatEv(settings.exposureEv),
                 formatShift(settings.temperature, "暖", "冷"),
                 formatShift(settings.tint, "洋红", "绿"),
@@ -1100,9 +1155,16 @@ public final class FilmSimulationDialog extends Dialog {
     private static final class FilmSpinnerAdapter extends ArrayAdapter<String> {
         /** 与条目一一对应的缩略图；null 表示这一路不显示缩略图（来源列表）。 */
         private List<Bitmap> thumbnails;
+        /** 与条目一一对应：true 表示品牌分组标题，不可选。 */
+        private final List<Boolean> headers;
 
         FilmSpinnerAdapter(Context context, List<String> labels) {
+            this(context, labels, null);
+        }
+
+        FilmSpinnerAdapter(Context context, List<String> labels, List<Boolean> headers) {
             super(context, android.R.layout.simple_spinner_item, labels);
+            this.headers = headers;
             setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         }
 
@@ -1112,7 +1174,22 @@ public final class FilmSimulationDialog extends Dialog {
         }
 
         @Override
+        public boolean areAllItemsEnabled() {
+            if (headers == null) return true;
+            for (Boolean header : headers) {
+                if (header) return false;
+            }
+            return true;
+        }
+
+        @Override
+        public boolean isEnabled(int position) {
+            return !isHeader(position);
+        }
+
+        @Override
         public View getView(int position, View convertView, ViewGroup parent) {
+            if (isHeader(position)) return buildHeader(position, false);
             if (hasThumbnail(position)) return buildRow(position, false);
             View view = super.getView(position, convertView, parent);
             if (view instanceof TextView) {
@@ -1125,13 +1202,33 @@ public final class FilmSimulationDialog extends Dialog {
 
         @Override
         public View getDropDownView(int position, View convertView, ViewGroup parent) {
+            if (isHeader(position)) return buildHeader(position, true);
             if (hasThumbnail(position)) return buildRow(position, true);
             return super.getDropDownView(position, convertView, parent);
+        }
+
+        private boolean isHeader(int position) {
+            return headers != null && position >= 0 && position < headers.size()
+                    && headers.get(position);
         }
 
         private boolean hasThumbnail(int position) {
             return thumbnails != null && position >= 0 && position < thumbnails.size()
                     && thumbnails.get(position) != null;
+        }
+
+        /** 品牌分组标题：小号、弱色、不可点。 */
+        private View buildHeader(int position, boolean dropdown) {
+            Context context = getContext();
+            float density = context.getResources().getDisplayMetrics().density;
+            TextView text = new TextView(context);
+            text.setText(getItem(position));
+            text.setTextSize(11f);
+            text.setTextColor(dropdown ? 0xFF8A8F98 : 0xFFA9B4C6);
+            text.setSingleLine(true);
+            text.setPadding(dp(density, 10), dp(density, dropdown ? 10 : 4),
+                    dp(density, 10), dp(density, 4));
+            return text;
         }
 
         /** 缩略图行：左边小图，右边名字；收起态白字，下拉态深字（系统浅色弹窗）。 */

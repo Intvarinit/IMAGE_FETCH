@@ -50,6 +50,10 @@ public final class FilmSimulator {
     private static final int GLOW_DOWNSCALE = 4;
     /** 反查 sRGB 表的分段数。 */
     private static final int ENCODE_STEPS = 1024;
+    /** 黑白相纸近似：中性灰相纸的反差与密度上下限（约 grade 2 偏软，暗部不糊、高光不硬截）。 */
+    private static final double MONO_PRINT_GAMMA = 1.5;
+    private static final double MONO_PRINT_MIN_DENSITY = 0.08;
+    private static final double MONO_PRINT_MAX_DENSITY = 2.0;
 
     /** 按原尺寸渲染。 */
     public static Bitmap render(Bitmap source, FilmStock stock, Settings settings) {
@@ -90,8 +94,14 @@ public final class FilmSimulator {
         float[] glow = null;
         if (tuned.halation > 0.01) {
             glow = buildGlow(pixels, width, height, toneLut);
-            // 抗光晕层强的胶片（如 Portra 系列）光晕收敛更快，这里按 profile 的标注打折。
-            double filmFactor = "strong".equalsIgnoreCase(stock.antihalation) ? 0.55 : 1.0;
+            // 按 profile 的抗光晕层标注调整：无 rem-jet 的 CineStill 光晕最夸张，
+            // 抗光晕层强的胶片（如 Portra 系列）收敛更快。
+            double filmFactor = 1.0;
+            if ("no".equalsIgnoreCase(stock.antihalation)) {
+                filmFactor = 1.6;
+            } else if ("strong".equalsIgnoreCase(stock.antihalation)) {
+                filmFactor = 0.55;
+            }
             halationStrength = 0.55 * tuned.halation * filmFactor;
         }
 
@@ -161,11 +171,24 @@ public final class FilmSimulator {
     private static float[][] buildToneLut(FilmStock stock, Settings settings) {
         double filmMidLog = (stock.logExposureMin + stock.logExposureMax) * 0.5;
         double midPrintDensity = -Math.log10(MID_GRAY);
+        boolean positive = stock.isPositive();
+        boolean monochrome = stock.monochrome;
         double[] printMidLog = new double[3];
         double[] printGain = new double[3];
         double[] filmMidDensity = new double[3];
+        /** 18% 场景中灰落在 logE 轴上的位置；负片取轴中点，正片按密度反查。 */
+        double[] filmAnchorLog = new double[3];
         int last = FilmStock.CURVE_POINTS - 1;
         for (int channel = 0; channel < 3; channel++) {
+            if (positive) {
+                // 反转片：D 随曝光下降，18% 灰对应密度 0.745（透过率 18%）。
+                filmAnchorLog[channel] = invertFilmLog(stock, channel, midPrintDensity);
+                filmMidDensity[channel] = midPrintDensity;
+                continue;
+            }
+            filmMidDensity[channel] = sampleFilmDensity(stock, channel, filmMidLog);
+            filmAnchorLog[channel] = filmMidLog;
+            if (monochrome) continue; // 黑白走下面的中性相纸近似，不用彩色相纸曲线。
             printMidLog[channel] = invertPrintLog(stock, channel, midPrintDensity);
             double printMax = stock.printDensity(channel, last);
             double whiteLog = invertPrintLog(stock, channel, 0.05);
@@ -174,7 +197,6 @@ public final class FilmSimulator {
             double filmSpan = Math.max(0.1, stock.density(channel, last) - stock.density(channel, 0));
             // 曲线若有轻微非单调/肩部截断，黑白跨度可能极小；给一个下限，避免反差系数变成负数。
             printGain[channel] = Math.max(0.05, (blackLog - whiteLog) / filmSpan);
-            filmMidDensity[channel] = sampleFilmDensity(stock, channel, filmMidLog);
         }
 
         // 暖/冷：正数提红降蓝；洋红/绿：正数提红蓝降绿。
@@ -190,15 +212,45 @@ public final class FilmSimulator {
         for (int channel = 0; channel < 3; channel++) {
             for (int value = 0; value < FilmStock.CURVE_POINTS; value++) {
                 double linear = srgbToLinear(value / 255.0) * gain[channel] * exposureGain;
-                double logExposure = Math.log10(Math.max(linear, 1e-6) / MID_GRAY) + filmMidLog;
-                double negativeDensity = sampleFilmDensity(stock, channel, logExposure);
-                double printLog = printMidLog[channel]
-                        + (filmMidDensity[channel] - negativeDensity) * printGain[channel];
-                double printDensity = samplePrintDensity(stock, channel, printLog);
-                lut[channel][value] = (float) Math.min(1.0, Math.pow(10.0, -printDensity));
+                double logExposure = Math.log10(Math.max(linear, 1e-6) / MID_GRAY)
+                        + filmAnchorLog[channel];
+                double filmDensity = sampleFilmDensity(stock, channel, logExposure);
+                double mapped;
+                if (positive) {
+                    // 幻灯片直接看：密度差 → 透过率，按 18% 灰归一，超出 1 的部分裁成白。
+                    mapped = MID_GRAY * Math.pow(10.0, filmMidDensity[channel] - filmDensity);
+                } else if (monochrome) {
+                    // 彩色相纸的逐通道密度不能直接当 RGB 用（会让黑白图偏色），
+                    // 这里用中性灰相纸近似：18% 锚点 + 固定反差，并限制在黑/白密度内。
+                    double paperDensity = midPrintDensity
+                            + (filmMidDensity[channel] - filmDensity) * MONO_PRINT_GAMMA;
+                    paperDensity = Math.max(MONO_PRINT_MIN_DENSITY,
+                            Math.min(MONO_PRINT_MAX_DENSITY, paperDensity));
+                    mapped = Math.pow(10.0, -paperDensity);
+                } else {
+                    double printLog = printMidLog[channel]
+                            + (filmMidDensity[channel] - filmDensity) * printGain[channel];
+                    mapped = Math.pow(10.0, -samplePrintDensity(stock, channel, printLog));
+                }
+                lut[channel][value] = (float) Math.min(1.0, Math.max(0.0, mapped));
             }
         }
         return lut;
+    }
+
+    /** 反查反转片的 logE：密度达到 targetDensity 处的曝光（D 随曝光下降，二分）。 */
+    private static double invertFilmLog(FilmStock stock, int channel, double targetDensity) {
+        double low = stock.logExposureMin;
+        double high = stock.logExposureMax;
+        for (int i = 0; i < 30; i++) {
+            double mid = (low + high) * 0.5;
+            if (sampleFilmDensity(stock, channel, mid) > targetDensity) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        return (low + high) * 0.5;
     }
 
     /** 反查相纸 logE：密度达到 targetDensity 处的曝光（曲线单调递增，二分即可）。 */
