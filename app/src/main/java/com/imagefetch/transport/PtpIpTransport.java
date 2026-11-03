@@ -332,6 +332,16 @@ public final class PtpIpTransport implements CameraTransport {
     /** 单文件累计上限（与 ZENCHE 口径一致）；接收器单包上限 64 MiB。 */
     private static final long MAX_TRANSFER_BYTES = 512L * 1024 * 1024;
     private static final int MAX_PACKET_BYTES = 64 * 1024 * 1024;
+    /**
+     * {@code commandWithData} 要把整段响应收进堆里的 byte[]，上限必须按可用堆收紧；
+     * 文件下载走流式写出，不受这里影响。
+     */
+    private static final long MAX_BUFFERED_BYTES = 64L * 1024 * 1024;
+
+    /** 单次命令可缓冲的数据量：不超过 64 MB，也不超过可用堆的八分之一。 */
+    private static long maxBufferedBytes() {
+        return Math.min(MAX_BUFFERED_BYTES, Runtime.getRuntime().maxMemory() / 8);
+    }
 
     /** 保活参数：单次 PING 探测超时 3s；命令复核超时 3s。 */
     public static final int PROBE_TIMEOUT_MS = 3000;
@@ -2739,14 +2749,16 @@ public final class PtpIpTransport implements CameraTransport {
         long totalLength = u64(first.data, 12);
         boolean hasDeclaredLength = u32(first.data, 12) != 0xffff_ffffL
                 || u32(first.data, 16) != 0xffff_ffffL;
-        if (hasDeclaredLength && totalLength > MAX_TRANSFER_BYTES) {
-            throw commandChannelFailed(
-                    new IOException("机内文件超过当前 512 MB 单文件传输上限"));
+        long bufferedLimit = maxBufferedBytes();
+        if (hasDeclaredLength && totalLength > bufferedLimit) {
+            throw commandChannelFailed(new IOException(
+                    "单次命令数据超过缓冲上限（" + (bufferedLimit >> 20) + " MB）"));
         }
-        java.io.ByteArrayOutputStream data = new java.io.ByteArrayOutputStream(
-                (int) Math.min(
-                        hasDeclaredLength ? totalLength : 8L * 1024 * 1024,
-                        8L * 1024 * 1024));
+        // 长度已知时直接按最终大小写入 byte[]：既不反复扩容，也省掉 toByteArray() 的那次整段拷贝。
+        byte[] declared = hasDeclaredLength ? new byte[(int) totalLength] : null;
+        java.io.ByteArrayOutputStream data = declared == null
+                ? new java.io.ByteArrayOutputStream(64 * 1024) : null;
+        long received = 0;
         while (true) {
             Packet packet = readResponseFor(expected);
             if ((packet.type != PACKET_DATA && packet.type != PACKET_END_DATA)
@@ -2755,18 +2767,24 @@ public final class PtpIpTransport implements CameraTransport {
                 throw commandChannelFailed(
                         new IOException("相机返回了无效的 PTP/IP 文件数据包"));
             }
-            data.write(packet.data, 12, packet.data.length - 12);
-            if (data.size() > MAX_TRANSFER_BYTES) {
-                throw commandChannelFailed(
-                        new IOException("机内文件超过当前 512 MB 单文件传输上限"));
+            int chunk = packet.data.length - 12;
+            if (declared != null) {
+                if (received + chunk > declared.length) {
+                    throw commandChannelFailed(
+                            new IOException("相机返回的数据超过 StartData 声明长度"));
+                }
+                System.arraycopy(packet.data, 12, declared, (int) received, chunk);
+            } else {
+                data.write(packet.data, 12, chunk);
+                if (data.size() > bufferedLimit) {
+                    throw commandChannelFailed(new IOException(
+                            "单次命令数据超过缓冲上限（" + (bufferedLimit >> 20) + " MB）"));
+                }
             }
-            if (hasDeclaredLength && data.size() > totalLength) {
-                throw commandChannelFailed(
-                        new IOException("相机返回的数据超过 StartData 声明长度"));
-            }
+            received += chunk;
             if (packet.type == PACKET_END_DATA) break;
         }
-        if (hasDeclaredLength && data.size() != totalLength) {
+        if (hasDeclaredLength && received != totalLength) {
             throw commandChannelFailed(
                     new IOException("相机返回的数据与 StartData 声明长度不一致"));
         }
@@ -2779,7 +2797,7 @@ public final class PtpIpTransport implements CameraTransport {
         }
         int code = u16(response.data, 8);
         if (code != RESPONSE_OK) throw rejected(code);
-        return data.toByteArray();
+        return declared != null ? declared : data.toByteArray();
     }
 
     // ── 事件通道 ──
