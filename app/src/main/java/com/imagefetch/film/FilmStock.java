@@ -55,9 +55,7 @@ public final class FilmStock {
     private final short[][] print;
     /** 内置 3D LUT 的 asset 文件名（assets/luts/ 下）；曲线胶片为 null。 */
     private final String lutFile;
-    /** 解析后的 LUT：首次用到时才读，避免打开页面就解析近 1 MB 的数据。 */
-    private volatile Lut3D lut;
-    /** 缩略图用的低精度 LUT（17³，约 60 KB）：完整表留给主预览，缩略图不占大内存。 */
+    /** 解析后的 LUT 由 {@link Lut3D} 统一缓存，这里只保留缩略图用的 17³ 表。 */
     private volatile Lut3D thumbnailLut;
     private final Context context;
 
@@ -95,20 +93,17 @@ public final class FilmStock {
         return lutFile != null && !lutFile.isEmpty();
     }
 
-    /** 懒加载 3D LUT；asset 读取失败时抛出运行时异常，由预览层提示。 */
+    /**
+     * 取 3D LUT：每次从 {@link Lut3D} 的进程内 LRU 缓存取，本对象不长期持有完整表，
+     * 否则缓存淘汰后的表仍被这里钉住，内存上限就形同虚设。
+     */
     Lut3D lut() {
         if (!hasLut()) return null;
-        Lut3D loaded = lut;
-        if (loaded != null) return loaded;
-        synchronized (this) {
-            if (lut == null) {
-                lut = Lut3D.load(context, "luts/" + lutFile);
-                if (lut == null) {
-                    throw new IllegalStateException("LUT 读取失败：" + lutFile);
-                }
-            }
-            return lut;
+        Lut3D loaded = Lut3D.load(context, "luts/" + lutFile);
+        if (loaded == null) {
+            throw new IllegalStateException("LUT 读取失败：" + lutFile);
         }
+        return loaded;
     }
 
     /** 缩略图用的降采样 LUT；与完整表分开缓存，避免缩略图把 51 张完整表拉进堆。 */

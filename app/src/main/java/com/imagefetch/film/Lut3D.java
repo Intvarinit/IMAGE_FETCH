@@ -7,7 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -19,8 +19,21 @@ import java.util.Map;
  * <p>解析结果按 asset 路径缓存在进程内：LUT 文件接近 1 MB，界面反复开关时不必重复读取。
  */
 public final class Lut3D {
-    /** 已解析的 LUT 缓存。 */
-    private static final Map<String, Lut3D> CACHE = new HashMap<>();
+    /**
+     * 已解析的 LUT 缓存：按访问顺序淘汰，最多保留 8 张完整表（约 3.4 MB）。
+     *
+     * <p>51 款全部浏览一遍会把 33³ 表累积到 22 MB，这里设上限避免给预览和
+     * 4096px 源图叠加时带来 OOM 风险；被淘汰的表下次选中时重新解析（几十毫秒，
+     * 在渲染线程里做）。缩略图另走 {@link #loadReduced}，不进入这个缓存。
+     */
+    private static final int CACHE_LIMIT = 8;
+    private static final Map<String, Lut3D> CACHE =
+            new LinkedHashMap<String, Lut3D>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Lut3D> eldest) {
+                    return size() > CACHE_LIMIT;
+                }
+            };
 
     private final int size;
     private final float[] table;
