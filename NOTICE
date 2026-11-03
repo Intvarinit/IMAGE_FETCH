@@ -43,3 +43,43 @@ SOFTWARE.
 Camera vendor extensions, vendor SDKs, and any trademarks referenced by the
 ported code remain the property of their respective owners and are not licensed
 by the ZENCHE MIT license.
+
+--------------------------------------------------------------------------------
+t3mujinpack HaldCLUT-derived LUTs
+
+The 51 files under app/src/main/assets/luts/ are converted from the complete
+haldcluts directory of t3mujinpack (https://github.com/t3mujin/t3mujinpack),
+downsampled from the original 144-level HaldCLUT PNGs to 33x33x33 .cube tables
+(Black and White 12, Color Negative 24, Color Slide 15). The conversion only
+resamples the color data and rewrites the container format; no other
+modification was made.
+
+Original work Copyright (c) 2017 Joao Almeida
+Distributed under the MIT License reproduced below. Modified for IMAGE_FETCH
+(resampled HaldCLUT -> 33x33x33 .cube).
+
+MIT License
+
+Copyright (c) 2017 Joao Almeida
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Film stock names are used only to describe the emulated look. They remain
+trademarks of their respective owners; the MIT license above does not grant
+any trademark rights.

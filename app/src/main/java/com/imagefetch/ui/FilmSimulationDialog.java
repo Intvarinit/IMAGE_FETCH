@@ -2,6 +2,7 @@ package com.imagefetch.ui;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Context;
 import android.content.ContextWrapper;
@@ -10,12 +11,14 @@ import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -27,6 +30,7 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -48,6 +52,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
@@ -74,6 +79,8 @@ public final class FilmSimulationDialog extends Dialog {
 
     /** 预览渲染的最长边：手机屏幕上足够，滑杆响应也快。 */
     private static final int PREVIEW_MAX_EDGE = 1100;
+    /** 拖动滑杆时的低分辨率预览：先保证跟手，松手后再补一帧全尺寸预览。 */
+    private static final int PREVIEW_QUICK_EDGE = 550;
     /** 胶片下拉里缩略图的最长边：只用来一眼看出色彩倾向。 */
     private static final int THUMB_MAX_EDGE = 96;
     /** 生成缩略图前先把源图缩到的最长边，避免每种胶片都从大图重采样。 */
@@ -102,6 +109,23 @@ public final class FilmSimulationDialog extends Dialog {
     private static final int TINT_DEFAULT = 50;
     private static final int GRAIN_DEFAULT = 35;
     private static final int HALATION_DEFAULT = 35;
+    private static final int VIGNETTE_DEFAULT = 0;
+    private static final int LEAK_DEFAULT = 0;
+    /** 导出尺寸选项：0 表示原尺寸，其余为成品最长边（不会放大）。 */
+    private static final int[] EXPORT_LONG_EDGES = {0, 2048, 4096};
+    /** 导出 JPEG 质量选项。 */
+    private static final int[] EXPORT_QUALITIES = {94, 86, 75};
+    /** 导出时从源图保留的相机信息；方向已经烘进像素，不复制。 */
+    private static final String[] EXPORT_EXIF_TAGS = {
+            android.media.ExifInterface.TAG_MAKE,
+            android.media.ExifInterface.TAG_MODEL,
+            android.media.ExifInterface.TAG_DATETIME_ORIGINAL,
+            android.media.ExifInterface.TAG_EXPOSURE_TIME,
+            android.media.ExifInterface.TAG_F_NUMBER,
+            "ISOSpeedRatings",
+            android.media.ExifInterface.TAG_FOCAL_LENGTH,
+            "LensModel",
+    };
 
     private final CameraSessionCoordinator coordinator;
     private final FilmSimulator.Settings settings = new FilmSimulator.Settings();
@@ -144,11 +168,30 @@ public final class FilmSimulationDialog extends Dialog {
     private SeekBar grainBar;
     private SeekBar halationBar;
     private CheckBox monochromeBox;
+    private Spinner monoFilterSpinner;
+    private SeekBar vignetteBar;
+    private SeekBar leakBar;
     private TextView exposureValue;
     private TextView temperatureValue;
     private TextView tintValue;
     private TextView grainValue;
     private TextView halationValue;
+    private TextView vignetteValue;
+    private TextView leakValue;
+    private ImageView originalView;
+    private View compareDivider;
+    private LinearLayout overlayBar;
+    private Button compareButton;
+    private Button pickColorButton;
+
+    /** 分屏对比：左原图、右模拟图，拖动分割线调整比例。 */
+    private boolean comparing;
+    private float compareSplit = 0.5f;
+    /** 吸管取样模式：下一次点按用取样点校正白平衡。 */
+    private boolean pickingColor;
+    /** 正在拖动参数滑杆：此时只渲染低分辨率预览。 */
+    private boolean adjustingSliders;
+    private int previewMaxEdge = PREVIEW_MAX_EDGE;
 
     private final List<CameraStorage.Item> sourceItems = new ArrayList<>();
     private int sourcePageIndex;
@@ -164,6 +207,9 @@ public final class FilmSimulationDialog extends Dialog {
     private boolean showingOriginal;
     /** 正在下载的照片缓存文件；换下一张或关闭页面时删除。 */
     private File currentSourceFile;
+    /** 从手机选择的图片 URI：导出时可从这里读取 EXIF；相机来源时为 null。 */
+    private Uri currentSourceUri;
+    private Uri pendingLocalUri;
     /** 当前源图的显示名（相机文件名或手机图片名），用于状态栏文案。 */
     private String sourceLabel = "";
     /** 当前源图是否是 RAW 内嵌预览并做了放大，状态栏要如实标注。 */
@@ -173,8 +219,11 @@ public final class FilmSimulationDialog extends Dialog {
     private boolean downloading;
     private boolean decoding;
     private boolean exporting;
-    /** 因缺少存储权限而挂起的导出：用户授权后继续。 */
+    /** 因缺少存储权限而挂起的导出：用户授权后继续，并沿用当时选的导出参数。 */
     private boolean pendingExportAfterPermission;
+    private int pendingExportLongEdge;
+    private int pendingExportQuality = EXPORT_QUALITIES[0];
+    private boolean pendingExportExif = true;
     private boolean released;
 
     private final Runnable renderRunnable = this::startPreviewRender;
@@ -231,13 +280,25 @@ public final class FilmSimulationDialog extends Dialog {
         grainBar = findViewById(R.id.filmGrainBar);
         halationBar = findViewById(R.id.filmHalationBar);
         monochromeBox = findViewById(R.id.filmMonochrome);
+        monoFilterSpinner = findViewById(R.id.filmMonoFilter);
+        vignetteBar = findViewById(R.id.filmVignetteBar);
+        leakBar = findViewById(R.id.filmLeakBar);
         exposureValue = findViewById(R.id.filmExposureValue);
         temperatureValue = findViewById(R.id.filmTemperatureValue);
         tintValue = findViewById(R.id.filmTintValue);
         grainValue = findViewById(R.id.filmGrainValue);
         halationValue = findViewById(R.id.filmHalationValue);
+        vignetteValue = findViewById(R.id.filmVignetteValue);
+        leakValue = findViewById(R.id.filmLeakValue);
+        originalView = findViewById(R.id.filmOriginalView);
+        compareDivider = findViewById(R.id.filmCompareDivider);
+        overlayBar = findViewById(R.id.filmOverlayBar);
+        compareButton = findViewById(R.id.filmCompareButton);
+        pickColorButton = findViewById(R.id.filmPickColorButton);
 
         findViewById(R.id.filmClose).setOnClickListener(view -> dismiss());
+        compareButton.setOnClickListener(view -> setCompareMode(!comparing));
+        pickColorButton.setOnClickListener(view -> toggleColorPick());
 
         setUpStocks();
         setUpSource();
@@ -246,7 +307,7 @@ public final class FilmSimulationDialog extends Dialog {
         previewView.setOnTouchListener(this::onPreviewTouch);
         loadButton.setOnClickListener(view -> loadSelectedSource());
         pickLocalButton.setOnClickListener(view -> pickLocalImage());
-        exportButton.setOnClickListener(view -> exportSimulation());
+        exportButton.setOnClickListener(view -> showExportOptions());
         findViewById(R.id.filmReset).setOnClickListener(view -> resetSettings());
 
         updateSliderLabels();
@@ -355,7 +416,7 @@ public final class FilmSimulationDialog extends Dialog {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 settings.exposureEv = (progress - EXPOSURE_DEFAULT) / 10.0;
                 updateSliderLabels();
-                schedulePreview();
+                schedulePreview(adjustingSliders);
             }
         });
         temperatureBar.setOnSeekBarChangeListener(new OnSeek() {
@@ -363,7 +424,7 @@ public final class FilmSimulationDialog extends Dialog {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 settings.temperature = (progress - TEMPERATURE_DEFAULT) / 50.0;
                 updateSliderLabels();
-                schedulePreview();
+                schedulePreview(adjustingSliders);
             }
         });
         tintBar.setOnSeekBarChangeListener(new OnSeek() {
@@ -371,7 +432,7 @@ public final class FilmSimulationDialog extends Dialog {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 settings.tint = (progress - TINT_DEFAULT) / 50.0;
                 updateSliderLabels();
-                schedulePreview();
+                schedulePreview(adjustingSliders);
             }
         });
         grainBar.setOnSeekBarChangeListener(new OnSeek() {
@@ -379,7 +440,7 @@ public final class FilmSimulationDialog extends Dialog {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 settings.grain = progress / 100.0;
                 updateSliderLabels();
-                schedulePreview();
+                schedulePreview(adjustingSliders);
             }
         });
         halationBar.setOnSeekBarChangeListener(new OnSeek() {
@@ -387,12 +448,43 @@ public final class FilmSimulationDialog extends Dialog {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 settings.halation = progress / 100.0;
                 updateSliderLabels();
-                schedulePreview();
+                schedulePreview(adjustingSliders);
+            }
+        });
+        vignetteBar.setOnSeekBarChangeListener(new OnSeek() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                settings.vignette = progress / 100.0;
+                updateSliderLabels();
+                schedulePreview(adjustingSliders);
+            }
+        });
+        leakBar.setOnSeekBarChangeListener(new OnSeek() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                settings.lightLeak = progress / 100.0;
+                updateSliderLabels();
+                schedulePreview(adjustingSliders);
             }
         });
         monochromeBox.setOnCheckedChangeListener((button, checked) -> {
             settings.monochrome = checked;
+            monoFilterSpinner.setVisibility(checked ? View.VISIBLE : View.GONE);
             schedulePreview();
+        });
+        monoFilterSpinner.setAdapter(new FilmSpinnerAdapter(getContext(),
+                Arrays.asList(getContext().getResources().getStringArray(
+                        R.array.film_mono_filters))));
+        monoFilterSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                settings.monoFilter = position;
+                if (settings.monochrome) schedulePreview();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
         });
     }
 
@@ -404,6 +496,10 @@ public final class FilmSimulationDialog extends Dialog {
                 Math.round(settings.grain * 100)));
         halationValue.setText(String.format(Locale.ROOT, "%d%%",
                 Math.round(settings.halation * 100)));
+        vignetteValue.setText(String.format(Locale.ROOT, "%d%%",
+                Math.round(settings.vignette * 100)));
+        leakValue.setText(String.format(Locale.ROOT, "%d%%",
+                Math.round(settings.lightLeak * 100)));
     }
 
     private static String formatEv(double ev) {
@@ -422,7 +518,10 @@ public final class FilmSimulationDialog extends Dialog {
         tintBar.setProgress(TINT_DEFAULT);
         grainBar.setProgress(GRAIN_DEFAULT);
         halationBar.setProgress(HALATION_DEFAULT);
+        vignetteBar.setProgress(VIGNETTE_DEFAULT);
+        leakBar.setProgress(LEAK_DEFAULT);
         monochromeBox.setChecked(false);
+        monoFilterSpinner.setSelection(0);
     }
 
     // ── 相机 RAW 列表 ──
@@ -616,26 +715,42 @@ public final class FilmSimulationDialog extends Dialog {
         if (decoded == null) {
             // 解码失败也要删掉缓存文件（RAW 可能有几十兆），否则会越积越多。
             if (cacheFile != null) cacheFile.delete();
+            pendingLocalUri = null;
             loadButton.setEnabled(true);
             exportButton.setEnabled(sourceBitmap != null && !sourceBitmap.isRecycled());
             statusView.setText(R.string.film_no_preview);
             return;
         }
         if (sourceBitmap != null) {
-            // 长按对比时 ImageView 正显示着旧源图，先摘下来再回收，避免绘制到已回收的位图。
+            // 对比视图/长按状态可能正显示着旧源图，先摘下来再回收，避免绘制到已回收的位图。
             if (showingOriginal) {
                 previewView.setImageDrawable(null);
                 showingOriginal = false;
             }
+            if (comparing) originalView.setImageDrawable(null);
             sourceBitmap.recycle();
         }
         sourceBitmap = decoded;
         if (currentSourceFile != null) currentSourceFile.delete();
-        currentSourceFile = cacheFile;
+        if (cacheFile != null) {
+            currentSourceFile = cacheFile;
+            currentSourceUri = null;
+            pendingLocalUri = null;
+        } else {
+            // 手机选图：保留 URI 以便导出时读取 EXIF；清掉上一张相机缓存。
+            currentSourceFile = null;
+            currentSourceUri = pendingLocalUri;
+            pendingLocalUri = null;
+        }
         sourceLabel = label == null ? "" : label;
         sourceUpscaled = upscaled;
         loadButton.setEnabled(true);
         exportButton.setEnabled(true);
+        overlayBar.setVisibility(View.VISIBLE);
+        if (comparing) {
+            originalView.setImageBitmap(decoded);
+            updateCompareSplit();
+        }
         startPreviewRender();
         refreshStockThumbnails();
     }
@@ -661,6 +776,12 @@ public final class FilmSimulationDialog extends Dialog {
         if (activity == null) {
             statusView.setText(R.string.film_status_local_failed);
             return;
+        }
+        // Android 13+ 优先用系统 Photo Picker：界面更轻、打开更快，同样不需要权限。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Intent picker = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            picker.setType("image/*");
+            if (launchPicker(activity, picker)) return;
         }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -708,6 +829,7 @@ public final class FilmSimulationDialog extends Dialog {
     public void onLocalImagePicked(Uri uri) {
         if (uri == null || released || downloading || decoding || exporting) return;
         final Context appContext = getContext().getApplicationContext();
+        pendingLocalUri = uri;
         decoding = true;
         loadButton.setEnabled(false);
         exportButton.setEnabled(false);
@@ -881,6 +1003,12 @@ public final class FilmSimulationDialog extends Dialog {
     // ── 模拟与对比 ──
 
     private void schedulePreview() {
+        schedulePreview(false);
+    }
+
+    /** @param quick true 表示滑杆拖动中，用更小的预览尺寸保证跟手 */
+    private void schedulePreview(boolean quick) {
+        previewMaxEdge = quick ? PREVIEW_QUICK_EDGE : PREVIEW_MAX_EDGE;
         handler.removeCallbacks(renderRunnable);
         handler.postDelayed(renderRunnable, RENDER_DEBOUNCE_MS);
     }
@@ -892,6 +1020,7 @@ public final class FilmSimulationDialog extends Dialog {
         final FilmSimulator.Settings snapshot = settings.copy();
         // 固定这一次渲染用的源图：换 RAW 时旧任务不会去读已被替换/回收的新旧混杂状态。
         final Bitmap source = sourceBitmap;
+        final int maxEdge = previewMaxEdge;
         final int generation = ++renderGeneration;
         // 导出期间不要再把状态栏改回“正在模拟”，否则会和全尺寸进度打架。
         if (!exporting) {
@@ -903,7 +1032,7 @@ public final class FilmSimulationDialog extends Dialog {
             try {
                 result = source.isRecycled()
                         ? null
-                        : FilmSimulator.render(source, stock, snapshot, PREVIEW_MAX_EDGE);
+                        : FilmSimulator.render(source, stock, snapshot, maxEdge);
             } catch (Throwable error) {
                 result = null;
             }
@@ -924,7 +1053,7 @@ public final class FilmSimulationDialog extends Dialog {
                 previewBitmap = rendered;
                 showingOriginal = false;
                 previewView.setImageBitmap(rendered);
-                compareHint.setVisibility(View.VISIBLE);
+                compareHint.setVisibility(comparing ? View.GONE : View.VISIBLE);
                 updateParams(stock);
                 // 全尺寸导出还没结束时，状态栏保留「正在生成全尺寸成品…」。
                 if (!sourceLabel.isEmpty() && !exporting) {
@@ -993,10 +1122,16 @@ public final class FilmSimulationDialog extends Dialog {
 
     private void updateParams(FilmStock stock) {
         if (stock == null) return;
-        String printLabel = stock.isPositive()
-                ? getContext().getString(R.string.film_positive)
-                : stock.printName;
-        paramsView.setText(getContext().getString(R.string.film_params,
+        String printLabel;
+        if (stock.hasLut()) {
+            printLabel = getContext().getString(R.string.film_lut_print);
+        } else {
+            printLabel = stock.isPositive()
+                    ? getContext().getString(R.string.film_positive)
+                    : stock.printName;
+        }
+        int template = stock.hasLut() ? R.string.film_params_lut : R.string.film_params;
+        paramsView.setText(getContext().getString(template,
                 stock.name,
                 printLabel,
                 formatEv(settings.exposureEv),
@@ -1006,8 +1141,30 @@ public final class FilmSimulationDialog extends Dialog {
                 Math.round(settings.halation * 100)));
     }
 
-    /** 按下显原图、松手回到模拟图；必须消费事件，否则收不到 ACTION_UP，对比如会卡在原图。 */
+    /** 对比模式下拖动分割线；吸管模式下点按取样；否则按下显原图、松手回到模拟图。 */
     private boolean onPreviewTouch(View view, MotionEvent event) {
+        if (comparing) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_MOVE:
+                    int width = view.getWidth();
+                    if (width > 0) {
+                        compareSplit = Math.max(0.03f,
+                                Math.min(0.97f, event.getX() / (float) width));
+                        updateCompareSplit();
+                    }
+                    break;
+                default:
+                    break;
+            }
+            return true;
+        }
+        if (pickingColor) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                sampleWhiteBalance(event.getX(), event.getY());
+            }
+            return true;
+        }
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 if (previewBitmap != null && sourceBitmap != null) {
@@ -1030,9 +1187,218 @@ public final class FilmSimulationDialog extends Dialog {
         return true;
     }
 
+    /** 进入/退出分屏对比：原图铺满预览，左侧按分割线裁出原图，右侧露出模拟图。 */
+    private void setCompareMode(boolean enable) {
+        if (enable && (sourceBitmap == null || sourceBitmap.isRecycled() || previewBitmap == null)) {
+            return;
+        }
+        if (enable && pickingColor) resetColorPickUi();
+        comparing = enable;
+        if (enable) {
+            originalView.setImageBitmap(sourceBitmap);
+            originalView.setVisibility(View.VISIBLE);
+            compareDivider.setVisibility(View.VISIBLE);
+            compareButton.setText(R.string.film_compare_exit);
+            compareHint.setVisibility(View.GONE);
+            updateCompareSplit();
+        } else {
+            previewView.setClipBounds(null);
+            originalView.setClipBounds(null);
+            originalView.setImageDrawable(null);
+            originalView.setVisibility(View.GONE);
+            compareDivider.setVisibility(View.GONE);
+            compareButton.setText(R.string.film_compare);
+            if (previewBitmap != null) {
+                compareHint.setVisibility(View.VISIBLE);
+                compareHint.setText(R.string.film_long_press_compare);
+            }
+        }
+    }
+
+    private void updateCompareSplit() {
+        int width = previewView.getWidth();
+        int height = previewView.getHeight();
+        if (!comparing || width <= 0 || height <= 0) return;
+        int split = Math.max(0, Math.min(width, (int) (width * compareSplit)));
+        previewView.setClipBounds(new Rect(split, 0, width, height));
+        originalView.setClipBounds(new Rect(0, 0, split, height));
+        FrameLayout.LayoutParams params =
+                (FrameLayout.LayoutParams) compareDivider.getLayoutParams();
+        params.leftMargin = Math.max(0, split - 1);
+        compareDivider.setLayoutParams(params);
+    }
+
+    private void toggleColorPick() {
+        if (sourceBitmap == null || sourceBitmap.isRecycled()) return;
+        if (comparing) setCompareMode(false);
+        pickingColor = !pickingColor;
+        if (pickingColor) {
+            pickColorButton.setText(R.string.film_pick_color_active);
+            compareHint.setText(R.string.film_pick_color_hint);
+            compareHint.setVisibility(View.VISIBLE);
+        } else {
+            resetColorPickUi();
+        }
+    }
+
+    private void resetColorPickUi() {
+        pickingColor = false;
+        pickColorButton.setText(R.string.film_pick_color);
+        compareHint.setText(R.string.film_long_press_compare);
+        compareHint.setVisibility(previewBitmap != null ? View.VISIBLE : View.GONE);
+    }
+
+    /** 按点按位置取 5×5 均值，反解色温/色调让取样点变成中性灰。 */
+    private void sampleWhiteBalance(float touchX, float touchY) {
+        resetColorPickUi();
+        Bitmap source = sourceBitmap;
+        if (source == null || source.isRecycled()) return;
+        int padLeft = previewView.getPaddingLeft();
+        int padTop = previewView.getPaddingTop();
+        int viewWidth = previewView.getWidth() - padLeft - previewView.getPaddingRight();
+        int viewHeight = previewView.getHeight() - padTop - previewView.getPaddingBottom();
+        if (viewWidth <= 0 || viewHeight <= 0) return;
+        float scale = Math.min(viewWidth / (float) source.getWidth(),
+                viewHeight / (float) source.getHeight());
+        float shownWidth = source.getWidth() * scale;
+        float shownHeight = source.getHeight() * scale;
+        float left = padLeft + (viewWidth - shownWidth) * 0.5f;
+        float top = padTop + (viewHeight - shownHeight) * 0.5f;
+        int px = (int) ((touchX - left) / scale);
+        int py = (int) ((touchY - top) / scale);
+        if (px < 0 || py < 0 || px >= source.getWidth() || py >= source.getHeight()) {
+            statusView.setText(R.string.film_wb_sample_failed);
+            return;
+        }
+        double red = 0.0;
+        double green = 0.0;
+        double blue = 0.0;
+        int samples = 0;
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int sx = Math.max(0, Math.min(source.getWidth() - 1, px + dx));
+                int sy = Math.max(0, Math.min(source.getHeight() - 1, py + dy));
+                int color = source.getPixel(sx, sy);
+                red += linearLevel((color >>> 16) & 0xff);
+                green += linearLevel((color >>> 8) & 0xff);
+                blue += linearLevel(color & 0xff);
+                samples++;
+            }
+        }
+        red /= samples;
+        green /= samples;
+        blue /= samples;
+        if (red < 1e-3 || green < 1e-3 || blue < 1e-3) {
+            statusView.setText(R.string.film_wb_sample_failed);
+            return;
+        }
+        // 与 buildToneLut 的增益模型同构：g0=(1+t)(1+0.12u)、g1=1-0.2u、g2=(1-t)(1+0.12u)。
+        double logRG = Math.log(green / red);
+        double logGB = Math.log(green / blue);
+        double cross = (logRG - logGB) * 0.5;
+        double t = (Math.exp(cross) - 1.0) / (Math.exp(cross) + 1.0);
+        double u = (logRG + logGB - Math.log(1.0 - t * t)) / 0.64;
+        double temperature = Math.max(-1.0, Math.min(1.0, t / 0.28));
+        double tint = Math.max(-1.0, Math.min(1.0, u));
+        temperatureBar.setProgress(TEMPERATURE_DEFAULT + (int) Math.round(temperature * 50));
+        tintBar.setProgress(TINT_DEFAULT + (int) Math.round(tint * 50));
+        statusView.setText(R.string.film_wb_sampled);
+    }
+
+    private static double linearLevel(int value) {
+        double x = value / 255.0;
+        return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+    }
+
     // ── 导出 ──
 
-    private void exportSimulation() {
+    /** 弹出导出选项：尺寸、JPEG 质量、是否保留拍摄信息。 */
+    private void showExportOptions() {
+        if (downloading || decoding || exporting) return;
+        if (sourceBitmap == null || sourceBitmap.isRecycled()) {
+            statusView.setText(R.string.film_need_raw);
+            return;
+        }
+        Context context = getContext();
+        float density = context.getResources().getDisplayMetrics().density;
+        int padding = (int) (18 * density);
+        LinearLayout root = new LinearLayout(context);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(padding, padding / 2, padding, 0);
+
+        TextView sizeLabel = new TextView(context);
+        sizeLabel.setText(R.string.film_export_size);
+        sizeLabel.setTextSize(13);
+        root.addView(sizeLabel);
+
+        Spinner sizeSpinner = new Spinner(context);
+        ArrayAdapter<String> sizeAdapter = new ArrayAdapter<>(context,
+                android.R.layout.simple_spinner_item,
+                new String[]{
+                        context.getString(R.string.film_export_size_original),
+                        context.getString(R.string.film_export_size_2048),
+                        context.getString(R.string.film_export_size_4096)});
+        sizeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        sizeSpinner.setAdapter(sizeAdapter);
+        root.addView(sizeSpinner, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView qualityLabel = new TextView(context);
+        qualityLabel.setText(R.string.film_export_quality);
+        qualityLabel.setTextSize(13);
+        LinearLayout.LayoutParams labelParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        labelParams.topMargin = (int) (8 * density);
+        root.addView(qualityLabel, labelParams);
+
+        Spinner qualitySpinner = new Spinner(context);
+        ArrayAdapter<String> qualityAdapter = new ArrayAdapter<>(context,
+                android.R.layout.simple_spinner_item,
+                new String[]{
+                        context.getString(R.string.film_export_quality_high),
+                        context.getString(R.string.film_export_quality_standard),
+                        context.getString(R.string.film_export_quality_small)});
+        qualityAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        qualitySpinner.setAdapter(qualityAdapter);
+        root.addView(qualitySpinner, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final boolean canKeepExif = canKeepSourceExif();
+        CheckBox exifBox = new CheckBox(context);
+        exifBox.setChecked(canKeepExif);
+        exifBox.setEnabled(canKeepExif);
+        exifBox.setText(canKeepExif
+                ? R.string.film_export_exif : R.string.film_export_exif_unavailable);
+        LinearLayout.LayoutParams exifParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        exifParams.topMargin = (int) (8 * density);
+        root.addView(exifBox, exifParams);
+
+        new AlertDialog.Builder(context)
+                .setTitle(R.string.film_export_options)
+                .setView(root)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.film_export_action, (dialog, which) ->
+                        exportSimulation(EXPORT_LONG_EDGES[sizeSpinner.getSelectedItemPosition()],
+                                EXPORT_QUALITIES[qualitySpinner.getSelectedItemPosition()],
+                                canKeepExif && exifBox.isChecked()))
+                .show();
+    }
+
+    /** 相机 JPG 或手机图片可以带出 EXIF；RAW 的内嵌预览不解析容器里的 EXIF。 */
+    private boolean canKeepSourceExif() {
+        if (currentSourceFile != null) {
+            String lower = currentSourceFile.getName().toLowerCase(Locale.ROOT);
+            return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+        }
+        return currentSourceUri != null;
+    }
+
+    private void exportSimulation(int longEdge, int quality, boolean keepExif) {
         if (downloading || decoding || exporting) return;
         if (sourceBitmap == null || sourceBitmap.isRecycled()) {
             statusView.setText(R.string.film_need_raw);
@@ -1044,11 +1410,18 @@ public final class FilmSimulationDialog extends Dialog {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
                 && getContext().checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                         != PackageManager.PERMISSION_GRANTED) {
+            pendingExportLongEdge = longEdge;
+            pendingExportQuality = quality;
+            pendingExportExif = keepExif;
             requestLegacyStoragePermission();
             return;
         }
         final FilmSimulator.Settings snapshot = settings.copy();
         final Bitmap source = sourceBitmap;
+        final File exifFile = currentSourceFile;
+        final Uri exifUri = currentSourceUri;
+        final boolean copyExif = keepExif;
+        final Context appContext = getContext().getApplicationContext();
         exporting = true;
         exportButton.setEnabled(false);
         loadButton.setEnabled(false);
@@ -1063,15 +1436,16 @@ public final class FilmSimulationDialog extends Dialog {
             String exportedName = null;
             Throwable failure = null;
             try {
-                full = FilmSimulator.render(source, stock, snapshot, 0);
+                full = FilmSimulator.render(source, stock, snapshot, longEdge);
                 if (full == null) throw new IOException("渲染失败。");
                 temp = new File(getContext().getCacheDir(),
                         "film_export_" + System.currentTimeMillis() + ".jpg");
                 try (FileOutputStream output = new FileOutputStream(temp)) {
-                    if (!full.compress(Bitmap.CompressFormat.JPEG, 94, output)) {
+                    if (!full.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
                         throw new IOException("JPEG 编码失败。");
                     }
                 }
+                if (copyExif) copySourceExif(appContext, exifFile, exifUri, temp);
                 String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT)
                         .format(new Date());
                 exportedName = "FILM_" + stock.id + "_" + stamp + ".jpg";
@@ -1102,6 +1476,40 @@ public final class FilmSimulationDialog extends Dialog {
         });
     }
 
+    /**
+     * 把源图的相机信息写到成品 JPEG。方向已经按 EXIF 摆正并烘进像素，
+     * 因此输出统一为 NORMAL，避免图库再转一次。
+     */
+    private static void copySourceExif(
+            Context context, File sourceFile, Uri sourceUri, File target) {
+        android.media.ExifInterface source = null;
+        try {
+            if (sourceFile != null && sourceFile.isFile()) {
+                source = new android.media.ExifInterface(sourceFile.getPath());
+            } else if (sourceUri != null) {
+                try (InputStream input = context.getContentResolver().openInputStream(sourceUri)) {
+                    if (input != null) source = new android.media.ExifInterface(input);
+                }
+            }
+        } catch (Exception ignored) {
+            return;
+        }
+        if (source == null) return;
+        try {
+            android.media.ExifInterface output =
+                    new android.media.ExifInterface(target.getPath());
+            for (String tag : EXPORT_EXIF_TAGS) {
+                String value = source.getAttribute(tag);
+                if (value != null && !value.isEmpty()) output.setAttribute(tag, value);
+            }
+            output.setAttribute(android.media.ExifInterface.TAG_ORIENTATION,
+                    String.valueOf(android.media.ExifInterface.ORIENTATION_NORMAL));
+            output.saveAttributes();
+        } catch (Exception ignored) {
+            // EXIF 写失败不影响成品，静默降级为无拍摄信息。
+        }
+    }
+
     /** 申请 Android 9 及以下的存储权限；结果由 MainActivity 转发回 {@link #onStoragePermissionResult}。 */
     private void requestLegacyStoragePermission() {
         Activity activity = findHostActivity(getContext());
@@ -1124,7 +1532,7 @@ public final class FilmSimulationDialog extends Dialog {
         if (released || !pendingExportAfterPermission) return;
         pendingExportAfterPermission = false;
         if (granted) {
-            exportSimulation();
+            exportSimulation(pendingExportLongEdge, pendingExportQuality, pendingExportExif);
         } else {
             statusView.setText(R.string.film_need_storage_permission);
         }
@@ -1143,6 +1551,7 @@ public final class FilmSimulationDialog extends Dialog {
         handler.removeCallbacksAndMessages(null);
         renderExecutor.shutdownNow();
         if (previewView != null) previewView.setImageDrawable(null);
+        if (originalView != null) originalView.setImageDrawable(null);
         if (previewBitmap != null) {
             previewBitmap.recycle();
             previewBitmap = null;
@@ -1274,14 +1683,17 @@ public final class FilmSimulationDialog extends Dialog {
         }
     }
 
-    /** 只关心进度变化的 SeekBar 监听。 */
-    private abstract static class OnSeek implements SeekBar.OnSeekBarChangeListener {
+    /** 只关心进度变化的 SeekBar 监听；拖动期间降级到低分辨率预览，松手补一帧清晰的。 */
+    private abstract class OnSeek implements SeekBar.OnSeekBarChangeListener {
         @Override
         public void onStartTrackingTouch(SeekBar seekBar) {
+            adjustingSliders = true;
         }
 
         @Override
         public void onStopTrackingTouch(SeekBar seekBar) {
+            adjustingSliders = false;
+            schedulePreview();
         }
     }
 }

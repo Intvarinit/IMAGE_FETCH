@@ -199,7 +199,38 @@
     <string name="film_status_ready_upscaled">%1$s · %2$d × %3$d（RAW 内嵌预览 2× 放大）· 长按画面可对比原图</string>
     <string name="film_positive">正片（无相纸）</string>
     <string name="film_positive_tag">正片</string>
-    <string name="film_monochrome">先转黑白（保留颗粒与光晕）</string>
+    <string name="film_lut_print">33³ 3D LUT</string>
+    <string name="film_params_lut">%1$s → %2$s\n曝光 %3$s · 色温 %4$s · 色调 %5$s · 颗粒 %6$d%% · 光晕 %7$d%%\n内置 3D LUT 来自 t3mujinpack（MIT）；颗粒与光晕为后期叠加。</string>
+    <string name="film_monochrome">先转黑白</string>
+    <string name="film_mono_filter_label">黑白滤镜</string>
+    <string name="film_vignette_label">暗角</string>
+    <string name="film_leak_label">漏光</string>
+    <string name="film_compare">对比</string>
+    <string name="film_compare_exit">退出对比</string>
+    <string name="film_pick_color">吸管</string>
+    <string name="film_pick_color_active">点按取样</string>
+    <string name="film_export_options">导出选项</string>
+    <string name="film_export_size">成品尺寸</string>
+    <string name="film_export_size_original">原尺寸</string>
+    <string name="film_export_size_2048">长边 2048</string>
+    <string name="film_export_size_4096">长边 4096</string>
+    <string name="film_export_quality">JPEG 质量</string>
+    <string name="film_export_quality_high">高（94）</string>
+    <string name="film_export_quality_standard">标准（86）</string>
+    <string name="film_export_quality_small">小体积（75）</string>
+    <string name="film_export_exif">保留拍摄信息（EXIF）</string>
+    <string name="film_export_exif_unavailable">当前来源没有可保留的拍摄信息</string>
+    <string name="film_export_action">导出</string>
+    <string name="film_pick_color_hint">点击画面中的中性灰或白色</string>
+    <string name="film_wb_sampled">已按取样点校正白平衡</string>
+    <string name="film_wb_sample_failed">取样点超出画面或太暗，请换一处</string>
+    <string-array name="film_mono_filters">
+        <item>无滤镜</item>
+        <item>黄滤镜</item>
+        <item>橙滤镜</item>
+        <item>红滤镜</item>
+        <item>绿滤镜</item>
+    </string-array>
     <string name="film_params">%1$s → %2$s\n曝光 %3$s · 色温 %4$s · 色调 %5$s · 颗粒 %6$d%% · 光晕 %7$d%%\n密度曲线来自 spektrafilm（CC BY-SA 4.0）；本页为半物理近似，非逐像素复刻。</string>
     <string name="film_no_catalog">没有读到内置胶片数据。</string>
     <string name="film_data_load_failed">内置胶片数据读取失败。</string>

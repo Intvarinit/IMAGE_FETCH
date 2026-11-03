@@ -47,12 +47,18 @@ public final class FilmStock {
     public final double logExposureMin;
     public final double logExposureMax;
 
-    /** [通道][256] 的胶片密度（未缩放）。 */
+    /** [通道][256] 的胶片密度（未缩放）。LUT 胶片为 null。 */
     private final short[][] curve;
-    /** [通道][256] 的相纸密度（未缩放）。 */
+    /** [通道][256] 的相纸密度（未缩放）。LUT 胶片为 null。 */
     private final short[][] print;
+    /** 内置 3D LUT 的 asset 文件名（assets/luts/ 下）；曲线胶片为 null。 */
+    private final String lutFile;
+    /** 解析后的 LUT：首次用到时才读，避免打开页面就解析近 1 MB 的数据。 */
+    private volatile Lut3D lut;
+    private final Context context;
 
     private FilmStock(
+            Context context,
             String id,
             String name,
             String brand,
@@ -63,7 +69,9 @@ public final class FilmStock {
             double logExposureMin,
             double logExposureMax,
             short[][] curve,
-            short[][] print) {
+            short[][] print,
+            String lutFile) {
+        this.context = context;
         this.id = id;
         this.name = name;
         this.brand = brand;
@@ -75,6 +83,28 @@ public final class FilmStock {
         this.logExposureMax = logExposureMax;
         this.curve = curve;
         this.print = print;
+        this.lutFile = lutFile;
+    }
+
+    /** 这条胶片走 3D LUT 管线，而不是内置密度曲线。 */
+    public boolean hasLut() {
+        return lutFile != null && !lutFile.isEmpty();
+    }
+
+    /** 懒加载 3D LUT；asset 读取失败时抛出运行时异常，由预览层提示。 */
+    Lut3D lut() {
+        if (!hasLut()) return null;
+        Lut3D loaded = lut;
+        if (loaded != null) return loaded;
+        synchronized (this) {
+            if (lut == null) {
+                lut = Lut3D.load(context, "luts/" + lutFile);
+                if (lut == null) {
+                    throw new IllegalStateException("LUT 读取失败：" + lutFile);
+                }
+            }
+            return lut;
+        }
     }
 
     /** 正片（反转片）：直接观看，不经过相纸。 */
@@ -147,7 +177,7 @@ public final class FilmStock {
             JSONArray array = root.getJSONArray("films");
             List<FilmStock> films = new ArrayList<>(array.length());
             for (int i = 0; i < array.length(); i++) {
-                films.add(parse(array.getJSONObject(i)));
+                films.add(parse(context, array.getJSONObject(i)));
             }
             return new Catalog(
                     films,
@@ -158,8 +188,12 @@ public final class FilmStock {
         }
     }
 
-    private static FilmStock parse(JSONObject object) throws org.json.JSONException {
+    private static FilmStock parse(Context context, JSONObject object)
+            throws org.json.JSONException {
+        String lutFile = object.optString("lut", "");
+        boolean fromLut = !lutFile.isEmpty();
         return new FilmStock(
+                context,
                 object.getString("id"),
                 object.optString("name", object.getString("id")),
                 object.optString("brand", ""),
@@ -167,15 +201,12 @@ public final class FilmStock {
                 object.optBoolean("monochrome", false),
                 object.optString("antihalation", ""),
                 object.optString("printName", ""),
-                object.getDouble("logExposureMin"),
-                object.getDouble("logExposureMax"),
-                parseCurve(object.getJSONArray("curve")),
-                object.has("print") ? parseCurve(object.getJSONArray("print")) : emptyCurve());
-    }
-
-    /** 正片没有相纸曲线；给一张全零表，避免下游判空。 */
-    private static short[][] emptyCurve() {
-        return new short[3][CURVE_POINTS];
+                fromLut ? 0.0 : object.getDouble("logExposureMin"),
+                fromLut ? 0.0 : object.getDouble("logExposureMax"),
+                fromLut ? null : parseCurve(object.getJSONArray("curve")),
+                fromLut || !object.has("print")
+                        ? null : parseCurve(object.getJSONArray("print")),
+                fromLut ? lutFile : null);
     }
 
     /** 把 [[r,g,b] × 256] 展开成 [通道][256]。 */

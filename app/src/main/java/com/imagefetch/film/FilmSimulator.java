@@ -34,6 +34,12 @@ public final class FilmSimulator {
         public double halation = 0.35;
         /** 先转黑白：任意胶片都可以只保留明暗、颗粒与光晕，输出中性灰。 */
         public boolean monochrome;
+        /** 黑白滤镜：0 无、1 黄、2 橙、3 红、4 绿（模拟黑白摄影常用滤镜）。 */
+        public int monoFilter;
+        /** 暗角强度（0…1）。 */
+        public double vignette;
+        /** 漏光强度（0…1）。 */
+        public double lightLeak;
 
         public Settings copy() {
             Settings copy = new Settings();
@@ -43,6 +49,9 @@ public final class FilmSimulator {
             copy.grain = grain;
             copy.halation = halation;
             copy.monochrome = monochrome;
+            copy.monoFilter = monoFilter;
+            copy.vignette = vignette;
+            copy.lightLeak = lightLeak;
             return copy;
         }
     }
@@ -57,6 +66,21 @@ public final class FilmSimulator {
     private static final double MONO_PRINT_GAMMA = 1.5;
     private static final double MONO_PRINT_MIN_DENSITY = 0.08;
     private static final double MONO_PRINT_MAX_DENSITY = 2.0;
+    /** 黑白滤镜的通道权重：黄/橙/红压暗天空，绿色更适合肤色与植被。 */
+    private static final float[][] MONO_FILTER_WEIGHTS = {
+            {0.2126f, 0.7152f, 0.0722f},
+            {0.40f, 0.48f, 0.12f},
+            {0.58f, 0.37f, 0.05f},
+            {0.82f, 0.16f, 0.02f},
+            {0.12f, 0.72f, 0.16f},
+    };
+    /** 颗粒噪声贴图边长（2 的幂，取模即可平铺）；比逐像素哈希更接近银盐的簇状颗粒。 */
+    private static final int GRAIN_TILE_SIZE = 512;
+    private static final int GRAIN_TILE_MASK = GRAIN_TILE_SIZE - 1;
+    /** 颗粒贴图懒加载：只建一次，所有渲染共用。 */
+    private static volatile float[] grainTile;
+    /** 导出时分条带处理的行数，显著降低大图内存峰值。 */
+    private static final int STRIP_ROWS = 256;
 
     /** 按原尺寸渲染。 */
     public static Bitmap render(Bitmap source, FilmStock stock, Settings settings) {
@@ -84,19 +108,20 @@ public final class FilmSimulator {
 
         int width = input.getWidth();
         int height = input.getHeight();
-        int[] pixels = new int[width * height];
-        input.getPixels(pixels, 0, width, 0, 0, width, height);
-        if (input != source) input.recycle();
 
         Settings tuned = settings.copy();
         clamp(tuned);
-        float[][] toneLut = buildToneLut(stock, tuned);
+        Lut3D lut = stock.hasLut() ? stock.lut() : null;
+        float[][] toneLut = lut == null ? buildToneLut(stock, tuned) : null;
+        int[][] adjustLut = lut == null ? null : buildAdjustLut(tuned);
+        float[] decodeLut = lut == null ? null : buildDecodeLut();
+        float[] lutOut = lut == null ? null : new float[3];
         float[] encodeLut = buildEncodeLut();
 
         double halationStrength = 0.0;
         float[] glow = null;
         if (tuned.halation > 0.01) {
-            glow = buildGlow(pixels, width, height, toneLut);
+            glow = buildGlow(input, width, height, toneLut, adjustLut, lut, decodeLut);
             // 按 profile 的抗光晕层标注调整：无 rem-jet 的 CineStill 光晕最夸张，
             // 抗光晕层强的胶片（如 Portra 系列）收敛更快。
             double filmFactor = 1.0;
@@ -111,70 +136,130 @@ public final class FilmSimulator {
         double grainAmount = 0.10 * tuned.grain;
         int glowWidth = glow == null ? 0 : Math.max(1, width / GLOW_DOWNSCALE);
         int glowHeight = glow == null ? 0 : Math.max(1, height / GLOW_DOWNSCALE);
+        float[] weights = MONO_FILTER_WEIGHTS[
+                Math.max(0, Math.min(MONO_FILTER_WEIGHTS.length - 1, tuned.monoFilter))];
+        // 黑白 LUT 的输出已经是中性灰，颗粒与光晕也应保持中性，避免彩色噪点。
+        boolean monoOutput = tuned.monochrome || (lut != null && stock.monochrome);
+        float vignette = (float) tuned.vignette;
+        float lightLeak = (float) tuned.lightLeak;
+        float centerX = width * 0.5f;
+        float centerY = height * 0.5f;
+        float[] tile = grainTile();
 
-        for (int y = 0; y < height; y++) {
-            int rowOffset = y * width;
-            for (int x = 0; x < width; x++) {
-                int argb = pixels[rowOffset + x];
-                float red = toneLut[0][(argb >>> 16) & 0xff];
-                float green = toneLut[1][(argb >>> 8) & 0xff];
-                float blue = toneLut[2][argb & 0xff];
-
-                if (tuned.monochrome) {
-                    // 先转黑白：色调映射后的三通道取亮度，去掉胶片的成色偏色。
-                    float gray = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
-                    red = gray;
-                    green = gray;
-                    blue = gray;
-                }
-
-                if (grainAmount > 0.0) {
-                    float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
-                    float weight = 4.0f * luminance * (1.0f - luminance);
-                    if (weight < 0.0f) weight = 0.0f;
-                    float scale = (float) grainAmount * weight;
-                    if (tuned.monochrome) {
-                        // 黑白颗粒是同一颗银盐，三通道用同一噪声，避免彩色噪点。
-                        float factor = 1.0f + hashNoise(x, y, 0x51ed) * scale;
-                        red *= factor;
-                        green = red;
-                        blue = red;
+        // 分条带渲染：只常驻一条带像素，导出 4096px 时不再需要整幅 int[]，内存峰值明显下降。
+        Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int stripRows = Math.min(height, STRIP_ROWS);
+        int[] strip = new int[width * stripRows];
+        for (int y0 = 0; y0 < height; y0 += stripRows) {
+            int rows = Math.min(stripRows, height - y0);
+            input.getPixels(strip, 0, width, 0, y0, width, rows);
+            for (int ry = 0; ry < rows; ry++) {
+                int y = y0 + ry;
+                int rowOffset = ry * width;
+                float ny = (y - centerY) / centerY;
+                for (int x = 0; x < width; x++) {
+                    int argb = strip[rowOffset + x];
+                    int r8 = (argb >>> 16) & 0xff;
+                    int g8 = (argb >>> 8) & 0xff;
+                    int b8 = argb & 0xff;
+                    float red;
+                    float green;
+                    float blue;
+                    if (lut != null) {
+                        // LUT 输入是 sRGB 显示值：先折进曝光/白平衡，再查表。
+                        lut.sample8(
+                                adjustLut[0][r8], adjustLut[1][g8], adjustLut[2][b8], lutOut);
+                        // 后续颗粒/光晕/暗角都在线性光里做，和曲线管线保持一致。
+                        red = decodeLut[to8(lutOut[0])];
+                        green = decodeLut[to8(lutOut[1])];
+                        blue = decodeLut[to8(lutOut[2])];
                     } else {
-                        float common = hashNoise(x, y, 0x51ed) * 0.7f;
-                        float nr = common + hashNoise(x, y, 0x2f1b) * 0.3f;
-                        float ng = common + hashNoise(x, y, 0x71a3) * 0.3f;
-                        float nb = common + hashNoise(x, y, 0x19c7) * 0.3f;
-                        red *= 1.0f + nr * scale;
-                        green *= 1.0f + ng * scale;
-                        blue *= 1.0f + nb * scale;
+                        red = toneLut[0][r8];
+                        green = toneLut[1][g8];
+                        blue = toneLut[2][b8];
                     }
-                }
 
-                if (glow != null) {
-                    float gx = (x + 0.5f) / GLOW_DOWNSCALE - 0.5f;
-                    float gy = (y + 0.5f) / GLOW_DOWNSCALE - 0.5f;
-                    float value = sampleGlow(glow, glowWidth, glowHeight, gx, gy);
-                    float strength = (float) halationStrength * value;
                     if (tuned.monochrome) {
-                        // 黑白的光晕是中性灰溢出，不带暖色。
-                        red += strength;
-                        green += strength;
-                        blue += strength;
-                    } else {
-                        red += strength;
-                        green += strength * 0.40f;
-                        blue += strength * 0.16f;
+                        // 先转黑白：色调映射后的三通道按滤镜权重取灰，去掉胶片的成色偏色。
+                        float gray = weights[0] * red + weights[1] * green + weights[2] * blue;
+                        red = gray;
+                        green = gray;
+                        blue = gray;
                     }
-                }
 
-                int r = encode(red, encodeLut);
-                int g = encode(green, encodeLut);
-                int b = encode(blue, encodeLut);
-                pixels[rowOffset + x] = 0xff000000 | (r << 16) | (g << 8) | b;
+                    if (grainAmount > 0.0) {
+                        float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
+                        float weight = 4.0f * luminance * (1.0f - luminance);
+                        if (weight < 0.0f) weight = 0.0f;
+                        float scale = (float) grainAmount * weight;
+                        if (monoOutput) {
+                            // 黑白颗粒是同一颗银盐，三通道用同一噪声，避免彩色噪点。
+                            float factor = 1.0f + grainAt(tile, x, y, 0x51ed) * scale;
+                            red *= factor;
+                            green = red;
+                            blue = red;
+                        } else {
+                            float common = grainAt(tile, x, y, 0x51ed) * 0.7f;
+                            float nr = common + grainAt(tile, x, y, 0x2f1b) * 0.3f;
+                            float ng = common + grainAt(tile, x, y, 0x71a3) * 0.3f;
+                            float nb = common + grainAt(tile, x, y, 0x19c7) * 0.3f;
+                            red *= 1.0f + nr * scale;
+                            green *= 1.0f + ng * scale;
+                            blue *= 1.0f + nb * scale;
+                        }
+                    }
+
+                    if (glow != null) {
+                        float gx = (x + 0.5f) / GLOW_DOWNSCALE - 0.5f;
+                        float gy = (y + 0.5f) / GLOW_DOWNSCALE - 0.5f;
+                        float value = sampleGlow(glow, glowWidth, glowHeight, gx, gy);
+                        float strength = (float) halationStrength * value;
+                        if (monoOutput) {
+                            // 黑白的光晕是中性灰溢出，不带暖色。
+                            red += strength;
+                            green += strength;
+                            blue += strength;
+                        } else {
+                            red += strength;
+                            green += strength * 0.40f;
+                            blue += strength * 0.16f;
+                        }
+                    }
+
+                    if (vignette > 0.01) {
+                        float nx = (x - centerX) / centerX;
+                        float radial = nx * nx + ny * ny;
+                        float dim = 1.0f - vignette * 0.9f * Math.min(1.0f, radial * 0.7f);
+                        red *= dim;
+                        green *= dim;
+                        blue *= dim;
+                    }
+
+                    if (lightLeak > 0.01) {
+                        // 右上角的暖色漏光：向右上角逐渐增强，带一点由暖到橙的过渡。
+                        float rx = (width - 1 - x) / (width * 0.45f);
+                        if (rx < 0.0f) rx = 0.0f;
+                        if (rx > 1.0f) rx = 1.0f;
+                        float ty = y / (height * 0.70f);
+                        if (ty > 1.0f) ty = 1.0f;
+                        float value = (1.0f - rx) * (1.0f - rx) * (1.0f - ty) * (1.0f - ty);
+                        float strength = 0.55f * lightLeak * value;
+                        red += strength;
+                        green += strength * 0.55f;
+                        blue += strength * 0.25f;
+                    }
+
+                    int r = encode(red, encodeLut);
+                    int g = encode(green, encodeLut);
+                    int b = encode(blue, encodeLut);
+                    strip[rowOffset + x] = 0xff000000 | (r << 16) | (g << 8) | b;
+                }
             }
+            output.setPixels(strip, 0, width, 0, y0, width, rows);
         }
 
-        return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888);
+        if (input != source) input.recycle();
+        return output;
     }
 
     private static void clamp(Settings settings) {
@@ -183,6 +268,10 @@ public final class FilmSimulator {
         settings.tint = Math.max(-1.0, Math.min(1.0, settings.tint));
         settings.grain = Math.max(0.0, Math.min(1.0, settings.grain));
         settings.halation = Math.max(0.0, Math.min(1.0, settings.halation));
+        settings.monoFilter = Math.max(0, Math.min(MONO_FILTER_WEIGHTS.length - 1,
+                settings.monoFilter));
+        settings.vignette = Math.max(0.0, Math.min(1.0, settings.vignette));
+        settings.lightLeak = Math.max(0.0, Math.min(1.0, settings.lightLeak));
     }
 
     /**
@@ -303,6 +392,44 @@ public final class FilmSimulator {
         return lut;
     }
 
+    /** sRGB 显示值 → 线性光：LUT 输出要回到线性域，才能沿用同一套颗粒/光晕。 */
+    private static float[] buildDecodeLut() {
+        float[] lut = new float[256];
+        for (int i = 0; i < 256; i++) {
+            lut[i] = (float) srgbToLinear(i / 255.0);
+        }
+        return lut;
+    }
+
+    /**
+     * LUT 管线的前置曝光/白平衡：在 sRGB 域先把三个通道折进 8bit，
+     * 再交给 3D LUT 查表；曲线管线仍走自己的一体化 toneLut。
+     */
+    private static int[][] buildAdjustLut(Settings settings) {
+        double temperature = 0.28 * settings.temperature;
+        double tint = settings.tint;
+        double[] gain = new double[3];
+        gain[0] = (1.0 + temperature) * (1.0 + 0.12 * tint);
+        gain[1] = 1.0 - 0.20 * tint;
+        gain[2] = (1.0 - temperature) * (1.0 + 0.12 * tint);
+        double exposureGain = Math.pow(2.0, settings.exposureEv);
+
+        int[][] lut = new int[3][256];
+        for (int channel = 0; channel < 3; channel++) {
+            for (int value = 0; value < 256; value++) {
+                double linear = srgbToLinear(value / 255.0) * gain[channel] * exposureGain;
+                lut[channel][value] = to8((float) linearToSrgb(linear));
+            }
+        }
+        return lut;
+    }
+
+    private static int to8(float value) {
+        if (value <= 0.0f) return 0;
+        if (value >= 1.0f) return 255;
+        return (int) (value * 255.0f + 0.5f);
+    }
+
     private static int encode(float linear, float[] encodeLut) {
         if (linear <= 0.0f) return 0;
         if (linear >= 1.0f) return 255;
@@ -345,24 +472,52 @@ public final class FilmSimulator {
      * 光晕掩码：取线性亮度里 0.6 以上的高光，按 1/4 边长累积成小图后做三级盒式模糊，
      * 得到从高光向外扩散的暖色光斑。
      */
-    private static float[] buildGlow(int[] pixels, int width, int height, float[][] toneLut) {
+    private static float[] buildGlow(
+            Bitmap input,
+            int width,
+            int height,
+            float[][] toneLut,
+            int[][] adjustLut,
+            Lut3D lut,
+            float[] decodeLut) {
         int glowWidth = Math.max(1, width / GLOW_DOWNSCALE);
         int glowHeight = Math.max(1, height / GLOW_DOWNSCALE);
+        int[] smallPixels;
+        if (glowWidth == width && glowHeight == height) {
+            smallPixels = new int[width * height];
+            input.getPixels(smallPixels, 0, width, 0, 0, width, height);
+        } else {
+            // 先缩到 1/4 边长再算掩码：既降低模糊成本，也避免为全图再开一份 int[]。
+            Bitmap small = Bitmap.createScaledBitmap(input, glowWidth, glowHeight, true);
+            smallPixels = new int[glowWidth * glowHeight];
+            small.getPixels(smallPixels, 0, glowWidth, 0, 0, glowWidth, glowHeight);
+            if (small != input) small.recycle();
+        }
         float[] mask = new float[glowWidth * glowHeight];
-        for (int y = 0; y < height; y++) {
-            int glowRow = Math.min(glowHeight - 1, y / GLOW_DOWNSCALE) * glowWidth;
-            int rowOffset = y * width;
-            for (int x = 0; x < width; x++) {
-                int argb = pixels[rowOffset + x];
-                float luminance = 0.2126f * toneLut[0][(argb >>> 16) & 0xff]
-                        + 0.7152f * toneLut[1][(argb >>> 8) & 0xff]
-                        + 0.0722f * toneLut[2][argb & 0xff];
-                float value = (luminance - 0.6f) / 0.4f;
-                if (value <= 0.0f) continue;
-                value = value * value;
-                int glowIndex = glowRow + Math.min(glowWidth - 1, x / GLOW_DOWNSCALE);
-                if (mask[glowIndex] < value) mask[glowIndex] = value;
+        float[] lutOut = lut == null ? null : new float[3];
+        for (int i = 0; i < mask.length; i++) {
+            int argb = smallPixels[i];
+            float lred;
+            float lgreen;
+            float lblue;
+            if (lut != null) {
+                lut.sample8(
+                        adjustLut[0][(argb >>> 16) & 0xff],
+                        adjustLut[1][(argb >>> 8) & 0xff],
+                        adjustLut[2][argb & 0xff],
+                        lutOut);
+                lred = decodeLut[to8(lutOut[0])];
+                lgreen = decodeLut[to8(lutOut[1])];
+                lblue = decodeLut[to8(lutOut[2])];
+            } else {
+                lred = toneLut[0][(argb >>> 16) & 0xff];
+                lgreen = toneLut[1][(argb >>> 8) & 0xff];
+                lblue = toneLut[2][argb & 0xff];
             }
+            float luminance = 0.2126f * lred + 0.7152f * lgreen + 0.0722f * lblue;
+            float value = (luminance - 0.6f) / 0.4f;
+            if (value <= 0.0f) continue;
+            mask[i] = value * value;
         }
         int baseRadius = Math.max(1, Math.round(Math.min(glowWidth, glowHeight) * 0.012f));
         mask = boxBlur(mask, glowWidth, glowHeight, baseRadius);
@@ -423,6 +578,69 @@ public final class FilmSimulator {
         float fy = y - y0;
         float top = glow[y0 * width + x0] * (1.0f - fx) + glow[y0 * width + x1] * fx;
         float bottom = glow[y1 * width + x0] * (1.0f - fx) + glow[y1 * width + x1] * fx;
+        return top * (1.0f - fy) + bottom * fy;
+    }
+
+    /**
+     * 颗粒贴图：两级噪声叠加成 512×512 的可平铺纹理。
+     *
+     * <p>粗层用 256×256 随机格点做双线性插值（周期正好 512 像素），得到 2 像素左右的
+     * 簇状结构；细层再用逐像素哈希补上高频。相比纯白噪声，颗粒更像银盐的团簇。
+     */
+    private static float[] grainTile() {
+        float[] tile = grainTile;
+        if (tile != null) return tile;
+        synchronized (FilmSimulator.class) {
+            if (grainTile != null) return grainTile;
+            int latticeSize = GRAIN_TILE_SIZE / 2;
+            float[] lattice = new float[latticeSize * latticeSize];
+            for (int y = 0; y < latticeSize; y++) {
+                for (int x = 0; x < latticeSize; x++) {
+                    lattice[y * latticeSize + x] = hashNoise(x, y, 0x9e37);
+                }
+            }
+            float[] built = new float[GRAIN_TILE_SIZE * GRAIN_TILE_SIZE];
+            float max = 0.0001f;
+            for (int y = 0; y < GRAIN_TILE_SIZE; y++) {
+                for (int x = 0; x < GRAIN_TILE_SIZE; x++) {
+                    float coarse = valueNoise(x * 0.5f, y * 0.5f, lattice, latticeSize);
+                    float fine = hashNoise(x, y, 0x2f1b);
+                    float value = coarse * 0.65f + fine * 0.35f;
+                    built[y * GRAIN_TILE_SIZE + x] = value;
+                    float magnitude = Math.abs(value);
+                    if (magnitude > max) max = magnitude;
+                }
+            }
+            // 归一化到约 [-1,1]，保证滑杆 100% 时的颗粒幅度与旧实现接近。
+            float scale = 1.05f / max;
+            for (int i = 0; i < built.length; i++) {
+                float value = built[i] * scale;
+                built[i] = value < -1.0f ? -1.0f : value > 1.0f ? 1.0f : value;
+            }
+            grainTile = built;
+            return built;
+        }
+    }
+
+    private static float grainAt(float[] tile, int x, int y, int seed) {
+        int ix = (x + (seed & 0x3f)) & GRAIN_TILE_MASK;
+        int iy = (y + ((seed >>> 6) & 0x3f)) & GRAIN_TILE_MASK;
+        return tile[iy * GRAIN_TILE_SIZE + ix];
+    }
+
+    private static float valueNoise(float x, float y, float[] lattice, int size) {
+        int x0 = (int) Math.floor(x);
+        int y0 = (int) Math.floor(y);
+        float fx = x - x0;
+        float fy = y - y0;
+        fx = fx * fx * (3.0f - 2.0f * fx);
+        fy = fy * fy * (3.0f - 2.0f * fy);
+        int xa = x0 % size;
+        int ya = y0 % size;
+        int xb = (xa + 1) % size;
+        int yb = (ya + 1) % size;
+        float top = lattice[ya * size + xa] * (1.0f - fx) + lattice[ya * size + xb] * fx;
+        float bottom = lattice[yb * size + xa] * (1.0f - fx) + lattice[yb * size + xb] * fx;
         return top * (1.0f - fy) + bottom * fy;
     }
 
