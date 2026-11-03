@@ -32,6 +32,8 @@ public final class FilmStock {
     /** 相纸曲线的 log 曝光轴（与参考仓库的全部 printing profile 一致）。 */
     static final double PRINT_LOG_MIN = -3.0;
     static final double PRINT_LOG_MAX = 4.0;
+    /** 缩略图 LUT 的边长：17³ 约 60 KB，96px 小图足够，误差远小于压缩与缩放本身。 */
+    private static final int THUMBNAIL_LUT_SIZE = 17;
 
     public final String id;
     public final String name;
@@ -55,6 +57,8 @@ public final class FilmStock {
     private final String lutFile;
     /** 解析后的 LUT：首次用到时才读，避免打开页面就解析近 1 MB 的数据。 */
     private volatile Lut3D lut;
+    /** 缩略图用的低精度 LUT（17³，约 60 KB）：完整表留给主预览，缩略图不占大内存。 */
+    private volatile Lut3D thumbnailLut;
     private final Context context;
 
     private FilmStock(
@@ -104,6 +108,22 @@ public final class FilmStock {
                 }
             }
             return lut;
+        }
+    }
+
+    /** 缩略图用的降采样 LUT；与完整表分开缓存，避免缩略图把 51 张完整表拉进堆。 */
+    Lut3D thumbnailLut() {
+        if (!hasLut()) return null;
+        Lut3D loaded = thumbnailLut;
+        if (loaded != null) return loaded;
+        synchronized (this) {
+            if (thumbnailLut == null) {
+                thumbnailLut = Lut3D.loadReduced(context, "luts/" + lutFile, THUMBNAIL_LUT_SIZE);
+                if (thumbnailLut == null) {
+                    throw new IllegalStateException("LUT 读取失败：" + lutFile);
+                }
+            }
+            return thumbnailLut;
         }
     }
 

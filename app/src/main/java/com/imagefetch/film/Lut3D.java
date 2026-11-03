@@ -54,6 +54,75 @@ public final class Lut3D {
         }
     }
 
+    /**
+     * 读取并降采样到不超过 {@code targetSize} 的表，结果不进入静态缓存。
+     * 缩略图只需要大致色彩倾向，用 17³（每张约 60 KB）就够，不必常驻完整表。
+     */
+    static Lut3D loadReduced(Context context, String assetPath, int targetSize) {
+        try (InputStream input = context.getAssets().open(assetPath)) {
+            Lut3D parsed = parse(input);
+            return parsed.size > targetSize ? parsed.downsample(targetSize) : parsed;
+        } catch (IOException | RuntimeException error) {
+            return null;
+        }
+    }
+
+    /** 三线性重采样成更小的表；网格点按 .cube 的红最快、蓝最慢顺序写入。 */
+    private Lut3D downsample(int targetSize) {
+        float[] reduced = new float[targetSize * targetSize * targetSize * 3];
+        double scale = (size - 1) / (double) (targetSize - 1);
+        int offset = 0;
+        for (int b = 0; b < targetSize; b++) {
+            double pb = b * scale;
+            int b0 = (int) pb;
+            int b1 = Math.min(b0 + 1, size - 1);
+            float fb = (float) (pb - b0);
+            for (int g = 0; g < targetSize; g++) {
+                double pg = g * scale;
+                int g0 = (int) pg;
+                int g1 = Math.min(g0 + 1, size - 1);
+                float fg = (float) (pg - g0);
+                for (int r = 0; r < targetSize; r++) {
+                    double pr = r * scale;
+                    int r0 = (int) pr;
+                    int r1 = Math.min(r0 + 1, size - 1);
+                    float fr = (float) (pr - r0);
+                    int base000 = ((b0 * size + g0) * size + r0) * 3;
+                    int base100 = ((b0 * size + g0) * size + r1) * 3;
+                    int base010 = ((b0 * size + g1) * size + r0) * 3;
+                    int base110 = ((b0 * size + g1) * size + r1) * 3;
+                    int base001 = ((b1 * size + g0) * size + r0) * 3;
+                    int base101 = ((b1 * size + g0) * size + r1) * 3;
+                    int base011 = ((b1 * size + g1) * size + r0) * 3;
+                    int base111 = ((b1 * size + g1) * size + r1) * 3;
+                    for (int channel = 0; channel < 3; channel++) {
+                        float c000 = table[base000 + channel];
+                        float c100 = table[base100 + channel];
+                        float c010 = table[base010 + channel];
+                        float c110 = table[base110 + channel];
+                        float c001 = table[base001 + channel];
+                        float c101 = table[base101 + channel];
+                        float c011 = table[base011 + channel];
+                        float c111 = table[base111 + channel];
+                        float c00 = c000 * (1.0f - fr) + c100 * fr;
+                        float c10 = c010 * (1.0f - fr) + c110 * fr;
+                        float c01 = c001 * (1.0f - fr) + c101 * fr;
+                        float c11 = c011 * (1.0f - fr) + c111 * fr;
+                        float c0 = c00 * (1.0f - fg) + c10 * fg;
+                        float c1 = c01 * (1.0f - fg) + c11 * fg;
+                        reduced[offset + channel] = c0 * (1.0f - fb) + c1 * fb;
+                    }
+                    offset += 3;
+                }
+            }
+        }
+        Lut3D lut = new Lut3D(targetSize, reduced);
+        System.arraycopy(domainMin, 0, lut.domainMin, 0, 3);
+        System.arraycopy(domainMax, 0, lut.domainMax, 0, 3);
+        lut.buildIndexTables();
+        return lut;
+    }
+
     private static Lut3D parse(InputStream input) throws IOException {
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(input, StandardCharsets.UTF_8));

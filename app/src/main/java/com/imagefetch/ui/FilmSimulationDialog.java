@@ -1107,7 +1107,8 @@ public final class FilmSimulationDialog extends Dialog {
         for (StockRow row : stockRows) {
             thumbs.add(row.film == null
                     ? null
-                    : FilmSimulator.render(reference, row.film, referenceSettings, THUMB_MAX_EDGE));
+                    : FilmSimulator.renderThumbnail(
+                            reference, row.film, referenceSettings, THUMB_MAX_EDGE));
         }
         if (reference != source) reference.recycle();
         return thumbs;

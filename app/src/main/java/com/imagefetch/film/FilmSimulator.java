@@ -94,6 +94,21 @@ public final class FilmSimulator {
      */
     public static Bitmap render(
             Bitmap source, FilmStock stock, Settings settings, int maxLongEdge) {
+        return render(source, stock, settings, maxLongEdge, null);
+    }
+
+    /**
+     * 缩略图渲染：LUT 胶片改用 17³ 降采样表。96px 的小图看不出 33³ 与 17³ 的差别，
+     * 但整页缩略图因此不必把 51 张完整表都读进内存。
+     */
+    public static Bitmap renderThumbnail(
+            Bitmap source, FilmStock stock, Settings settings, int maxLongEdge) {
+        return render(source, stock, settings, maxLongEdge,
+                stock != null && stock.hasLut() ? stock.thumbnailLut() : null);
+    }
+
+    private static Bitmap render(
+            Bitmap source, FilmStock stock, Settings settings, int maxLongEdge, Lut3D lutOverride) {
         if (source == null || stock == null || settings == null) return null;
         Bitmap input = source;
         if (maxLongEdge > 0) {
@@ -111,7 +126,8 @@ public final class FilmSimulator {
 
         Settings tuned = settings.copy();
         clamp(tuned);
-        Lut3D lut = stock.hasLut() ? stock.lut() : null;
+        Lut3D lut = lutOverride != null ? lutOverride
+                : (stock.hasLut() ? stock.lut() : null);
         float[][] toneLut = lut == null ? buildToneLut(stock, tuned) : null;
         int[][] adjustLut = lut == null ? null : buildAdjustLut(tuned);
         float[] decodeLut = lut == null ? null : buildDecodeLut();
