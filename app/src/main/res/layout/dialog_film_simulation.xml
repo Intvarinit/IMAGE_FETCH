@@ -143,6 +143,21 @@
                     android:text="@string/film_pick_color"
                     android:textColor="#FFFFFF"
                     android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/filmFullScreenButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="30dp"
+                    android:layout_marginStart="2dp"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/bg_caption"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:text="@string/film_full_screen"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
             </LinearLayout>
 
             <ProgressBar
@@ -660,5 +675,480 @@
             android:layout_marginTop="6dp"
             android:maxLines="3"
             android:textColor="@color/film_text_muted" />
+    </LinearLayout>
+
+    <!--
+      全屏对比：图片独占上方舞台区，控制参数收进底部圆角半透明卡片，
+      分割线只绘制在照片实际显示范围内（fitCenter 留出的黑边不画线）。
+    -->
+    <LinearLayout
+        android:id="@+id/filmFullScreen"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <FrameLayout
+            android:id="@+id/filmFullStage"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1">
+
+        <ImageView
+            android:id="@+id/filmFullPreview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="@string/film_simulation_title"
+            android:scaleType="fitCenter" />
+
+        <ImageView
+            android:id="@+id/filmFullOriginal"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="@string/film_compare"
+            android:scaleType="fitCenter" />
+
+        <View
+            android:id="@+id/filmFullDivider"
+            android:layout_width="2dp"
+            android:layout_height="0dp"
+            android:layout_gravity="top|start"
+            android:background="#FFFFFF" />
+
+        <TextView
+            style="@style/Text.Caption"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:layout_margin="8dp"
+            android:background="@drawable/bg_caption"
+            android:paddingStart="@dimen/space_s"
+            android:paddingTop="2dp"
+            android:paddingEnd="@dimen/space_s"
+            android:paddingBottom="2dp"
+            android:text="@string/film_full_compare_hint"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/filmFullExit"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_gravity="top|end"
+            android:layout_margin="8dp"
+            android:background="@drawable/bg_caption"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="@string/film_full_screen_exit"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:id="@+id/filmFullControls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_marginEnd="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_film_fullscreen_controls"
+            android:clickable="true"
+            android:orientation="vertical"
+            android:paddingStart="12dp"
+            android:paddingTop="8dp"
+            android:paddingEnd="12dp"
+            android:paddingBottom="8dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="10dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_exposure_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullExposureValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullExposureBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="60"
+                        android:progress="30" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_highlights_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullHighlightsValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullHighlightsBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="200"
+                        android:progress="100" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="10dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_shadows_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullShadowsValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullShadowsBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="200"
+                        android:progress="100" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_whites_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullWhitesValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullWhitesBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="200"
+                        android:progress="100" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="10dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_blacks_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullBlacksValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullBlacksBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="200"
+                        android:progress="100" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_dehaze_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullDehazeValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullDehazeBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="200"
+                        android:progress="100" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="10dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_temperature_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullTemperatureValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullTemperatureBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="100"
+                        android:progress="50" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_tint_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullTintValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullTintBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="100"
+                        android:progress="50" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="10dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_strength_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullStrengthValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                             android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullStrengthBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="100"
+                        android:progress="100" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            style="@style/Text.Caption"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/film_sharpening_label"
+                            android:textColor="#CCFFFFFF" />
+
+                        <TextView
+                            android:id="@+id/filmFullSharpeningValue"
+                            style="@style/Text.Caption"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="#FFFFFF" />
+                    </LinearLayout>
+
+                    <SeekBar
+                        android:id="@+id/filmFullSharpeningBar"
+                        android:layout_width="match_parent"
+                        android:layout_height="26dp"
+                        android:max="100"
+                        android:progress="0" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
 </FrameLayout>

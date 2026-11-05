@@ -42,6 +42,18 @@ public final class FilmSimulator {
         public double lightLeak;
         /** 整体强度（0…1）：与原图的混合比例，1 为完整胶片效果。 */
         public double strength = 1.0;
+        /** 高光调整（-1…+1，正数提亮、负数压暗高光）。 */
+        public double highlights;
+        /** 阴影调整（-1…+1，正数提亮、负数压暗暗部）。 */
+        public double shadows;
+        /** 白色调整（-1…+1，作用在最亮端）。 */
+        public double whites;
+        /** 黑色调整（-1…+1，作用在最暗端）。 */
+        public double blacks;
+        /** 锐化（0…1）：边缘细节增强量。 */
+        public double sharpening;
+        /** 去薄雾（-1…+1，正数去雾、负数加雾）。 */
+        public double dehaze;
 
         public Settings copy() {
             Settings copy = new Settings();
@@ -55,6 +67,12 @@ public final class FilmSimulator {
             copy.vignette = vignette;
             copy.lightLeak = lightLeak;
             copy.strength = strength;
+            copy.highlights = highlights;
+            copy.shadows = shadows;
+            copy.whites = whites;
+            copy.blacks = blacks;
+            copy.sharpening = sharpening;
+            copy.dehaze = dehaze;
             return copy;
         }
     }
@@ -166,6 +184,25 @@ public final class FilmSimulator {
         float centerX = width * 0.5f;
         float centerY = height * 0.5f;
         float[] tile = grainTile();
+        // 高光/阴影/白色/黑色是纯亮度调整，参数全为 0 时不建表、也不进入逐像素分支。
+        int[] zoneLut = (tuned.highlights != 0.0 || tuned.shadows != 0.0
+                || tuned.whites != 0.0 || tuned.blacks != 0.0)
+                ? buildZoneLut(tuned) : null;
+        // 去雾用 1/8 缩略图的暗通道估计透射率；负值则是往雾灰色收敛。
+        float dehaze = (float) tuned.dehaze;
+        DehazeMap dehazeMap = null;
+        int[] hazeLut = null;
+        int[] dehazeColumns = null;
+        if (dehaze > 0.01f) {
+            dehazeMap = buildDehazeMap(input, dehaze);
+            dehazeColumns = new int[width];
+            for (int x = 0; x < width; x++) {
+                dehazeColumns[x] = Math.min(dehazeMap.width - 1,
+                        x * dehazeMap.width / width);
+            }
+        } else if (dehaze < -0.01f) {
+            hazeLut = buildHazeLut(-dehaze);
+        }
 
         // 分条带渲染：只常驻一条带像素，导出 4096px 时不再需要整幅 int[]，内存峰值明显下降。
         Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
@@ -178,6 +215,11 @@ public final class FilmSimulator {
                 int y = y0 + ry;
                 int rowOffset = ry * width;
                 float ny = (y - centerY) / centerY;
+                int dehazeRow = 0;
+                if (dehazeMap != null) {
+                    dehazeRow = Math.min(dehazeMap.height - 1,
+                            y * dehazeMap.height / height) * dehazeMap.width;
+                }
                 for (int x = 0; x < width; x++) {
                     int argb = strip[rowOffset + x];
                     int r8 = (argb >>> 16) & 0xff;
@@ -273,6 +315,26 @@ public final class FilmSimulator {
                     int r = encode(red, encodeLut);
                     int g = encode(green, encodeLut);
                     int b = encode(blue, encodeLut);
+                    if (dehazeMap != null) {
+                        float transmission =
+                                dehazeMap.transmission[dehazeRow + dehazeColumns[x]];
+                        float inverse = 1.0f / transmission;
+                        float shift = dehazeMap.light * (inverse - 1.0f);
+                        r = clamp8(Math.round(r * inverse - shift));
+                        g = clamp8(Math.round(g * inverse - shift));
+                        b = clamp8(Math.round(b * inverse - shift));
+                    } else if (hazeLut != null) {
+                        r = hazeLut[r];
+                        g = hazeLut[g];
+                        b = hazeLut[b];
+                    }
+                    if (zoneLut != null) {
+                        int luma = (r * 299 + g * 587 + b * 114) / 1000;
+                        int delta = zoneLut[luma];
+                        r = clamp8(r + delta);
+                        g = clamp8(g + delta);
+                        b = clamp8(b + delta);
+                    }
                     if (mixStrength < 0.999f) {
                         // 与原始 sRGB 像素线性混合；只多三次乘法，不增加额外图像缓冲区。
                         int sr = (argb >>> 16) & 0xff;
@@ -288,6 +350,10 @@ public final class FilmSimulator {
             output.setPixels(strip, 0, width, 0, y0, width, rows);
         }
 
+        if (tuned.sharpening > 0.01) {
+            // 强度映射到 0…0.8，100% 也不会出现生硬的白色描边。
+            applySharpen(output, 0.8f * (float) tuned.sharpening);
+        }
         if (input != source) input.recycle();
         return output;
     }
@@ -303,6 +369,189 @@ public final class FilmSimulator {
         settings.vignette = Math.max(0.0, Math.min(1.0, settings.vignette));
         settings.lightLeak = Math.max(0.0, Math.min(1.0, settings.lightLeak));
         settings.strength = Math.max(0.0, Math.min(1.0, settings.strength));
+        settings.highlights = Math.max(-1.0, Math.min(1.0, settings.highlights));
+        settings.shadows = Math.max(-1.0, Math.min(1.0, settings.shadows));
+        settings.whites = Math.max(-1.0, Math.min(1.0, settings.whites));
+        settings.blacks = Math.max(-1.0, Math.min(1.0, settings.blacks));
+        settings.sharpening = Math.max(0.0, Math.min(1.0, settings.sharpening));
+        settings.dehaze = Math.max(-1.0, Math.min(1.0, settings.dehaze));
+    }
+
+    /**
+     * 高光/阴影/白色/黑色调整表：按输出亮度给一个等量的三通道偏移，因此只改变明暗、不改变色相。
+     * 各段用平滑权重过渡，避免在中间调出现可见的分界。
+     */
+    private static int[] buildZoneLut(Settings settings) {
+        int[] lut = new int[256];
+        float highlights = (float) settings.highlights;
+        float shadows = (float) settings.shadows;
+        float whites = (float) settings.whites;
+        float blacks = (float) settings.blacks;
+        for (int level = 0; level < 256; level++) {
+            float luma = level / 255.0f;
+            float highlightWeight = smoothstep(0.45f, 1.0f, luma);
+            float shadowWeight = 1.0f - smoothstep(0.0f, 0.55f, luma);
+            float whiteWeight = smoothstep(0.62f, 1.0f, luma);
+            float blackWeight = 1.0f - smoothstep(0.0f, 0.38f, luma);
+            float target = luma + highlights * highlightWeight * 0.35f
+                    + shadows * shadowWeight * 0.35f
+                    + whites * whiteWeight * 0.28f
+                    + blacks * blackWeight * 0.28f;
+            target = Math.max(0.0f, Math.min(1.0f, target));
+            lut[level] = Math.round((target - luma) * 255.0f);
+        }
+        return lut;
+    }
+
+    private static float smoothstep(float edge0, float edge1, float value) {
+        float t = Math.max(0.0f, Math.min(1.0f, (value - edge0) / (edge1 - edge0)));
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    private static int clamp8(int value) {
+        return value < 0 ? 0 : (value > 255 ? 255 : value);
+    }
+
+    /** 去雾用的低分辨率传输率图：按暗通道估计每个区域的雾浓度。 */
+    private static final class DehazeMap {
+        final float light;
+        final int width;
+        final int height;
+        final float[] transmission;
+
+        DehazeMap(float light, int width, int height, float[] transmission) {
+            this.light = light;
+            this.width = width;
+            this.height = height;
+            this.transmission = transmission;
+        }
+    }
+
+    /** 缩到 1/8 估算暗通道与大气光，再得到每块的透射率；逐像素只做一次查表与缩放。 */
+    private static DehazeMap buildDehazeMap(Bitmap input, float strength) {
+        int width = Math.max(1, input.getWidth() / 8);
+        int height = Math.max(1, input.getHeight() / 8);
+        Bitmap small = Bitmap.createScaledBitmap(input, width, height, true);
+        int[] pixels = new int[width * height];
+        small.getPixels(pixels, 0, width, 0, 0, width, height);
+        small.recycle();
+        int[] dark = new int[pixels.length];
+        int[] histogram = new int[256];
+        for (int i = 0; i < pixels.length; i++) {
+            int pixel = pixels[i];
+            int value = Math.min((pixel >>> 16) & 0xff,
+                    Math.min((pixel >>> 8) & 0xff, pixel & 0xff));
+            dark[i] = value;
+            histogram[value]++;
+        }
+        // 大气光取暗通道的高分位：有雾时这个值被抬亮，无雾时接近黑位。
+        int wanted = Math.max(1, (int) (pixels.length * 0.99f));
+        int light = 255;
+        int count = 0;
+        for (int level = 255; level >= 0; level--) {
+            count += histogram[level];
+            if (count >= wanted) {
+                light = level;
+                break;
+            }
+        }
+        light = Math.max(40, light);
+        float omega = 0.9f * strength;
+        float[] transmission = new float[dark.length];
+        for (int i = 0; i < transmission.length; i++) {
+            float t = 1.0f - omega * (dark[i] / (float) light);
+            transmission[i] = Math.max(0.35f, Math.min(1.0f, t));
+        }
+        return new DehazeMap(light, width, height, transmission);
+    }
+
+    /** 反向参数（加雾）：把颜色往雾灰色收敛，用于对照或营造空气感。 */
+    private static int[] buildHazeLut(float strength) {
+        int[] lut = new int[256];
+        float haze = 0.45f * strength;
+        float light = 200.0f;
+        for (int level = 0; level < 256; level++) {
+            lut[level] = clamp8(Math.round(level * (1.0f - haze) + light * haze));
+        }
+        return lut;
+    }
+
+    /**
+     * USM 锐化：用 1/3 缩略图的两次盒式模糊得到低频，再按强度加回高频。
+     * 只在锐化参数大于 0 时执行，多一次整图读取，不影响默认渲染路径。
+     */
+    private static void applySharpen(Bitmap image, float amount) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        if (width < 3 || height < 3) return;
+        int lowWidth = Math.max(1, width / 3);
+        int lowHeight = Math.max(1, height / 3);
+        Bitmap low = Bitmap.createScaledBitmap(image, lowWidth, lowHeight, true);
+        int[] blurred = new int[lowWidth * lowHeight];
+        low.getPixels(blurred, 0, lowWidth, 0, 0, lowWidth, lowHeight);
+        low.recycle();
+        blurred = boxBlur(blurred, lowWidth, lowHeight);
+        blurred = boxBlur(blurred, lowWidth, lowHeight);
+
+        int[] columnIndex = new int[width];
+        for (int x = 0; x < width; x++) {
+            columnIndex[x] = Math.min(lowWidth - 1, x * lowWidth / width);
+        }
+        int stripRows = Math.min(height, STRIP_ROWS);
+        int[] strip = new int[width * stripRows];
+        for (int y0 = 0; y0 < height; y0 += stripRows) {
+            int rows = Math.min(stripRows, height - y0);
+            image.getPixels(strip, 0, width, 0, y0, width, rows);
+            for (int ry = 0; ry < rows; ry++) {
+                int y = y0 + ry;
+                int lowRow = Math.min(lowHeight - 1, y * lowHeight / height) * lowWidth;
+                int rowOffset = ry * width;
+                for (int x = 0; x < width; x++) {
+                    int base = blurred[lowRow + columnIndex[x]];
+                    int argb = strip[rowOffset + x];
+                    int r = (argb >>> 16) & 0xff;
+                    int g = (argb >>> 8) & 0xff;
+                    int b = argb & 0xff;
+                    int br = (base >>> 16) & 0xff;
+                    int bg = (base >>> 8) & 0xff;
+                    int bb = base & 0xff;
+                    r = clamp8((int) (r + (r - br) * amount));
+                    g = clamp8((int) (g + (g - bg) * amount));
+                    b = clamp8((int) (b + (b - bb) * amount));
+                    strip[rowOffset + x] = 0xff000000 | (r << 16) | (g << 8) | b;
+                }
+            }
+            image.setPixels(strip, 0, width, 0, y0, width, rows);
+        }
+    }
+
+    private static int[] boxBlur(int[] source, int width, int height) {
+        int[] output = new int[source.length];
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int red = 0;
+                int green = 0;
+                int blue = 0;
+                int count = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    int yy = y + dy;
+                    if (yy < 0 || yy >= height) continue;
+                    int row = yy * width;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int xx = x + dx;
+                        if (xx < 0 || xx >= width) continue;
+                        int pixel = source[row + xx];
+                        red += (pixel >>> 16) & 0xff;
+                        green += (pixel >>> 8) & 0xff;
+                        blue += pixel & 0xff;
+                        count++;
+                    }
+                }
+                output[y * width + x] = 0xff000000
+                        | ((red / count) << 16) | ((green / count) << 8) | (blue / count);
+            }
+        }
+        return output;
     }
 
     /**

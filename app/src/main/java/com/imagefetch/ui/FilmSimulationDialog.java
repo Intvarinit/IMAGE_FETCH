@@ -118,6 +118,9 @@ public final class FilmSimulationDialog extends Dialog {
     private static final int VIGNETTE_DEFAULT = 0;
     private static final int LEAK_DEFAULT = 0;
     private static final int STRENGTH_DEFAULT = 100;
+    /** 全屏栏里高光/阴影滑杆的中位（0 调整），范围 -100…+100。 */
+    private static final int HIGHLIGHT_DEFAULT = 100;
+    private static final int SHADOW_DEFAULT = 100;
     /** 收藏 / 最近使用的本机记录；最近使用最多保留这么多款。 */
     private static final String FILM_PREFS = "film_simulation";
     private static final String PREF_FAVORITES = "favorite_ids";
@@ -213,6 +216,41 @@ public final class FilmSimulationDialog extends Dialog {
     private LinearLayout overlayBar;
     private Button compareButton;
     private Button pickColorButton;
+
+    /** 全屏对比浮层：上方图片舞台 + 底部圆角半透明参数卡。 */
+    private LinearLayout fullScreenOverlay;
+    private FrameLayout fullStage;
+    private ImageView fullPreviewView;
+    private ImageView fullOriginalView;
+    private View fullCompareDivider;
+    private SeekBar fullExposureBar;
+    private SeekBar fullHighlightsBar;
+    private SeekBar fullShadowsBar;
+    private SeekBar fullTemperatureBar;
+    private SeekBar fullTintBar;
+    private SeekBar fullStrengthBar;
+    private SeekBar fullWhitesBar;
+    private SeekBar fullBlacksBar;
+    private SeekBar fullSharpeningBar;
+    private SeekBar fullDehazeBar;
+    private TextView fullExposureValue;
+    private TextView fullHighlightsValue;
+    private TextView fullShadowsValue;
+    private TextView fullTemperatureValue;
+    private TextView fullTintValue;
+    private TextView fullStrengthValue;
+    private TextView fullWhitesValue;
+    private TextView fullBlacksValue;
+    private TextView fullSharpeningValue;
+    private TextView fullDehazeValue;
+    private Button fullScreenButton;
+    private boolean fullScreenOpen;
+    /** 进入全屏时回填滑杆值，不触发重渲染。 */
+    private boolean syncingFullScreenSliders;
+    private float fullCompareSplit = 0.5f;
+    /** 当前照片在舞台里的实际显示区域，分割线与裁剪都只落在这个范围内。 */
+    private float fullImageLeft;
+    private float fullImageWidth;
 
     /** 分屏对比：左原图、右模拟图，拖动分割线调整比例。 */
     private boolean comparing;
@@ -331,10 +369,39 @@ public final class FilmSimulationDialog extends Dialog {
         overlayBar = findViewById(R.id.filmOverlayBar);
         compareButton = findViewById(R.id.filmCompareButton);
         pickColorButton = findViewById(R.id.filmPickColorButton);
+        fullScreenButton = findViewById(R.id.filmFullScreenButton);
+        fullScreenOverlay = findViewById(R.id.filmFullScreen);
+        fullStage = findViewById(R.id.filmFullStage);
+        fullPreviewView = findViewById(R.id.filmFullPreview);
+        fullOriginalView = findViewById(R.id.filmFullOriginal);
+        fullCompareDivider = findViewById(R.id.filmFullDivider);
+        fullExposureBar = findViewById(R.id.filmFullExposureBar);
+        fullHighlightsBar = findViewById(R.id.filmFullHighlightsBar);
+        fullShadowsBar = findViewById(R.id.filmFullShadowsBar);
+        fullTemperatureBar = findViewById(R.id.filmFullTemperatureBar);
+        fullTintBar = findViewById(R.id.filmFullTintBar);
+        fullStrengthBar = findViewById(R.id.filmFullStrengthBar);
+        fullWhitesBar = findViewById(R.id.filmFullWhitesBar);
+        fullBlacksBar = findViewById(R.id.filmFullBlacksBar);
+        fullSharpeningBar = findViewById(R.id.filmFullSharpeningBar);
+        fullDehazeBar = findViewById(R.id.filmFullDehazeBar);
+        fullExposureValue = findViewById(R.id.filmFullExposureValue);
+        fullHighlightsValue = findViewById(R.id.filmFullHighlightsValue);
+        fullShadowsValue = findViewById(R.id.filmFullShadowsValue);
+        fullTemperatureValue = findViewById(R.id.filmFullTemperatureValue);
+        fullTintValue = findViewById(R.id.filmFullTintValue);
+        fullStrengthValue = findViewById(R.id.filmFullStrengthValue);
+        fullWhitesValue = findViewById(R.id.filmFullWhitesValue);
+        fullBlacksValue = findViewById(R.id.filmFullBlacksValue);
+        fullSharpeningValue = findViewById(R.id.filmFullSharpeningValue);
+        fullDehazeValue = findViewById(R.id.filmFullDehazeValue);
 
         findViewById(R.id.filmClose).setOnClickListener(view -> dismiss());
         compareButton.setOnClickListener(view -> setCompareMode(!comparing));
         pickColorButton.setOnClickListener(view -> toggleColorPick());
+        fullScreenButton.setOnClickListener(view -> setFullScreen(true));
+        findViewById(R.id.filmFullExit).setOnClickListener(view -> setFullScreen(false));
+        fullStage.setOnTouchListener(this::onFullScreenTouch);
         modeFilmButton.setOnClickListener(view -> switchMode(false));
         modeLutButton.setOnClickListener(view -> switchMode(true));
         favoriteButton.setOnClickListener(view -> toggleFavorite());
@@ -363,6 +430,15 @@ public final class FilmSimulationDialog extends Dialog {
             window.setLayout(WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT);
         }
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (fullScreenOpen) {
+            setFullScreen(false);
+            return;
+        }
+        super.onBackPressed();
     }
 
     // ── 界面搭建 ──
@@ -716,6 +792,62 @@ public final class FilmSimulationDialog extends Dialog {
             public void onNothingSelected(AdapterView<?> parent) {
             }
         });
+
+        // 全屏浮层上的六个基础参数：与普通页共用同一份 settings，调整后立刻重渲染预览。
+        bindFullScreenSlider(fullExposureBar, 0);
+        bindFullScreenSlider(fullHighlightsBar, 1);
+        bindFullScreenSlider(fullShadowsBar, 2);
+        bindFullScreenSlider(fullTemperatureBar, 3);
+        bindFullScreenSlider(fullTintBar, 4);
+        bindFullScreenSlider(fullStrengthBar, 5);
+        bindFullScreenSlider(fullWhitesBar, 6);
+        bindFullScreenSlider(fullBlacksBar, 7);
+        bindFullScreenSlider(fullSharpeningBar, 8);
+        bindFullScreenSlider(fullDehazeBar, 9);
+    }
+
+    private void bindFullScreenSlider(final SeekBar bar, final int kind) {
+        bar.setOnSeekBarChangeListener(new OnSeek() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (syncingFullScreenSliders) return;
+                switch (kind) {
+                    case 1:
+                        settings.highlights = (progress - HIGHLIGHT_DEFAULT) / 100.0;
+                        break;
+                    case 2:
+                        settings.shadows = (progress - SHADOW_DEFAULT) / 100.0;
+                        break;
+                    case 3:
+                        settings.temperature = (progress - TEMPERATURE_DEFAULT) / 50.0;
+                        break;
+                    case 4:
+                        settings.tint = (progress - TINT_DEFAULT) / 50.0;
+                        break;
+                    case 5:
+                        settings.strength = progress / 100.0;
+                        break;
+                    case 6:
+                        settings.whites = (progress - HIGHLIGHT_DEFAULT) / 100.0;
+                        break;
+                    case 7:
+                        settings.blacks = (progress - SHADOW_DEFAULT) / 100.0;
+                        break;
+                    case 8:
+                        settings.sharpening = progress / 100.0;
+                        break;
+                    case 9:
+                        settings.dehaze = (progress - HIGHLIGHT_DEFAULT) / 100.0;
+                        break;
+                    default:
+                        settings.exposureEv = (progress - EXPOSURE_DEFAULT) / 10.0;
+                        break;
+                }
+                updateSliderLabels();
+                updateFullScreenLabels();
+                schedulePreview(adjustingSliders);
+            }
+        });
     }
 
     private void updateSliderLabels() {
@@ -744,6 +876,27 @@ public final class FilmSimulationDialog extends Dialog {
         return (amount > 0 ? positive : negative) + " " + Math.abs(amount);
     }
 
+    private static String formatLevel(double value) {
+        int amount = (int) Math.round(value * 100);
+        return amount == 0 ? "0" : String.format(Locale.ROOT, "%+d", amount);
+    }
+
+    private void updateFullScreenLabels() {
+        if (fullExposureValue == null) return;
+        fullExposureValue.setText(formatEv(settings.exposureEv));
+        fullHighlightsValue.setText(formatLevel(settings.highlights));
+        fullShadowsValue.setText(formatLevel(settings.shadows));
+        fullTemperatureValue.setText(formatShift(settings.temperature, "暖", "冷"));
+        fullTintValue.setText(formatShift(settings.tint, "洋红", "绿"));
+        fullWhitesValue.setText(formatLevel(settings.whites));
+        fullBlacksValue.setText(formatLevel(settings.blacks));
+        fullDehazeValue.setText(formatLevel(settings.dehaze));
+        fullSharpeningValue.setText(String.format(Locale.ROOT, "%d%%",
+                Math.round(settings.sharpening * 100)));
+        fullStrengthValue.setText(String.format(Locale.ROOT, "%d%%",
+                Math.round(settings.strength * 100)));
+    }
+
     private void resetSettings() {
         strengthBar.setProgress(STRENGTH_DEFAULT);
         exposureBar.setProgress(EXPOSURE_DEFAULT);
@@ -755,6 +908,22 @@ public final class FilmSimulationDialog extends Dialog {
         leakBar.setProgress(LEAK_DEFAULT);
         monochromeBox.setChecked(false);
         monoFilterSpinner.setSelection(0);
+        // 高光/阴影/白色/黑色/锐化/去薄雾只在全屏栏里出现，重置时一并归零。
+        syncingFullScreenSliders = true;
+        fullHighlightsBar.setProgress(HIGHLIGHT_DEFAULT);
+        fullShadowsBar.setProgress(SHADOW_DEFAULT);
+        fullWhitesBar.setProgress(HIGHLIGHT_DEFAULT);
+        fullBlacksBar.setProgress(SHADOW_DEFAULT);
+        fullSharpeningBar.setProgress(0);
+        fullDehazeBar.setProgress(HIGHLIGHT_DEFAULT);
+        settings.highlights = 0.0;
+        settings.shadows = 0.0;
+        settings.whites = 0.0;
+        settings.blacks = 0.0;
+        settings.sharpening = 0.0;
+        settings.dehaze = 0.0;
+        syncingFullScreenSliders = false;
+        updateFullScreenLabels();
     }
 
     // ── 相机 RAW 列表 ──
@@ -985,6 +1154,10 @@ public final class FilmSimulationDialog extends Dialog {
         if (comparing) {
             originalView.setImageBitmap(decoded);
             updateCompareSplit();
+        }
+        if (fullScreenOpen) {
+            fullOriginalView.setImageBitmap(decoded);
+            updateFullScreenSplit();
         }
         startPreviewRender();
         refreshStockThumbnails();
@@ -1284,10 +1457,15 @@ public final class FilmSimulationDialog extends Dialog {
                     }
                     return;
                 }
-                if (previewBitmap != null && previewBitmap != rendered) previewBitmap.recycle();
+                if (previewBitmap != null && previewBitmap != rendered) {
+                    // 全屏浮层可能正显示旧结果，先摘掉引用再回收。
+                    if (fullScreenOpen) fullPreviewView.setImageDrawable(null);
+                    previewBitmap.recycle();
+                }
                 previewBitmap = rendered;
                 showingOriginal = false;
                 previewView.setImageBitmap(rendered);
+                if (fullScreenOpen) fullPreviewView.setImageBitmap(rendered);
                 compareHint.setVisibility(comparing ? View.GONE : View.VISIBLE);
                 updateParams(stock);
                 // 全尺寸导出还没结束时，状态栏保留「正在生成全尺寸成品…」。
@@ -1486,6 +1664,142 @@ public final class FilmSimulationDialog extends Dialog {
                 (FrameLayout.LayoutParams) compareDivider.getLayoutParams();
         params.leftMargin = Math.max(0, split - 1);
         compareDivider.setLayoutParams(params);
+    }
+
+    // ── 全屏对比与实时调整 ──
+
+    /** 进入全屏只看照片：隐藏系统栏，左右分屏对比，底部悬浮半透明参数栏。 */
+    private void setFullScreen(boolean enable) {
+        if (enable) {
+            if (sourceBitmap == null || sourceBitmap.isRecycled()
+                    || previewBitmap == null || previewBitmap.isRecycled()) {
+                return;
+            }
+            if (comparing) setCompareMode(false);
+            if (pickingColor) resetColorPickUi();
+            fullScreenOpen = true;
+            fullCompareSplit = compareSplit;
+            fullImageLeft = 0.0f;
+            fullImageWidth = 0.0f;
+            fullPreviewView.setImageBitmap(previewBitmap);
+            fullOriginalView.setImageBitmap(sourceBitmap);
+            fullScreenOverlay.setVisibility(View.VISIBLE);
+            syncFullScreenSliders();
+            updateFullScreenSplit();
+            // 刚显示时还没有尺寸，布局完成后再按实际宽度放分割线。
+            fullScreenOverlay.post(this::updateFullScreenSplit);
+            applyImmersive(true);
+        } else {
+            if (!fullScreenOpen) return;
+            fullScreenOpen = false;
+            fullPreviewView.setImageDrawable(null);
+            fullOriginalView.setImageDrawable(null);
+            fullScreenOverlay.setVisibility(View.GONE);
+            applyImmersive(false);
+            syncMainSliders();
+            updateSliderLabels();
+            updateFullScreenLabels();
+            FilmStock stock = selectedStock();
+            if (stock != null) updateParams(stock);
+        }
+    }
+
+    /** 进入全屏时把当前参数回填到全屏滑杆，回填不触发重渲染。 */
+    private void syncFullScreenSliders() {
+        syncingFullScreenSliders = true;
+        fullExposureBar.setProgress(EXPOSURE_DEFAULT + (int) Math.round(settings.exposureEv * 10));
+        fullHighlightsBar.setProgress(HIGHLIGHT_DEFAULT + (int) Math.round(settings.highlights * 100));
+        fullShadowsBar.setProgress(SHADOW_DEFAULT + (int) Math.round(settings.shadows * 100));
+        fullTemperatureBar.setProgress(
+                TEMPERATURE_DEFAULT + (int) Math.round(settings.temperature * 50));
+        fullTintBar.setProgress(TINT_DEFAULT + (int) Math.round(settings.tint * 50));
+        fullWhitesBar.setProgress(HIGHLIGHT_DEFAULT + (int) Math.round(settings.whites * 100));
+        fullBlacksBar.setProgress(SHADOW_DEFAULT + (int) Math.round(settings.blacks * 100));
+        fullSharpeningBar.setProgress((int) Math.round(settings.sharpening * 100));
+        fullDehazeBar.setProgress(HIGHLIGHT_DEFAULT + (int) Math.round(settings.dehaze * 100));
+        fullStrengthBar.setProgress((int) Math.round(settings.strength * 100));
+        syncingFullScreenSliders = false;
+        updateFullScreenLabels();
+    }
+
+    /** 退出全屏时把全屏里改过的参数同步回普通页滑杆，避免显示旧值。 */
+    private void syncMainSliders() {
+        strengthBar.setProgress((int) Math.round(settings.strength * 100));
+        exposureBar.setProgress(EXPOSURE_DEFAULT + (int) Math.round(settings.exposureEv * 10));
+        temperatureBar.setProgress(TEMPERATURE_DEFAULT + (int) Math.round(settings.temperature * 50));
+        tintBar.setProgress(TINT_DEFAULT + (int) Math.round(settings.tint * 50));
+    }
+
+    private void updateFullScreenSplit() {
+        int width = fullPreviewView.getWidth();
+        int height = fullPreviewView.getHeight();
+        Bitmap bitmap = previewBitmap != null ? previewBitmap : sourceBitmap;
+        if (!fullScreenOpen || width <= 0 || height <= 0 || bitmap == null) return;
+        // 与 fitCenter 一致地算出照片实际占用的矩形：分割线、裁剪都限定在照片内，
+        // 上下黑边里不再出现一条贯穿全屏的白线。
+        float scale = Math.min(width / (float) bitmap.getWidth(),
+                height / (float) bitmap.getHeight());
+        float shownWidth = bitmap.getWidth() * scale;
+        float shownHeight = bitmap.getHeight() * scale;
+        float imageLeft = (width - shownWidth) * 0.5f;
+        float imageTop = (height - shownHeight) * 0.5f;
+        fullImageLeft = imageLeft;
+        fullImageWidth = shownWidth;
+        int left = Math.round(imageLeft);
+        int top = Math.round(imageTop);
+        int right = Math.round(imageLeft + shownWidth);
+        int bottom = Math.round(imageTop + shownHeight);
+        int split = Math.max(left, Math.min(right,
+                Math.round(imageLeft + shownWidth * fullCompareSplit)));
+        fullPreviewView.setClipBounds(new Rect(split, top, right, bottom));
+        fullOriginalView.setClipBounds(new Rect(left, top, split, bottom));
+        FrameLayout.LayoutParams params =
+                (FrameLayout.LayoutParams) fullCompareDivider.getLayoutParams();
+        params.leftMargin = Math.max(0, split - 1);
+        params.topMargin = Math.max(0, top);
+        params.height = Math.max(0, bottom - top);
+        fullCompareDivider.setLayoutParams(params);
+    }
+
+    /** 在图片舞台内拖动即可移动分屏位置；触摸落在黑边上时也按照片比例换算。 */
+    private boolean onFullScreenTouch(View view, MotionEvent event) {
+        if (!fullScreenOpen) return false;
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_MOVE: {
+                float fraction;
+                if (fullImageWidth > 0) {
+                    fraction = (event.getX() - fullImageLeft) / fullImageWidth;
+                } else {
+                    int width = view.getWidth();
+                    if (width <= 0) return true;
+                    fraction = event.getX() / (float) width;
+                }
+                fullCompareSplit = Math.max(0.02f, Math.min(0.98f, fraction));
+                updateFullScreenSplit();
+                return true;
+            }
+            default:
+                return true;
+        }
+    }
+
+    private void applyImmersive(boolean enable) {
+        Window window = getWindow();
+        if (window == null) return;
+        if (enable) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            window.getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
     }
 
     private void toggleColorPick() {
@@ -1812,6 +2126,8 @@ public final class FilmSimulationDialog extends Dialog {
         renderExecutor.shutdownNow();
         if (previewView != null) previewView.setImageDrawable(null);
         if (originalView != null) originalView.setImageDrawable(null);
+        if (fullPreviewView != null) fullPreviewView.setImageDrawable(null);
+        if (fullOriginalView != null) fullOriginalView.setImageDrawable(null);
         if (previewBitmap != null) {
             previewBitmap.recycle();
             previewBitmap = null;

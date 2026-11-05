@@ -220,6 +220,15 @@
     <string name="film_mono_filter_label">黑白滤镜</string>
     <string name="film_vignette_label">暗角</string>
     <string name="film_leak_label">漏光</string>
+    <string name="film_highlights_label">高光</string>
+    <string name="film_shadows_label">阴影</string>
+    <string name="film_whites_label">白色</string>
+    <string name="film_blacks_label">黑色</string>
+    <string name="film_sharpening_label">锐化</string>
+    <string name="film_dehaze_label">去薄雾</string>
+    <string name="film_full_screen">全屏</string>
+    <string name="film_full_screen_exit">退出全屏</string>
+    <string name="film_full_compare_hint">拖动分割线对比原图</string>
     <string name="film_compare">对比</string>
     <string name="film_compare_exit">退出对比</string>
     <string name="film_pick_color">吸管</string>
