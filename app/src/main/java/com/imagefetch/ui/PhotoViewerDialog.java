@@ -37,16 +37,25 @@ public final class PhotoViewerDialog extends Dialog {
         }
     }
 
+    /** 图片栏之外的直接操作：由 MainActivity 负责真正下载/删除，这里是入口。 */
+    public interface ActionListener {
+        void onDownload(CameraStorage.Item item);
+
+        void onDelete(CameraStorage.Item item);
+    }
+
     private final PhotoGridAdapter adapter;
     private final Loader loader;
     private int position;
     private PageListener pageListener;
+    private ActionListener actionListener;
 
     private ZoomableImageView image;
     private TextView titleView;
     private TextView counterView;
     private TextView infoView;
     private Button toggleView;
+    private Button downloadView;
 
     public PhotoViewerDialog(Context context, PhotoGridAdapter adapter, int position, Loader loader) {
         super(context);
@@ -57,6 +66,10 @@ public final class PhotoViewerDialog extends Dialog {
 
     public void setOnPageChangedListener(PageListener listener) {
         pageListener = listener;
+    }
+
+    public void setActionListener(ActionListener listener) {
+        actionListener = listener;
     }
 
     @Override
@@ -82,6 +95,7 @@ public final class PhotoViewerDialog extends Dialog {
         counterView = findViewById(R.id.previewCounter);
         infoView = findViewById(R.id.previewInfo);
         toggleView = findViewById(R.id.previewToggle);
+        downloadView = findViewById(R.id.previewDownload);
 
         findViewById(R.id.previewClose).setOnClickListener(view -> dismiss());
         toggleView.setOnClickListener(view -> {
@@ -89,6 +103,14 @@ public final class PhotoViewerDialog extends Dialog {
             if (item == null) return;
             adapter.toggle(item);
             updateToggle(item);
+        });
+        downloadView.setOnClickListener(view -> {
+            CameraStorage.Item item = currentItem();
+            if (item != null && actionListener != null) actionListener.onDownload(item);
+        });
+        findViewById(R.id.previewDelete).setOnClickListener(view -> {
+            CameraStorage.Item item = currentItem();
+            if (item != null && actionListener != null) actionListener.onDelete(item);
         });
         image.setSwipeListener(direction -> {
             int target = position + direction;
@@ -153,6 +175,11 @@ public final class PhotoViewerDialog extends Dialog {
         toggleView.setText(adapter.isSelected(item.handle)
                 ? R.string.preview_toggle_unselect
                 : R.string.preview_toggle_select);
+        // 取回只处理 JPEG：RAW/视频停在缩略图状态，下载按钮置灰，避免点了之后只得到一句跳过的提示。
+        downloadView.setEnabled(item.isJpeg());
+        downloadView.setText(item.isJpeg()
+                ? R.string.preview_download
+                : R.string.preview_download_unavailable);
     }
 
     private static String describe(CameraStorage.Item item) {

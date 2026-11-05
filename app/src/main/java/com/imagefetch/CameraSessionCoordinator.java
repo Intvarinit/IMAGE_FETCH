@@ -32,6 +32,7 @@ import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.ptp.WhiteBalanceChoices;
 import com.imagefetch.storage.GalleryExporter;
+import com.imagefetch.storage.JpegOrientation;
 import com.imagefetch.storage.PhotoRepository;
 import com.imagefetch.transfer.HeartbeatMonitor;
 import com.imagefetch.transfer.NewPhotoResolver;
@@ -762,7 +763,9 @@ public final class CameraSessionCoordinator {
         }
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inSampleSize = sample;
-        return BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        // 相机竖拍 JPEG 只在 EXIF 里记方向：按标记摆正，否则全屏看图里长宽会颠倒横躺。
+        return JpegOrientation.applyFromFile(file, decoded);
     }
 
     public boolean isConnected() {

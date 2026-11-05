@@ -33,6 +33,9 @@
     <string name="close">关闭</string>
     <string name="preview_toggle_select">选中此图</string>
     <string name="preview_toggle_unselect">取消选中</string>
+    <string name="preview_download">下载此图</string>
+    <string name="preview_download_unavailable">仅 JPG 可下载</string>
+    <string name="preview_delete">删除此图</string>
     <string name="preview_loading">正在读取原图…</string>
     <string name="preview_thumbnail_only">（无原图可读，当前为缩略图）</string>
     <string name="capture_panel_title">遥控拍摄</string>
@@ -41,6 +44,7 @@
     <string name="live_view_size_label">图传画质</string>
     <string name="autofocus">自动对焦</string>
     <string name="capture_running">正在拍摄并取回…</string>
+    <string name="capture_finished">可继续拍摄</string>
     <string name="exposure_minus">−</string>
     <string name="exposure_plus">+</string>
     <string name="exposure_unknown">—</string>
@@ -164,6 +168,9 @@
     <string name="film_simulation">胶片模拟</string>
     <string name="film_simulation_title">胶片模拟</string>
     <string name="film_stock_label">胶片</string>
+    <string name="film_mode_film">胶片模拟</string>
+    <string name="film_mode_lut">3D LUT</string>
+    <string name="film_lut_stock_label">LUT</string>
     <string name="film_source_label">来源</string>
     <string name="film_page_prev">‹</string>
     <string name="film_page_next">›</string>

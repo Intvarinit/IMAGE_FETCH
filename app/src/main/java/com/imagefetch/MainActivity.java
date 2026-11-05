@@ -61,6 +61,7 @@ import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.ptp.WhiteBalanceChoices;
 import com.imagefetch.storage.GalleryExporter;
+import com.imagefetch.storage.JpegOrientation;
 import com.imagefetch.ui.FocusBoxOverlayView;
 import com.imagefetch.ui.FilmSimulationDialog;
 import com.imagefetch.ui.PagedGridScroll;
@@ -369,6 +370,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             return true;
         });
         setUpShotPanel();
+        applySystemBarInsets();
         selectionCountView = findViewById(R.id.selectionCount);
         gridPager = findViewById(R.id.gridPager);
         gridPagerContent = findViewById(R.id.gridPagerContent);
@@ -573,7 +575,55 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 (item, result) -> coordinator.loadPreview(item,
                         (handle, bitmap) -> result.onPreview(handle, bitmap)));
         viewerDialog.setOnPageChangedListener(this::scrollToPhoto);
+        viewerDialog.setActionListener(new PhotoViewerDialog.ActionListener() {
+            @Override public void onDownload(CameraStorage.Item item) {
+                downloadFromViewer(item);
+            }
+
+            @Override public void onDelete(CameraStorage.Item item) {
+                confirmDeleteFromViewer(item);
+            }
+        });
+        viewerDialog.setOnDismissListener(ignored -> viewerDialog = null);
         viewerDialog.show();
+    }
+
+    /**
+     * 全屏看图里直接下载当前这张：只处理 JPEG；发起后收起看图页，
+     * 让主界面显示传输进度与最终的「已保存」结果。
+     */
+    private void downloadFromViewer(CameraStorage.Item item) {
+        if (!coordinator.isConnected()) {
+            showError("请先连接相机。", null);
+            return;
+        }
+        if (!item.isJpeg()) {
+            showError("当前只支持取回 JPG；RAW 或视频请在相机上处理。", null);
+            return;
+        }
+        if (viewerDialog != null && viewerDialog.isShowing()) viewerDialog.dismiss();
+        progressBar.setProgress(0);
+        setBusy(true);
+        coordinator.download(Collections.singletonList(item));
+    }
+
+    /** 全屏看图里直接删除当前这张：与批量删除走同一条确认与删除流程，只是范围缩到一张。 */
+    private void confirmDeleteFromViewer(CameraStorage.Item item) {
+        if (!coordinator.isConnected()) {
+            showError("请先连接相机。", null);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.delete_confirm_title)
+                .setMessage(getString(R.string.delete_confirm_message, 1, item.filename))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.delete_confirm_action, (dialog, which) -> {
+                    if (viewerDialog != null && viewerDialog.isShowing()) viewerDialog.dismiss();
+                    statusView.setText("正在删除…");
+                    setBusy(true);
+                    coordinator.deleteObjects(Collections.singletonList(item));
+                })
+                .show();
     }
 
     /** 打开「胶片模拟」独立页：页面自己读 RAW 列表、下载、模拟与导出。 */
@@ -1263,6 +1313,40 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         }
     }
 
+    /**
+     * targetSdk 35 起系统强制边到边显示，内容默认会伸进状态栏/导航栏下方。
+     * 把两条系统栏的尺寸补进主内容与侧栏的内边距，让顶部连接卡片与底部按钮不被系统栏压住。
+     * 计算以 XML 里的原始内边距为基准，避免系统多次回调时重复叠加。
+     */
+    private void applySystemBarInsets() {
+        final View content = findViewById(R.id.main_content);
+        final int baseLeft = content.getPaddingLeft();
+        final int baseTop = content.getPaddingTop();
+        final int baseRight = content.getPaddingRight();
+        final int baseBottom = content.getPaddingBottom();
+        content.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(
+                    baseLeft + insets.getSystemWindowInsetLeft(),
+                    baseTop + insets.getSystemWindowInsetTop(),
+                    baseRight + insets.getSystemWindowInsetRight(),
+                    baseBottom + insets.getSystemWindowInsetBottom());
+            return insets;
+        });
+
+        // 侧栏是贴左边缘滑出的整屏面板，只补上下；左右留给它自己贴边。
+        final View drawer = findViewById(R.id.drawerPanel);
+        final int drawerTop = drawer.getPaddingTop();
+        final int drawerBottom = drawer.getPaddingBottom();
+        drawer.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(
+                    view.getPaddingLeft(),
+                    drawerTop + insets.getSystemWindowInsetTop(),
+                    view.getPaddingRight(),
+                    drawerBottom + insets.getSystemWindowInsetBottom());
+            return insets;
+        });
+    }
+
     /** 明确区分两处落点：应用内暂存（下载中转，导出后清理）与系统相册可见位置。 */
     private void updateStorageLabels() {
         String album = exportToGalleryBox.isChecked()
@@ -1498,9 +1582,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         });
     }
 
-    /** 包围批次逐张更新进度行与单张预览；单张拍摄（张数 = 1）不显示这两块。 */
+    /** 包围批次逐张更新进度行与单张预览；单张拍摄没有「N/M 张」进度，但也显示刚取回的缩略图。 */
     private void updateStackProgress(File file) {
-        if (expectedShots <= 1) return;
+        if (expectedShots <= 1) {
+            // 单张拍完只有一行状态文字太干：把刚取回的这一张直接贴进面板，便于立刻确认构图与对焦。
+            showStackPreview(file);
+            return;
+        }
         if (stackProgressView != null) {
             stackProgressView.setVisibility(View.VISIBLE);
             stackProgressView.setText(
@@ -1540,7 +1628,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         while (bounds.outWidth / (sample * 2) >= targetWidth) sample *= 2;
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inSampleSize = sample;
-        return BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        Bitmap decoded = BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        // 与全屏看图一致：竖拍照片按 EXIF 摆正，免得刚拍完的缩略图横躺。
+        return JpegOrientation.applyFromFile(file, decoded);
     }
 
     @Override
@@ -3041,6 +3131,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             if (captureShootButton != null) captureShootButton.setEnabled(true);
             // 「本次未发现 JPEG」既落盘也不报错，只有这条回调能把按钮恢复成可用。
             setBusy(false);
+            // 单张拍摄 / 未发现 JPEG 的路径没有逐张回调，面板上的「正在拍摄并取回…」会一直挂着；
+            // 流程结束这里收掉忙碌提示。只替换仍是忙碌的那条，不动取景过程中报出的其它状态。
+            if (liveViewStatusView != null
+                    && getString(R.string.capture_running).contentEquals(liveViewStatusView.getText())) {
+                liveViewStatusView.setText(R.string.capture_finished);
+            }
             // 自动合成的正确挂点：只有 App 发起的拍摄这一批才合成；机身自己拍（App 无操作）
             // 批次窗口根本没开，consume() 取到 appInitiated=false，什么都不做。
             // onFileSaved 的 post 排在本条之前，同一 main looper 队列按序执行，这里拿到的是完整批次。

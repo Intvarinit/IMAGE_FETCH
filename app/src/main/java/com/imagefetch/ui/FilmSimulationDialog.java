@@ -12,6 +12,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -142,10 +143,18 @@ public final class FilmSimulationDialog extends Dialog {
     private TextView paramsView;
     private Spinner stockSpinner;
     private Spinner sourceSpinner;
+    private TextView stockLabelView;
+    private Button modeFilmButton;
+    private Button modeLutButton;
     private FilmSpinnerAdapter stockAdapter;
     /** 胶片下拉的行：分组标题（film 为 null）或具体胶片。 */
     private final List<StockRow> stockRows = new ArrayList<>();
-    /** 每次换源图递增，迟到的缩略图结果直接丢弃。 */
+    /** 当前目录只显示 LUT 胶片；false 时只显示曲线胶片。 */
+    private boolean lutMode;
+    /** 各自记住最后选中的胶片，来回切换模式不会重置。 */
+    private String filmModeStockId = "kodak_portra_400";
+    private String lutModeStockId;
+    /** 每次换源图或换目录递增，迟到的缩略图结果直接丢弃。 */
     private int thumbnailGeneration;
 
     private static final class StockRow {
@@ -268,6 +277,9 @@ public final class FilmSimulationDialog extends Dialog {
         compareHint = findViewById(R.id.filmCompareHint);
         paramsView = findViewById(R.id.filmParams);
         stockSpinner = findViewById(R.id.filmStockSpinner);
+        stockLabelView = findViewById(R.id.filmStockLabel);
+        modeFilmButton = findViewById(R.id.filmModeFilm);
+        modeLutButton = findViewById(R.id.filmModeLut);
         sourceSpinner = findViewById(R.id.filmSourceSpinner);
         prevPageButton = findViewById(R.id.filmPrevPage);
         nextPageButton = findViewById(R.id.filmNextPage);
@@ -299,7 +311,10 @@ public final class FilmSimulationDialog extends Dialog {
         findViewById(R.id.filmClose).setOnClickListener(view -> dismiss());
         compareButton.setOnClickListener(view -> setCompareMode(!comparing));
         pickColorButton.setOnClickListener(view -> toggleColorPick());
+        modeFilmButton.setOnClickListener(view -> switchMode(false));
+        modeLutButton.setOnClickListener(view -> switchMode(true));
 
+        updateModeUi();
         setUpStocks();
         setUpSource();
         setUpSliders();
@@ -329,34 +344,13 @@ public final class FilmSimulationDialog extends Dialog {
     private void setUpStocks() {
         if (catalog == null || catalog.films.isEmpty()) {
             stockSpinner.setEnabled(false);
+            modeFilmButton.setEnabled(false);
+            modeLutButton.setEnabled(false);
             statusView.setText(catalogError == null
                     ? getContext().getString(R.string.film_no_catalog)
                     : catalogError);
             return;
         }
-        stockRows.clear();
-        List<String> names = new ArrayList<>();
-        List<Boolean> headers = new ArrayList<>();
-        String brand = null;
-        for (FilmStock film : catalog.films) {
-            if (brand == null || !brand.equals(film.brand)) {
-                brand = film.brand;
-                stockRows.add(new StockRow(
-                        brand.isEmpty() ? "其他" : brand.toUpperCase(java.util.Locale.ROOT), null));
-                names.add(stockRows.get(stockRows.size() - 1).label);
-                headers.add(true);
-            }
-            String label = film.shortName();
-            if (film.isPositive()) {
-                label += " · " + getContext().getString(R.string.film_positive_tag);
-            }
-            stockRows.add(new StockRow(label, film));
-            names.add(label);
-            headers.add(false);
-        }
-        stockAdapter = new FilmSpinnerAdapter(getContext(), names, headers);
-        stockSpinner.setAdapter(stockAdapter);
-        stockSpinner.setSelection(indexOfStock("kodak_portra_400"));
         stockSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -375,7 +369,80 @@ public final class FilmSimulationDialog extends Dialog {
             public void onNothingSelected(AdapterView<?> parent) {
             }
         });
+        rebuildStocks();
+    }
+
+    /**
+     * 只把当前模式的胶片装进下拉：曲线胶片与 3D LUT 各一份目录，
+     * 分组标题按筛选后的结果重新生成，避免 76 项混在一起滚动。
+     */
+    private void rebuildStocks() {
+        // 先作废在途的缩略图任务，避免旧目录的结果落到新适配器上。
+        thumbnailGeneration++;
+        stockRows.clear();
+        List<String> names = new ArrayList<>();
+        List<Boolean> headers = new ArrayList<>();
+        String brand = null;
+        for (FilmStock film : catalog.films) {
+            if (film.hasLut() != lutMode) continue;
+            if (brand == null || !brand.equals(film.brand)) {
+                brand = film.brand;
+                stockRows.add(new StockRow(
+                        brand.isEmpty() ? "其他" : brand.toUpperCase(java.util.Locale.ROOT), null));
+                names.add(stockRows.get(stockRows.size() - 1).label);
+                headers.add(true);
+            }
+            String label = film.shortName();
+            if (film.isPositive()) {
+                label += " · " + getContext().getString(R.string.film_positive_tag);
+            }
+            stockRows.add(new StockRow(label, film));
+            names.add(label);
+            headers.add(false);
+        }
+        stockAdapter = new FilmSpinnerAdapter(getContext(), names, headers);
+        stockSpinner.setAdapter(stockAdapter);
+        String target = lutMode ? lutModeStockId : filmModeStockId;
+        int selection = target == null ? nextFilmIndex(-1) : indexOfStock(target);
+        stockSpinner.setSelection(Math.max(0, selection));
+        stockSpinner.setContentDescription(getContext().getString(
+                lutMode ? R.string.film_lut_stock_label : R.string.film_stock_label));
         updateParams(selectedStock());
+        if (sourceBitmap != null) {
+            schedulePreview();
+            refreshStockThumbnails();
+        }
+    }
+
+    /** 两种目录共用同一页面与同一套参数；切换时保留源图和滑杆，只换胶片数据源。 */
+    private void switchMode(boolean lut) {
+        if (lutMode == lut || catalog == null) return;
+        FilmStock selected = selectedStock();
+        if (lutMode) {
+            lutModeStockId = selected == null ? null : selected.id;
+        } else {
+            filmModeStockId = selected == null ? null : selected.id;
+        }
+        lutMode = lut;
+        updateModeUi();
+        rebuildStocks();
+    }
+
+    private void updateModeUi() {
+        stockLabelView.setText(lutMode
+                ? R.string.film_lut_stock_label
+                : R.string.film_stock_label);
+        applyModeStyle(modeFilmButton, !lutMode);
+        applyModeStyle(modeLutButton, lutMode);
+    }
+
+    private void applyModeStyle(Button button, boolean active) {
+        button.setBackgroundResource(active
+                ? R.drawable.bg_film_tab_selected
+                : R.drawable.bg_film_input);
+        button.setTextColor(getContext().getColor(
+                active ? R.color.film_text : R.color.film_text_muted));
+        button.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
     }
 
     private int nextFilmIndex(int from) {
@@ -1076,16 +1143,19 @@ public final class FilmSimulationDialog extends Dialog {
         final Bitmap source = sourceBitmap;
         if (source == null || source.isRecycled()) return;
         final int generation = ++thumbnailGeneration;
+        // 目录可能随模式切换被重建，后台任务用快照，避免边遍历边清空。
+        final List<StockRow> rows = new ArrayList<>(stockRows);
+        final FilmSpinnerAdapter adapter = stockAdapter;
         renderExecutor.execute(() -> {
-            List<Bitmap> thumbs = buildStockThumbnails(source);
+            List<Bitmap> thumbs = buildStockThumbnails(source, rows);
             handler.post(() -> {
-                if (released || generation != thumbnailGeneration) return;
-                stockAdapter.setThumbnails(thumbs);
+                if (released || generation != thumbnailGeneration || adapter != stockAdapter) return;
+                adapter.setThumbnails(thumbs);
             });
         });
     }
 
-    private List<Bitmap> buildStockThumbnails(Bitmap source) {
+    private List<Bitmap> buildStockThumbnails(Bitmap source, List<StockRow> rows) {
         int longest = Math.max(source.getWidth(), source.getHeight());
         Bitmap reference = source;
         if (longest > THUMB_REFERENCE_EDGE) {
@@ -1103,8 +1173,8 @@ public final class FilmSimulationDialog extends Dialog {
         referenceSettings.grain = 0;
         referenceSettings.halation = 0;
 
-        List<Bitmap> thumbs = new ArrayList<>(stockRows.size());
-        for (StockRow row : stockRows) {
+        List<Bitmap> thumbs = new ArrayList<>(rows.size());
+        for (StockRow row : rows) {
             thumbs.add(row.film == null
                     ? null
                     : FilmSimulator.renderThumbnail(

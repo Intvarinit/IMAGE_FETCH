@@ -38,6 +38,42 @@
                 android:text="@string/close" />
         </LinearLayout>
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/space_s"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/filmModeFilm"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_film_tab_selected"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:paddingTop="0dp"
+                android:paddingBottom="0dp"
+                android:text="@string/film_mode_film"
+                android:textColor="@color/film_text"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/filmModeLut"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_marginStart="@dimen/space_s"
+                android:layout_weight="1"
+                android:background="@drawable/bg_film_input"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:paddingTop="0dp"
+                android:paddingBottom="0dp"
+                android:text="@string/film_mode_lut"
+                android:textColor="@color/film_text_muted"
+                android:textSize="14sp" />
+        </LinearLayout>
+
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
@@ -152,6 +188,7 @@
             android:orientation="horizontal">
 
             <TextView
+                android:id="@+id/filmStockLabel"
                 style="@style/Text.Caption"
                 android:layout_width="@dimen/field_label_width"
                 android:layout_height="wrap_content"
