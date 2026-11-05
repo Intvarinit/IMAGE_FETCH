@@ -7,6 +7,7 @@ import android.app.Dialog;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -56,8 +57,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -112,6 +117,12 @@ public final class FilmSimulationDialog extends Dialog {
     private static final int HALATION_DEFAULT = 35;
     private static final int VIGNETTE_DEFAULT = 0;
     private static final int LEAK_DEFAULT = 0;
+    private static final int STRENGTH_DEFAULT = 100;
+    /** 收藏 / 最近使用的本机记录；最近使用最多保留这么多款。 */
+    private static final String FILM_PREFS = "film_simulation";
+    private static final String PREF_FAVORITES = "favorite_ids";
+    private static final String PREF_RECENTS = "recent_ids";
+    private static final int RECENT_LIMIT = 6;
     /** 导出尺寸选项：0 表示原尺寸，其余为成品最长边（不会放大）。 */
     private static final int[] EXPORT_LONG_EDGES = {0, 2048, 4096};
     /** 导出 JPEG 质量选项。 */
@@ -146,9 +157,19 @@ public final class FilmSimulationDialog extends Dialog {
     private TextView stockLabelView;
     private Button modeFilmButton;
     private Button modeLutButton;
+    private Button favoriteButton;
+    private SeekBar strengthBar;
+    private TextView strengthValue;
     private FilmSpinnerAdapter stockAdapter;
     /** 胶片下拉的行：分组标题（film 为 null）或具体胶片。 */
     private final List<StockRow> stockRows = new ArrayList<>();
+    /** 收藏与最近使用；收藏按目录顺序展示，最近使用按使用时间倒序。 */
+    private final Set<String> favoriteIds = new LinkedHashSet<>();
+    private final List<String> recentIds = new ArrayList<>();
+    /** 当前源图下已渲染的胶片缩略图，按胶片 ID 缓存；切换收藏/模式时不必重渲染。 */
+    private final Map<String, Bitmap> stockThumbs = new HashMap<>();
+    /** 最近一次记录进「最近使用」的胶片，用来区分程序性选中和用户点选。 */
+    private String lastRecordedStockId;
     /** 当前目录只显示 LUT 胶片；false 时只显示曲线胶片。 */
     private boolean lutMode;
     /** 各自记住最后选中的胶片，来回切换模式不会重置。 */
@@ -280,6 +301,9 @@ public final class FilmSimulationDialog extends Dialog {
         stockLabelView = findViewById(R.id.filmStockLabel);
         modeFilmButton = findViewById(R.id.filmModeFilm);
         modeLutButton = findViewById(R.id.filmModeLut);
+        favoriteButton = findViewById(R.id.filmFavorite);
+        strengthBar = findViewById(R.id.filmStrengthBar);
+        strengthValue = findViewById(R.id.filmStrengthValue);
         sourceSpinner = findViewById(R.id.filmSourceSpinner);
         prevPageButton = findViewById(R.id.filmPrevPage);
         nextPageButton = findViewById(R.id.filmNextPage);
@@ -313,7 +337,9 @@ public final class FilmSimulationDialog extends Dialog {
         pickColorButton.setOnClickListener(view -> toggleColorPick());
         modeFilmButton.setOnClickListener(view -> switchMode(false));
         modeLutButton.setOnClickListener(view -> switchMode(true));
+        favoriteButton.setOnClickListener(view -> toggleFavorite());
 
+        loadFilmPreferences();
         updateModeUi();
         setUpStocks();
         setUpSource();
@@ -346,6 +372,7 @@ public final class FilmSimulationDialog extends Dialog {
             stockSpinner.setEnabled(false);
             modeFilmButton.setEnabled(false);
             modeLutButton.setEnabled(false);
+            favoriteButton.setEnabled(false);
             statusView.setText(catalogError == null
                     ? getContext().getString(R.string.film_no_catalog)
                     : catalogError);
@@ -362,7 +389,9 @@ public final class FilmSimulationDialog extends Dialog {
                     return;
                 }
                 if (sourceBitmap != null) schedulePreview();
+                rememberIfUserPicked(stock);
                 updateParams(stock);
+                updateFavoriteButton(stock);
             }
 
             @Override
@@ -377,21 +406,81 @@ public final class FilmSimulationDialog extends Dialog {
      * 分组标题按筛选后的结果重新生成，避免 76 项混在一起滚动。
      */
     private void rebuildStocks() {
+        rebuildStocks(true);
+    }
+
+    /**
+     * @param refreshPreview 是否重新渲染预览；只改目录（例如点收藏）时传 false，避免无谓重渲染。
+     */
+    private void rebuildStocks(boolean refreshPreview) {
         // 先作废在途的缩略图任务，避免旧目录的结果落到新适配器上。
         thumbnailGeneration++;
         stockRows.clear();
         List<String> names = new ArrayList<>();
         List<Boolean> headers = new ArrayList<>();
-        String brand = null;
+
+        List<FilmStock> modeFilms = new ArrayList<>();
         for (FilmStock film : catalog.films) {
-            if (film.hasLut() != lutMode) continue;
+            if (film.hasLut() == lutMode) modeFilms.add(film);
+        }
+        // 收藏与最近使用放在最前：76 款目录里常用的那几款不用翻。
+        addStockGroup(names, headers, getContext().getString(R.string.film_group_favorites),
+                favoriteFilms(modeFilms));
+        addStockGroup(names, headers, getContext().getString(R.string.film_group_recents),
+                recentFilms(modeFilms));
+
+        // 品牌分组：同一品牌的胶片保持目录顺序连续成组。
+        String brand = null;
+        List<FilmStock> brandFilms = new ArrayList<>();
+        for (FilmStock film : modeFilms) {
             if (brand == null || !brand.equals(film.brand)) {
+                if (brand != null) {
+                    addStockGroup(names, headers, brandLabel(brand), brandFilms);
+                }
                 brand = film.brand;
-                stockRows.add(new StockRow(
-                        brand.isEmpty() ? "其他" : brand.toUpperCase(java.util.Locale.ROOT), null));
-                names.add(stockRows.get(stockRows.size() - 1).label);
-                headers.add(true);
+                brandFilms = new ArrayList<>();
             }
+            brandFilms.add(film);
+        }
+        if (brand != null) addStockGroup(names, headers, brandLabel(brand), brandFilms);
+
+        stockAdapter = new FilmSpinnerAdapter(getContext(), names, headers);
+        // 先用缓存把已渲染过的缩略图立刻贴回去，缺的再交给后台补齐。
+        stockAdapter.setThumbnails(thumbnailsForRows());
+        stockSpinner.setAdapter(stockAdapter);
+        String target = lutMode ? lutModeStockId : filmModeStockId;
+        int selection = target == null ? nextFilmIndex(-1) : indexOfStock(target);
+        stockSpinner.setSelection(Math.max(0, selection));
+        stockSpinner.setContentDescription(getContext().getString(
+                lutMode ? R.string.film_lut_stock_label : R.string.film_stock_label));
+        FilmStock selected = stockRows.isEmpty() || selection < 0
+                ? null
+                : stockRows.get(Math.min(selection, stockRows.size() - 1)).film;
+        // 程序性选中不算一次「使用」，等用户真的改选别的胶片再记进最近使用。
+        lastRecordedStockId = selected == null ? null : selected.id;
+        updateParams(selectedStock());
+        updateFavoriteButton(selected);
+        if (sourceBitmap != null) {
+            if (refreshPreview) schedulePreview();
+            refreshStockThumbnails();
+        }
+    }
+
+    private List<Bitmap> thumbnailsForRows() {
+        List<Bitmap> thumbs = new ArrayList<>(stockRows.size());
+        for (StockRow row : stockRows) {
+            thumbs.add(row.film == null ? null : stockThumbs.get(row.film.id));
+        }
+        return thumbs;
+    }
+
+    private void addStockGroup(List<String> names, List<Boolean> headers, String title,
+            List<FilmStock> films) {
+        if (films.isEmpty()) return;
+        stockRows.add(new StockRow(title, null));
+        names.add(title);
+        headers.add(true);
+        for (FilmStock film : films) {
             String label = film.shortName();
             if (film.isPositive()) {
                 label += " · " + getContext().getString(R.string.film_positive_tag);
@@ -400,18 +489,84 @@ public final class FilmSimulationDialog extends Dialog {
             names.add(label);
             headers.add(false);
         }
-        stockAdapter = new FilmSpinnerAdapter(getContext(), names, headers);
-        stockSpinner.setAdapter(stockAdapter);
-        String target = lutMode ? lutModeStockId : filmModeStockId;
-        int selection = target == null ? nextFilmIndex(-1) : indexOfStock(target);
-        stockSpinner.setSelection(Math.max(0, selection));
-        stockSpinner.setContentDescription(getContext().getString(
-                lutMode ? R.string.film_lut_stock_label : R.string.film_stock_label));
-        updateParams(selectedStock());
-        if (sourceBitmap != null) {
-            schedulePreview();
-            refreshStockThumbnails();
+    }
+
+    private String brandLabel(String brand) {
+        return brand.isEmpty() ? "其他" : brand.toUpperCase(Locale.ROOT);
+    }
+
+    private List<FilmStock> favoriteFilms(List<FilmStock> modeFilms) {
+        List<FilmStock> films = new ArrayList<>();
+        for (FilmStock film : modeFilms) {
+            if (favoriteIds.contains(film.id)) films.add(film);
         }
+        return films;
+    }
+
+    private List<FilmStock> recentFilms(List<FilmStock> modeFilms) {
+        List<FilmStock> films = new ArrayList<>();
+        for (String id : recentIds) {
+            for (FilmStock film : modeFilms) {
+                if (film.id.equals(id)) {
+                    films.add(film);
+                    break;
+                }
+            }
+            if (films.size() >= RECENT_LIMIT) break;
+        }
+        return films;
+    }
+
+    private void rememberIfUserPicked(FilmStock stock) {
+        if (stock.id.equals(lastRecordedStockId)) return;
+        lastRecordedStockId = stock.id;
+        recentIds.remove(stock.id);
+        recentIds.add(0, stock.id);
+        while (recentIds.size() > RECENT_LIMIT) recentIds.remove(recentIds.size() - 1);
+        StringBuilder joined = new StringBuilder();
+        for (String id : recentIds) {
+            if (joined.length() > 0) joined.append(',');
+            joined.append(id);
+        }
+        getPrefs().edit().putString(PREF_RECENTS, joined.toString()).apply();
+    }
+
+    private void toggleFavorite() {
+        FilmStock stock = selectedStock();
+        if (stock == null) return;
+        if (!favoriteIds.remove(stock.id)) favoriteIds.add(stock.id);
+        getPrefs().edit().putStringSet(PREF_FAVORITES, new LinkedHashSet<>(favoriteIds)).apply();
+        // 立刻重建目录让收藏分组生效；缩略图来自缓存，不再重复渲染。
+        rebuildStocks(false);
+    }
+
+    private void updateFavoriteButton(FilmStock stock) {
+        if (favoriteButton == null) return;
+        boolean favorite = stock != null && favoriteIds.contains(stock.id);
+        favoriteButton.setEnabled(stock != null);
+        favoriteButton.setText(favorite
+                ? R.string.film_favorite_remove
+                : R.string.film_favorite_add);
+        favoriteButton.setContentDescription(getContext().getString(favorite
+                ? R.string.film_favorite_remove_desc
+                : R.string.film_favorite_add_desc));
+    }
+
+    private void loadFilmPreferences() {
+        SharedPreferences prefs = getPrefs();
+        favoriteIds.clear();
+        favoriteIds.addAll(prefs.getStringSet(PREF_FAVORITES, Collections.emptySet()));
+        recentIds.clear();
+        String stored = prefs.getString(PREF_RECENTS, "");
+        if (!stored.isEmpty()) {
+            for (String id : stored.split(",")) {
+                if (!id.isEmpty()) recentIds.add(id);
+            }
+        }
+    }
+
+    private SharedPreferences getPrefs() {
+        return getContext().getSharedPreferences(FILM_PREFS, Context.MODE_PRIVATE);
     }
 
     /** 两种目录共用同一页面与同一套参数；切换时保留源图和滑杆，只换胶片数据源。 */
@@ -478,6 +633,14 @@ public final class FilmSimulationDialog extends Dialog {
     }
 
     private void setUpSliders() {
+        strengthBar.setOnSeekBarChangeListener(new OnSeek() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                settings.strength = progress / 100.0;
+                updateSliderLabels();
+                schedulePreview(adjustingSliders);
+            }
+        });
         exposureBar.setOnSeekBarChangeListener(new OnSeek() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
@@ -556,6 +719,8 @@ public final class FilmSimulationDialog extends Dialog {
     }
 
     private void updateSliderLabels() {
+        strengthValue.setText(String.format(Locale.ROOT, "%d%%",
+                Math.round(settings.strength * 100)));
         exposureValue.setText(formatEv(settings.exposureEv));
         temperatureValue.setText(formatShift(settings.temperature, "暖", "冷"));
         tintValue.setText(formatShift(settings.tint, "洋红", "绿"));
@@ -580,6 +745,7 @@ public final class FilmSimulationDialog extends Dialog {
     }
 
     private void resetSettings() {
+        strengthBar.setProgress(STRENGTH_DEFAULT);
         exposureBar.setProgress(EXPOSURE_DEFAULT);
         temperatureBar.setProgress(TEMPERATURE_DEFAULT);
         tintBar.setProgress(TINT_DEFAULT);
@@ -811,6 +977,8 @@ public final class FilmSimulationDialog extends Dialog {
         }
         sourceLabel = label == null ? "" : label;
         sourceUpscaled = upscaled;
+        // 缩略图与源图绑定，换图后旧缩略图全部作废（不立刻 recycle：可能还在下拉里显示）。
+        stockThumbs.clear();
         loadButton.setEnabled(true);
         exportButton.setEnabled(true);
         overlayBar.setVisibility(View.VISIBLE);
@@ -1145,17 +1313,26 @@ public final class FilmSimulationDialog extends Dialog {
         final int generation = ++thumbnailGeneration;
         // 目录可能随模式切换被重建，后台任务用快照，避免边遍历边清空。
         final List<StockRow> rows = new ArrayList<>(stockRows);
+        final Map<String, Bitmap> existing = new HashMap<>(stockThumbs);
         final FilmSpinnerAdapter adapter = stockAdapter;
         renderExecutor.execute(() -> {
-            List<Bitmap> thumbs = buildStockThumbnails(source, rows);
+            List<Bitmap> thumbs = buildStockThumbnails(source, rows, existing);
             handler.post(() -> {
                 if (released || generation != thumbnailGeneration || adapter != stockAdapter) return;
+                // 渲染结果放回缓存：下次切收藏/模式时直接复用，不用重跑。
+                for (int i = 0; i < rows.size(); i++) {
+                    FilmStock film = rows.get(i).film;
+                    if (film != null && thumbs.get(i) != null) {
+                        stockThumbs.put(film.id, thumbs.get(i));
+                    }
+                }
                 adapter.setThumbnails(thumbs);
             });
         });
     }
 
-    private List<Bitmap> buildStockThumbnails(Bitmap source, List<StockRow> rows) {
+    private List<Bitmap> buildStockThumbnails(
+            Bitmap source, List<StockRow> rows, Map<String, Bitmap> existing) {
         int longest = Math.max(source.getWidth(), source.getHeight());
         Bitmap reference = source;
         if (longest > THUMB_REFERENCE_EDGE) {
@@ -1174,11 +1351,23 @@ public final class FilmSimulationDialog extends Dialog {
         referenceSettings.halation = 0;
 
         List<Bitmap> thumbs = new ArrayList<>(rows.size());
+        // 收藏/最近使用里的胶片会和品牌分组重复，同一款只渲染一次，几行共用同一张缩略图。
+        Map<String, Bitmap> renderedById = new HashMap<>();
         for (StockRow row : rows) {
-            thumbs.add(row.film == null
-                    ? null
-                    : FilmSimulator.renderThumbnail(
-                            reference, row.film, referenceSettings, THUMB_MAX_EDGE));
+            if (row.film == null) {
+                thumbs.add(null);
+                continue;
+            }
+            Bitmap thumb = existing.get(row.film.id);
+            if (thumb == null || thumb.isRecycled()) {
+                thumb = renderedById.get(row.film.id);
+            }
+            if (thumb == null || thumb.isRecycled()) {
+                thumb = FilmSimulator.renderThumbnail(
+                        reference, row.film, referenceSettings, THUMB_MAX_EDGE);
+                renderedById.put(row.film.id, thumb);
+            }
+            thumbs.add(thumb);
         }
         if (reference != source) reference.recycle();
         return thumbs;

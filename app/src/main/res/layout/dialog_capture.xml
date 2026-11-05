@@ -39,6 +39,23 @@
                 android:layout_height="match_parent"
                 android:clickable="false"
                 android:focusable="false" />
+
+            <!-- 叠在画面右上角：不占纵向空间，开关状态一眼可见。 -->
+            <CheckBox
+                android:id="@+id/liveViewGrid"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="top|end"
+                android:layout_margin="4dp"
+                android:buttonTint="#FFFFFF"
+                android:padding="8dp"
+                android:shadowColor="#80000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="4"
+                android:text="@string/live_view_grid"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp" />
         </FrameLayout>
 
         <TextView

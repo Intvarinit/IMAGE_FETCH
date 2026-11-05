@@ -40,6 +40,8 @@ public final class FilmSimulator {
         public double vignette;
         /** 漏光强度（0…1）。 */
         public double lightLeak;
+        /** 整体强度（0…1）：与原图的混合比例，1 为完整胶片效果。 */
+        public double strength = 1.0;
 
         public Settings copy() {
             Settings copy = new Settings();
@@ -52,6 +54,7 @@ public final class FilmSimulator {
             copy.monoFilter = monoFilter;
             copy.vignette = vignette;
             copy.lightLeak = lightLeak;
+            copy.strength = strength;
             return copy;
         }
     }
@@ -158,6 +161,8 @@ public final class FilmSimulator {
         boolean monoOutput = tuned.monochrome || (lut != null && stock.monochrome);
         float vignette = (float) tuned.vignette;
         float lightLeak = (float) tuned.lightLeak;
+        // 强度混合在 sRGB 域完成：0% 就是原图，100% 是完整胶片效果。
+        float mixStrength = (float) tuned.strength;
         float centerX = width * 0.5f;
         float centerY = height * 0.5f;
         float[] tile = grainTile();
@@ -268,6 +273,15 @@ public final class FilmSimulator {
                     int r = encode(red, encodeLut);
                     int g = encode(green, encodeLut);
                     int b = encode(blue, encodeLut);
+                    if (mixStrength < 0.999f) {
+                        // 与原始 sRGB 像素线性混合；只多三次乘法，不增加额外图像缓冲区。
+                        int sr = (argb >>> 16) & 0xff;
+                        int sg = (argb >>> 8) & 0xff;
+                        int sb = argb & 0xff;
+                        r = (int) (r * mixStrength + sr * (1f - mixStrength) + 0.5f);
+                        g = (int) (g * mixStrength + sg * (1f - mixStrength) + 0.5f);
+                        b = (int) (b * mixStrength + sb * (1f - mixStrength) + 0.5f);
+                    }
                     strip[rowOffset + x] = 0xff000000 | (r << 16) | (g << 8) | b;
                 }
             }
@@ -288,6 +302,7 @@ public final class FilmSimulator {
                 settings.monoFilter));
         settings.vignette = Math.max(0.0, Math.min(1.0, settings.vignette));
         settings.lightLeak = Math.max(0.0, Math.min(1.0, settings.lightLeak));
+        settings.strength = Math.max(0.0, Math.min(1.0, settings.strength));
     }
 
     /**

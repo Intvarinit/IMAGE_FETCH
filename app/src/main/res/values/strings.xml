@@ -42,6 +42,7 @@
     <string name="live_view_hint">实时取景画面</string>
     <string name="live_view_starting">正在开启实时取景…</string>
     <string name="live_view_size_label">图传画质</string>
+    <string name="live_view_grid">网格</string>
     <string name="autofocus">自动对焦</string>
     <string name="capture_running">正在拍摄并取回…</string>
     <string name="capture_finished">可继续拍摄</string>
@@ -171,6 +172,13 @@
     <string name="film_mode_film">胶片模拟</string>
     <string name="film_mode_lut">3D LUT</string>
     <string name="film_lut_stock_label">LUT</string>
+    <string name="film_strength_label">强度</string>
+    <string name="film_group_favorites">收藏</string>
+    <string name="film_group_recents">最近使用</string>
+    <string name="film_favorite_add">☆</string>
+    <string name="film_favorite_remove">★</string>
+    <string name="film_favorite_add_desc">收藏此胶片</string>
+    <string name="film_favorite_remove_desc">取消收藏</string>
     <string name="film_source_label">来源</string>
     <string name="film_page_prev">‹</string>
     <string name="film_page_next">›</string>

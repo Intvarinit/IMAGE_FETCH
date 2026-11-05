@@ -59,6 +59,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -1191,6 +1192,8 @@ public final class CameraSessionCoordinator {
         int consecutiveErrors;
         /** 已经因为「收不到帧」重发过几次开启序列。 */
         int stallRestarts;
+        /** 上一帧还在 UI 线程处理时置 true：丢弃新帧，避免取景帧在消息队列里堆起来。 */
+        final AtomicBoolean framePending = new AtomicBoolean();
         long lastFrameAt = System.currentTimeMillis();
         long lastRestartAt = System.currentTimeMillis();
     }
@@ -1235,7 +1238,18 @@ public final class CameraSessionCoordinator {
                 if (frame != null) {
                     liveViewFrameWidth = frame.getWidth();
                     liveViewFrameHeight = frame.getHeight();
-                    mainHandler.post(() -> listener.onLiveViewFrame(frame));
+                    // UI 线程一时忙不过来时只保留最新一帧：每帧 MB 级，堆十几帧既涨内存也越拖越慢。
+                    if (pump.framePending.compareAndSet(false, true)) {
+                        mainHandler.post(() -> {
+                            try {
+                                listener.onLiveViewFrame(frame);
+                            } finally {
+                                pump.framePending.set(false);
+                            }
+                        });
+                    } else if (!frame.isRecycled()) {
+                        frame.recycle();
+                    }
                 }
             }
         } catch (Exception error) {

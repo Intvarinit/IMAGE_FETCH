@@ -106,6 +106,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final String PREF_CAMERA_SSID = "camera_ssid";
     private static final String PREF_CAMERA_PASSWORD = "camera_password";
     private static final String PREF_LIVE_VIEW_SIZE = "live_view_size";
+    private static final String PREF_LIVE_VIEW_GRID = "live_view_grid";
     /** 机身参数基线快照（{@link VendorPropertySnapshot#toText()} 的文本）；空串表示没有基线。 */
     private static final String PREF_PROPERTY_BASELINE = "property_baseline";
     private static final int[] PAGE_SIZE_OPTIONS = {20, 50, 100};
@@ -258,6 +259,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private FrameLayout liveViewFrame;
     /** 对焦点小方框覆盖层；面板关闭后置空。 */
     private FocusBoxOverlayView focusBoxOverlay;
+    /** 取景三分线开关；面板关闭后置空。 */
+    private CheckBox liveViewGridCheck;
     /** 最近一次下发的对焦点帧坐标；NaN 表示还没点过（面板重开时复位）。 */
     private float lastFocusFrameX = Float.NaN;
     private float lastFocusFrameY = Float.NaN;
@@ -659,6 +662,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         liveViewImage = content.findViewById(R.id.liveViewImage);
         liveViewFrame = content.findViewById(R.id.liveViewFrame);
         focusBoxOverlay = content.findViewById(R.id.focusBoxOverlay);
+        liveViewGridCheck = content.findViewById(R.id.liveViewGrid);
         lastFocusFrameX = Float.NaN;
         lastFocusFrameY = Float.NaN;
         liveViewStatusView = content.findViewById(R.id.liveViewStatus);
@@ -680,6 +684,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         ViewGroup.LayoutParams frameParams = liveViewFrame.getLayoutParams();
         frameParams.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.28f);
         liveViewFrame.setLayoutParams(frameParams);
+
+        // 三分线开关：状态记在本机，下次打开拍摄面板沿用。
+        boolean showGrid = preferences.getBoolean(PREF_LIVE_VIEW_GRID, false);
+        liveViewGridCheck.setChecked(showGrid);
+        focusBoxOverlay.setGridVisible(showGrid);
+        liveViewGridCheck.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit().putBoolean(PREF_LIVE_VIEW_GRID, checked).apply();
+            if (focusBoxOverlay != null) focusBoxOverlay.setGridVisible(checked);
+        });
 
         // 点按预览只移动对焦框、不触发对焦（用户明确要求：对焦另走「自动对焦」按钮）。
         liveViewImage.setOnTouchListener((view, event) -> {
@@ -751,6 +764,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         lastFocusFrameX = Float.NaN;
         lastFocusFrameY = Float.NaN;
         liveViewStatusView = null;
+        liveViewGridCheck = null;
         captureShootButton = null;
         captureAutofocusButton = null;
         liveViewSizeSpinner = null;
@@ -3110,6 +3124,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
      */
     private void updateFocusBox() {
         if (focusBoxOverlay == null || liveViewImage == null || liveViewBitmap == null) return;
+        // 三分线只覆盖真实画面区域：取景容器与 3:2 帧比例不完全一致时会留黑边。
+        int viewWidth = liveViewImage.getWidth();
+        int viewHeight = liveViewImage.getHeight();
+        int frameWidth = liveViewBitmap.getWidth();
+        int frameHeight = liveViewBitmap.getHeight();
+        if (viewWidth > 0 && viewHeight > 0 && frameWidth > 0 && frameHeight > 0) {
+            float scale = Math.min(viewWidth / (float) frameWidth, viewHeight / (float) frameHeight);
+            float shownWidth = frameWidth * scale;
+            float shownHeight = frameHeight * scale;
+            float left = (viewWidth - shownWidth) * 0.5f;
+            float top = (viewHeight - shownHeight) * 0.5f;
+            focusBoxOverlay.setContentRect(left, top, left + shownWidth, top + shownHeight);
+        }
         if (Float.isNaN(lastFocusFrameX) || Float.isNaN(lastFocusFrameY)) {
             focusBoxOverlay.clear();
             return;
