@@ -18,12 +18,14 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelUuid;
 import android.util.Log;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -89,8 +91,21 @@ public final class CanonBleHandover {
 
     private static final long SCAN_TIMEOUT_MS = 12_000L;
     private static final long CONNECT_TIMEOUT_MS = 10_000L;
+    /** 写 App 名后等相机回 [2] 的上限；官方在这步没有超时，我们兜底继续。 */
+    private static final long PAIR_ACK_TIMEOUT_MS = 4_000L;
+    /** REQUEST_AP_CONFIG 后等相机回 TLV 的上限；超时仍继续读，让相机有机会补数据。 */
+    private static final long AP_CONFIG_TIMEOUT_MS = 3_000L;
+    /** START 后等 00020003 指示的上限；个别机型不回指示，兜底按参数齐全算成功。 */
+    private static final long START_STATUS_TIMEOUT_MS = 4_000L;
+    /** 交接完成后保持 BLE 会话活跃的间隔：官方在 Wi‑Fi 期间也一直有会话交互。 */
+    private static final long SESSION_KEEPALIVE_MS = 15_000L;
     /** 首次要等系统配对弹窗由用户确认，整体窗口放宽到 90s。 */
     private static final long OVERALL_TIMEOUT_MS = 90_000L;
+    /**
+     * 已配对设备会话初始化的「无进展」上限：正常每次 GATT 读写都在 100ms 内回来，
+     * 超过这个时间说明相机蓝牙已卡死（实测偶发不回包），没必要陪跑到 90s 总超时。
+     */
+    private static final long SESSION_PROGRESS_TIMEOUT_MS = 20_000L;
     private static final long MTU_TIMEOUT_MS = 800L;
 
     public interface Callback {
@@ -143,6 +158,43 @@ public final class CanonBleHandover {
     private final java.util.ArrayDeque<Runnable> gattOps = new java.util.ArrayDeque<>();
     private boolean opInFlight;
     private boolean sessionStarted;
+    /** 官方在写 00010006 之后等相机回 [2]：收到后才去读 0001000B。 */
+    private boolean pairAckSeen;
+    private boolean pairWaitActive;
+    /** REQUEST_AP_CONFIG 的 TLV 回执已到，后续 SSID/密码读取可以开始。 */
+    private boolean apConfigSeen;
+    private boolean apWaitActive;
+    /** 0001000B 返回的能力位：决定还要等哪些 0001000C 状态。 */
+    private int sessionFlags;
+    private String modelName1;
+    private String modelName2;
+    private int batteryLevel = -1;
+    private int cameraState = -1;
+    private boolean sessionReadyLogged;
+    /** 00020001 的 AP 配置数据：START 是否支持带安全类型看它。 */
+    private byte[] apConfigData;
+    /** 00020005 返回的安全类型列表（官方用它判断支持 9=WPA2）。 */
+    private java.util.List<Integer> securityTypes;
+    private boolean finished;
+    private boolean ready;
+    /** 会话初始化看门狗是否已武装：只对已配对设备生效（首次配对要等用户确认系统弹窗）。 */
+    private boolean watchdogArmed;
+    private final Runnable sessionProgressTimeout = () -> fail("相机蓝牙无响应，请重试");
+    private final Runnable sessionKeepAlive = new Runnable() {
+        @Override public void run() {
+            if (finished || !ready) return;
+            if (gatt != null && sessionStateCharacteristic != null) {
+                Log.i(TAG, "会话保活：读 00010005");
+                enqueue(() -> read(gatt, sessionStateCharacteristic, "会话保活"));
+            }
+            handler.postDelayed(this, SESSION_KEEPALIVE_MS);
+        }
+    };
+    private final Runnable startStatusFallback = () -> {
+        if (finished) return;
+        Log.w(TAG, "没有收到 WAP 状态指示，按参数齐全收尾");
+        finishHandover();
+    };
 
     private String cameraIp;
     private String cameraBssid;
@@ -150,8 +202,9 @@ public final class CanonBleHandover {
     private String handoverSsid;
     private String handoverPassword;
     private boolean handoverAccepted;
+    /** START 是否已成功写给相机。START 之前失败时相机不会被唤醒、热点也不会出现。 */
+    private volatile boolean wifiStartRequested;
 
-    private boolean finished;
     private BroadcastReceiver bondReceiver;
 
     private final Runnable overallTimeout = () -> fail("蓝牙交接超时：相机没有回应");
@@ -203,9 +256,19 @@ public final class CanonBleHandover {
         }, SCAN_TIMEOUT_MS);
     }
 
+    /**
+     * 是否已把 START 写给相机。START 之前失败（蓝牙关闭/扫不到广播）相机根本不会开热点，
+     * 回退入网可以很快放弃；START 之后失败则热点可能已在启动，需要给足等待时间。
+     */
+    public boolean isWifiStartRequested() {
+        return wifiStartRequested;
+    }
+
     /** 会话结束时释放 BLE 连接（不影响相机已经开着的 Wi‑Fi）。 */
     public void close() {
         finished = true;
+        ready = false;
+        watchdogArmed = false;
         handler.removeCallbacksAndMessages(null);
         unregisterBondReceiver();
         if (gatt != null) {
@@ -314,6 +377,14 @@ public final class CanonBleHandover {
                     fail("缺少蓝牙连接权限");
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (ready) {
+                    // 交接完成后的 BLE 会话断开：只停保活，Wi‑Fi 会话由上层自行续命。
+                    Log.w(TAG, "相机断开了蓝牙会话（status " + status + "）");
+                    ready = false;
+                    handler.removeCallbacks(sessionKeepAlive);
+                    closeGattQuietly();
+                    return;
+                }
                 if (bondReceiver != null) {
                     // 配对期间相机可能短暂断开：先不判失败，等 BOND_BONDED
                     // 回调后用已配对设备重连（见 registerBondReceiver）。
@@ -405,26 +476,35 @@ public final class CanonBleHandover {
 
         @Override public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             Log.i(TAG, "mtu=" + mtu + " status=" + status);
-            if (!finished) startSession(gatt);
+            if (!finished) {
+                if (watchdogArmed) armSessionWatchdog();
+                startSession(gatt);
+            }
         }
 
         @Override public void onCharacteristicWrite(
                 BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
             if (finished) return;
             Log.i(TAG, "write " + characteristic.getUuid() + " status=" + status);
+            byte[] written = characteristic.getValue();
+            int opcode = written != null && written.length > 0 ? (written[0] & 0xff) : -1;
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                fail("相机拒绝了 Wi‑Fi 唤醒请求（" + status + "）");
+                // 身份注册这类写失败只记日志；只有交接命令/会话确认失败才中止。
+                if (CHAR_WAP_CP.equals(characteristic.getUuid())
+                        || (CHAR_SESSION_CMD.equals(characteristic.getUuid()) && opcode == 1)) {
+                    fail("相机拒绝了 Wi‑Fi 唤醒请求（" + status + "）");
+                    return;
+                }
+                Log.w(TAG, "write failed, continue: " + characteristic.getUuid()
+                        + " status=" + status);
+                opDone();
                 return;
             }
-            if (CHAR_WAP_CP.equals(characteristic.getUuid())) {
-                byte[] value = characteristic.getValue();
-                int opcode = value != null && value.length > 0 ? (value[0] & 0xff) : 0;
+            if (CHAR_SESSION_CMD.equals(characteristic.getUuid()) && opcode == 1) {
+                // 会话确认 {1} 已写入：按官方顺序紧接着发 START。
+                enqueue(() -> startHandover(gatt));
+            } else if (CHAR_WAP_CP.equals(characteristic.getUuid())) {
                 status("相机已收到蓝牙交接命令（" + opcode + "）…");
-                // START 已被相机接受：参数（IP/SSID/密码）在 {10} 的回包与后续读取里拿齐了。
-                if ((opcode == 1 || opcode == 4) && cameraIp != null
-                        && handoverSsid != null && handoverPassword != null) {
-                    finishHandover();
-                }
             }
             opDone();
         }
@@ -445,12 +525,27 @@ public final class CanonBleHandover {
                 opDone();
                 return;
             }
+            byte[] value = characteristic.getValue();
             if (CHAR_WAP_SSID.equals(characteristic.getUuid())) {
                 handoverSsid = ascii(characteristic);
             } else if (CHAR_WAP_PASSWORD.equals(characteristic.getUuid())) {
                 handoverPassword = ascii(characteristic);
             } else if (CHAR_WAP_SECURITY.equals(characteristic.getUuid())) {
-                Log.i(TAG, "security type=" + hex(characteristic.getValue()));
+                securityTypes = parseSecurityTypes(value);
+                Log.i(TAG, "security types=" + securityTypes);
+            } else if (CHAR_WAP_AP_CONFIG.equals(characteristic.getUuid())) {
+                // 官方 f3903t：START 是否支持携带安全类型看它的头 4 字节。
+                apConfigData = value == null ? null : value.clone();
+                Log.i(TAG, "ap config=" + hex(apConfigData));
+            } else if (CHAR_SESSION_INIT.equals(characteristic.getUuid())) {
+                // 官方按位判断还需要等哪些 0001000C 状态（机型名/电量/会话类型）。
+                sessionFlags = value != null && value.length >= 4
+                        ? ByteBuffer.wrap(value).getInt() : 0;
+                Log.i(TAG, "session flags=0x" + Integer.toHexString(sessionFlags));
+                maybeLogSessionReady();
+            } else if (CHAR_SESSION_STATE.equals(characteristic.getUuid())) {
+                Log.i(TAG, "session state=" + (value != null && value.length > 0
+                        ? (value[0] & 0xff) : -1));
             }
             opDone();
         }
@@ -518,6 +613,12 @@ public final class CanonBleHandover {
      */
     private void requestMtuThenSession(BluetoothGatt gatt) {
         if (sessionStarted || finished) return;
+        // 已配对设备（含本次刚配对完成）的会话初始化全程都该有进展，武装 20s 看门狗。
+        BluetoothDevice device = gatt.getDevice();
+        if (device != null && device.getBondState() == BluetoothDevice.BOND_BONDED) {
+            watchdogArmed = true;
+            armSessionWatchdog();
+        }
         try {
             if (gatt.requestMtu(512)) {
                 handler.postDelayed(() -> {
@@ -531,26 +632,23 @@ public final class CanonBleHandover {
     }
 
     /**
-     * 官方初始化顺序（来自 Camera Connect 反编译）：
-     * 读会话初始化 0001000B → 读 00010005 并开通知 → 开 0001000C 指示 →
-     * 读 00020001 → 00020003 用 indication、00020002 用 notification →
-     * 读 SSID/密码/安全类型 → 最后写 START。
+     * 官方初始化顺序（反编译 C0235o.B / C0203g / T.c）：
+     * 未注册时走配对路径——写 {@code 00010006 = [1]+App名} → 等相机回 [2] →
+     * 读 {@code 0001000B} → 订阅各服务 → 写 {@code 0001000A} 身份（UUID/昵称/类型）→
+     * 发 REQUEST_AP_CONFIG → 读 SSID/密码/安全类型 → 会话确认 {1} → START。
      */
     private void startSession(BluetoothGatt gatt) {
         if (finished || sessionStarted) return;
         sessionStarted = true;
         Log.i(TAG, "startSession");
+        if (sessionPairCharacteristic != null) {
+            // 官方 startPairingSequence：先写 App 名并等相机回 [2]，确认后才读会话初始化。
+            enqueue(() -> write(gatt, sessionPairCharacteristic, pairPayload(), "App 名注册"));
+            enqueue(() -> enable(gatt, sessionPairCharacteristic, true));
+            enqueue(this::awaitPairAck);
+        }
         if (sessionInitCharacteristic != null) {
             enqueue(() -> read(gatt, sessionInitCharacteristic, "会话初始化"));
-        }
-        if (sessionPairCharacteristic != null) {
-            // 官方 startPairingSequence：向 00010006 写 [1] + App 名称。
-            // 相机里虽然已有 IMAGE_FETCH，但官方每次建会话仍会重写一次。
-            byte[] name = "IMAGE_FETCH".getBytes(StandardCharsets.US_ASCII);
-            byte[] payload = new byte[name.length + 1];
-            payload[0] = 1;
-            System.arraycopy(name, 0, payload, 1, name.length);
-            enqueue(() -> write(gatt, sessionPairCharacteristic, payload, "App 名注册"));
         }
         if (sessionStateCharacteristic != null) {
             enqueue(() -> read(gatt, sessionStateCharacteristic, "会话状态"));
@@ -570,11 +668,12 @@ public final class CanonBleHandover {
             enqueue(() -> enable(gatt, cpCharacteristic, false));
         }
         subscribeAuxServices(gatt);
+        // 官方在读 0001000B 成功后写 0001000A 的三条身份指令，再请求 AP 参数。
+        enqueueIdentityWrites(gatt);
         if (cpCharacteristic != null) {
-            // 官方在 START 之前先发 REQUEST_AP_CONFIG(0x0A)，让相机生成 SSID/密码/安全类型；
-            // 直接读会拿到全 0（实测）。
+            // 官方先发 REQUEST_AP_CONFIG(0x0A)，等相机回 TLV 后才读 SSID/密码/安全类型。
             enqueue(() -> requestApConfig(gatt));
-            enqueue(() -> handler.postDelayed(this::opDone, 500L));
+            enqueue(this::awaitApConfig);
         }
         if (ssidCharacteristic != null) {
             enqueue(() -> read(gatt, ssidCharacteristic, "SSID"));
@@ -585,11 +684,138 @@ public final class CanonBleHandover {
         if (securityCharacteristic != null) {
             enqueue(() -> read(gatt, securityCharacteristic, "安全类型"));
         }
-        if (sessionCmdCharacteristic != null) {
-            // 官方 T.c(Q.SUCCESS)：交接就绪后先写会话确认 {1} 到 0001000A。
-            enqueue(() -> write(gatt, sessionCmdCharacteristic, new byte[]{1}, "会话确认"));
+        // 参数齐了才写会话确认 {1}；写入成功后在回调里发 START。
+        enqueue(() -> confirmAndStart(gatt));
+    }
+
+    /** {@code [1] + App 名称}：官方 startPairingSequence 的固定载荷。 */
+    private byte[] pairPayload() {
+        byte[] name = "IMAGE_FETCH".getBytes(StandardCharsets.US_ASCII);
+        byte[] payload = new byte[name.length + 1];
+        payload[0] = 1;
+        System.arraycopy(name, 0, payload, 1, name.length);
+        return payload;
+    }
+
+    /**
+     * 官方在会话初始化后向 {@code 0001000A} 连写三条身份指令：
+     * {@code {3}+16 字节 UUID}、{@code {4}+手机昵称}、{@code {5,2}}。
+     * 少写这三条，相机可能仍接受 START 却不真正打开 AP。
+     */
+    private void enqueueIdentityWrites(BluetoothGatt gatt) {
+        if (sessionCmdCharacteristic == null) return;
+        byte[] uuid = appUuidBytes();
+        if (uuid != null) {
+            byte[] payload = new byte[17];
+            payload[0] = 3;
+            System.arraycopy(uuid, 0, payload, 1, 16);
+            enqueue(() -> write(gatt, sessionCmdCharacteristic, payload, "UUID 注册"));
         }
-        enqueue(() -> startHandover(gatt));
+        String nickname = deviceNickname();
+        byte[] name = nickname.getBytes(StandardCharsets.US_ASCII);
+        byte[] namePayload = new byte[name.length + 1];
+        namePayload[0] = 4;
+        System.arraycopy(name, 0, namePayload, 1, name.length);
+        enqueue(() -> write(gatt, sessionCmdCharacteristic, namePayload, "昵称注册"));
+        enqueue(() -> write(gatt, sessionCmdCharacteristic, new byte[]{5, 2}, "会话类型"));
+        // 官方 J(true)：仅当 0001000B 能力位 64 置位时才允许发「禁止自动关机」，
+        // 否则相机会回 GATT 133 并直接断开蓝牙。
+        enqueue(() -> {
+            if ((sessionFlags & 64) == 64) {
+                write(gatt, sessionCmdCharacteristic, new byte[]{10, 1}, "禁止自动关机");
+            } else {
+                Log.i(TAG, "相机不支持禁止自动关机（flags=0x" + Integer.toHexString(sessionFlags) + "）");
+                opDone();
+            }
+        });
+    }
+
+    /** 复用 PTP/IP 的发起方 GUID（官方 BLE 与 PTP 用的是同一个 UUID）。 */
+    private byte[] appUuidBytes() {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(
+                    "image_fetch_prefs", Context.MODE_PRIVATE);
+            String text = prefs.getString("ptpip_initiator_guid", "");
+            if (text == null || text.length() != 32) return null;
+            byte[] uuid = new byte[16];
+            for (int i = 0; i < 16; i++) {
+                uuid[i] = (byte) Integer.parseInt(text.substring(i * 2, i * 2 + 2), 16);
+            }
+            return uuid;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /** 官方写入的手机昵称；读不到蓝牙名时退回 App 名。 */
+    private String deviceNickname() {
+        try {
+            BluetoothManager manager =
+                    (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+            BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
+            String name = adapter == null ? null : adapter.getName();
+            if (name != null && !name.trim().isEmpty()) return name.trim();
+        } catch (Exception ignored) {
+        }
+        return "IMAGE_FETCH";
+    }
+
+    /** 等相机对 App 名注册回 [2]；没回执就按超时继续，不让流程卡死。 */
+    private void awaitPairAck() {
+        if (finished) return;
+        if (pairAckSeen) {
+            opDone();
+            return;
+        }
+        pairWaitActive = true;
+        handler.postDelayed(() -> {
+            if (!pairWaitActive) return;
+            pairWaitActive = false;
+            Log.w(TAG, "App 名注册无回执，继续会话初始化");
+            opDone();
+        }, PAIR_ACK_TIMEOUT_MS);
+    }
+
+    /** 等相机对 REQUEST_AP_CONFIG 回 TLV（00020002）；超时也继续读，避免整条流程卡住。 */
+    private void awaitApConfig() {
+        if (finished) return;
+        if (apConfigSeen) {
+            opDone();
+            return;
+        }
+        apWaitActive = true;
+        handler.postDelayed(() -> {
+            if (!apWaitActive) return;
+            apWaitActive = false;
+            Log.w(TAG, "AP 配置回执超时，继续读取 SSID/密码");
+            opDone();
+        }, AP_CONFIG_TIMEOUT_MS);
+    }
+
+    /**
+     * 官方 B.a()：IP/BSSID/SSID/密码/安全类型五项齐了，才写 {@code 0001000A {1}}
+     * 表示交接就绪；写入成功后在 onCharacteristicWrite 里发 START。
+     */
+    private void confirmAndStart(BluetoothGatt gatt) {
+        if (finished) return;
+        if (cameraIp == null || handoverSsid == null || handoverPassword == null
+                || securityTypes == null) {
+            fail("相机没有返回完整的 Wi‑Fi 参数");
+            return;
+        }
+        if (sessionCmdCharacteristic == null) {
+            startHandover(gatt);
+            return;
+        }
+        status("相机 Wi‑Fi 参数就绪，正在启动热点…");
+        write(gatt, sessionCmdCharacteristic, new byte[]{1}, "会话确认");
+    }
+
+    /** 官方 b()：00020001 的头 4 字节含 16 且安全类型列表包含 9，才发带安全类型的 START。 */
+    private boolean supportsSecurityTypeStart() {
+        if (apConfigData == null || apConfigData.length < 4 || securityTypes == null) return false;
+        int capabilities = ByteBuffer.wrap(apConfigData).getInt();
+        return (capabilities & 16) == 16 && securityTypes.contains(9);
     }
 
     /** 官方的其余订阅：遥控(0003)、实时取景(0004)、相机状态(0008)。少一个相机都可能不认 START。 */
@@ -662,7 +888,22 @@ public final class CanonBleHandover {
 
     private void opDone() {
         opInFlight = false;
+        // 每完成一步 GATT 读写都算进展，看门狗重新计时。
+        if (watchdogArmed) armSessionWatchdog();
         runNextOp();
+    }
+
+    /** 已配对设备的会话初始化：20s 没有任何进展就判相机蓝牙卡死，不再陪跑到 90s。 */
+    private void armSessionWatchdog() {
+        handler.removeCallbacks(sessionProgressTimeout);
+        if (!finished && !ready) {
+            handler.postDelayed(sessionProgressTimeout, SESSION_PROGRESS_TIMEOUT_MS);
+        }
+    }
+
+    private void disarmSessionWatchdog() {
+        watchdogArmed = false;
+        handler.removeCallbacks(sessionProgressTimeout);
     }
 
     private void read(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, String label) {
@@ -723,29 +964,58 @@ public final class CanonBleHandover {
             fail("相机的蓝牙交接通道不可用");
             return;
         }
+        // 官方 b()：能力位含 16 且安全类型支持 9 才发 START_WITH_SECURITY_TYPE，否则发普通 START。
+        boolean secure = supportsSecurityTypeStart();
+        byte[] payload = secure ? new byte[]{4, 0, 0, 0, 9} : new byte[]{1};
         try {
             cpCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-            // 官方支持 START_WITH_SECURITY_TYPE(0x04)+int：安全类型 9（WPA2）。
-            // 之前只发 START(0x01)，相机回 GATT 0 却不开 AP，改发带安全类型的命令。
-            cpCharacteristic.setValue(new byte[]{4, 0, 0, 0, 9});
+            cpCharacteristic.setValue(payload);
             boolean ok = gatt.writeCharacteristic(cpCharacteristic);
-            Log.i(TAG, "写 START_WITH_SECURITY_TYPE(4,9) 到 WAP CP ok=" + ok);
-            if (!ok) handoverAccepted = false;
+            Log.i(TAG, "写 START(" + (secure ? "4,9" : "1") + ") 到 WAP CP ok=" + ok);
+            if (ok) {
+                wifiStartRequested = true;
+                handler.postDelayed(startStatusFallback, START_STATUS_TIMEOUT_MS);
+            } else {
+                handoverAccepted = false;
+                opDone();
+            }
         } catch (Exception error) {
             Log.w(TAG, "写 START 异常", error);
             handoverAccepted = false;
+            opDone();
         }
     }
 
     private void handleNotification(BluetoothGattCharacteristic characteristic, byte[] value) {
         if (finished || value == null || value.length == 0) return;
+        // 收到相机任何通知都算进展，看门狗重新计时。
+        if (watchdogArmed) armSessionWatchdog();
         Log.i(TAG, "notify " + characteristic.getUuid() + " " + hex(value));
+        if (CHAR_SESSION_PAIR.equals(characteristic.getUuid())) {
+            // 官方：相机回 [2] 表示 App 名注册完成，之后才读 0001000B。
+            if ((value[0] & 0xff) == 2) {
+                pairAckSeen = true;
+                if (pairWaitActive) {
+                    pairWaitActive = false;
+                    opDone();
+                }
+            }
+            return;
+        }
+        if (CHAR_SESSION_IND.equals(characteristic.getUuid())) {
+            handleSessionIndication(value);
+            return;
+        }
         if (CHAR_WAP_STATUS.equals(characteristic.getUuid())) {
             if (value.length < 2) return;
+            int code = value[0] & 0xff;
             int subCode = value[1] & 0xff;
-            if (subCode == 3) {
+            // 官方：Code=1 才是 WAP 状态；SubCode 3=开始成功，4/5=被拒绝。
+            if (code == 1 && subCode == 3) {
+                handler.removeCallbacks(startStatusFallback);
                 status("相机已开始开启 Wi‑Fi…");
-            } else if (subCode == 4 || subCode == 5) {
+                finishHandover();
+            } else if (code == 1 && (subCode == 4 || subCode == 5)) {
                 fail("相机拒绝了 Wi‑Fi 唤醒请求");
             }
             return;
@@ -753,12 +1023,68 @@ public final class CanonBleHandover {
         if (!CHAR_WAP_CP.equals(characteristic.getUuid())) return;
         // 相机回包前 2 字节是头（实测 0x7F 0x10），后面才是 TLV；IP/BSSID 为小端序。
         parseTlv(value, 2);
-        if (cameraIp != null && handoverSsid != null && handoverPassword != null) {
-            finishHandover();
+        apConfigSeen = true;
+        if (apWaitActive) {
+            apWaitActive = false;
+            opDone();
         }
-        if (cameraIp != null && handoverSsid == null) {
-            readSsid(gatt);
+    }
+
+    /**
+     * 官方对 0001000C 指示的解析：
+     * 1/2 = 机型名两段，3 = 电量，4 = 错误码，5 = 设备信息列表，7 = 会话类型/状态。
+     */
+    private void handleSessionIndication(byte[] value) {
+        int type = value[0] & 0xff;
+        if (type == 1) {
+            modelName1 = asciiFrom(value, 1);
+        } else if (type == 2) {
+            modelName2 = asciiFrom(value, 1);
+        } else if (type == 3) {
+            if (value.length > 1) batteryLevel = value[1] & 0xff;
+        } else if (type == 4) {
+            if (value.length >= 5) {
+                int code = ByteBuffer.wrap(value, 1, 4).getInt();
+                if (code != 1) status("相机状态异常（" + code + "）");
+            }
+        } else if (type == 5) {
+            Log.i(TAG, "device info list bytes=" + value.length);
+        } else if (type == 7) {
+            if (value.length > 1) cameraState = value[1] & 0xff;
         }
+        maybeLogSessionReady();
+    }
+
+    /** 官方 T.a()：0001000B 要求的机型名/电量/会话状态都到齐后，会话才算就绪。 */
+    private void maybeLogSessionReady() {
+        if (sessionReadyLogged) return;
+        if ((sessionFlags & 8) != 0 && (modelName1 == null || modelName2 == null)) return;
+        if ((sessionFlags & 16) != 0 && batteryLevel < 0) return;
+        if ((sessionFlags & 512) != 0 && cameraState < 0) return;
+        sessionReadyLogged = true;
+        String model = ((modelName1 == null ? "" : modelName1)
+                + (modelName2 == null ? "" : modelName2)).trim();
+        Log.i(TAG, "session ready model=" + model + " battery=" + batteryLevel
+                + " state=" + cameraState);
+        if (!model.isEmpty()) status("相机：" + model);
+    }
+
+    private static java.util.List<Integer> parseSecurityTypes(byte[] value) {
+        if (value == null || value.length < 4) return null;
+        int count = value.length / 4;
+        java.util.List<Integer> types = new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            types.add(ByteBuffer.wrap(value, i * 4, 4).getInt());
+        }
+        return types;
+    }
+
+    private static String asciiFrom(byte[] value, int from) {
+        if (value == null || value.length <= from) return "";
+        String text = new String(value, from, value.length - from, StandardCharsets.US_ASCII);
+        int end = text.indexOf('\0');
+        if (end >= 0) text = text.substring(0, end);
+        return text.trim();
     }
 
     /** TLV：type、length、payload 连续排列。 */
@@ -788,28 +1114,23 @@ public final class CanonBleHandover {
         }
     }
 
-    private void readSsid(BluetoothGatt gatt) {
-        if (ssidCharacteristic == null) return;
-        try {
-            gatt.readCharacteristic(ssidCharacteristic);
-        } catch (Exception ignored) {
-        }
-    }
-
     private void finishHandover() {
-        if (finished) return;
+        if (finished || ready) return;
         if (cameraIp == null) {
             fail("相机没有返回 Wi‑Fi 地址");
             return;
         }
         Log.i(TAG, "handover OK ssid=" + handoverSsid + " ip=" + cameraIp
                 + " bssid=" + cameraBssid + " wait=" + waitMillis);
-        finished = true;
-        handler.removeCallbacksAndMessages(null);
+        ready = true;
+        handler.removeCallbacks(overallTimeout);
+        disarmSessionWatchdog();
         unregisterBondReceiver();
         status("蓝牙交接完成：" + cameraIp);
         callback.onReady(new Result(handoverSsid, handoverPassword, cameraIp,
                 cameraBssid, waitMillis));
+        // 会话期间保持 BLE 有心跳：官方在 Wi‑Fi 连接期间 BLE 也一直在线。
+        handler.postDelayed(sessionKeepAlive, SESSION_KEEPALIVE_MS);
     }
 
     private static String ascii(BluetoothGattCharacteristic characteristic) {
@@ -836,9 +1157,11 @@ public final class CanonBleHandover {
     }
 
     private void fail(String message) {
-        if (finished) return;
+        if (finished || ready) return;
         Log.w(TAG, "FAIL: " + message);
         finished = true;
+        ready = false;
+        disarmSessionWatchdog();
         handler.removeCallbacksAndMessages(null);
         unregisterBondReceiver();
         if (gatt != null) {

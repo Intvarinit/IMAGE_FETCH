@@ -769,8 +769,7 @@ public final class PtpIpTransport implements CameraTransport {
      *
      * @return 本次真正执行时的两步响应码文案（供快门诊断记录）；已在本次会话设置过则返回 {@code null}
      */
-    private String ensureCanonRemoteMode() throws Exception {
-        if (canonRemoteModeReady) return null;
+    private String ensureCanonRemoteMode() throws Exception {        if (canonRemoteModeReady) return null;
         ensureCameraModel();
         // 遥控模式取值按机型分：EOS M 系列 0x15、普通 EOS 1（library.c:9942-9962）。
         // 这两步的响应码不能忽略：若遥控模式没设置成功，后面的释放命令即使回 OK
@@ -790,6 +789,13 @@ public final class PtpIpTransport implements CameraTransport {
         canonRemoteModeReady = true;
         return "0x9114 SetRemoteMode(" + remoteModeText(remoteModeValue) + ") → " + hexCode(remoteMode)
                 + "\n0x9115 SetEventMode(1) → " + hexCode(eventMode);
+    }
+
+    /** 连接后立即进入遥控/事件模式（官方同款），避免相机会话被当作空闲。 */
+    @Override
+    public synchronized void enterRemoteMode() throws Exception {
+        ensureConnected();
+        ensureCanonRemoteMode();
     }
 
     /** 诊断用：遥控模式取值写成 {@code 1} 或 {@code 0x15}。 */

@@ -273,6 +273,12 @@ public final class CameraSessionCoordinator {
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    /**
+     * 心跳独立线程：与 executor 共用时会被整批缩略图/翻页任务堵住，
+     * 实测能出现 40 秒空窗，相机按空闲超时直接关热点。
+     */
+    private final ExecutorService heartbeatExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean heartbeatInFlight = new AtomicBoolean(false);
     private final PtpIpTransport wifiTransport = new PtpIpTransport();
     private final UsbPtpTransport usbTransport;
     /** 当前会话的传输实现；连接前为 null。 */
@@ -384,6 +390,14 @@ public final class CameraSessionCoordinator {
     /** 相机 Wi‑Fi 名称/密码；SSID 为空表示不改网络，沿用系统已连的那条。 */
     private volatile String cameraSsid = "";
     private volatile String cameraPassphrase = "";
+    /** BLE 交接返回的相机 AP BSSID（一次性提示，不影响手动入网）。 */
+    private volatile String cameraBssidHint = "";
+    /**
+     * BLE 交接失败后回退入网的一次性首试时长（毫秒），0 表示常规流程。
+     * 交接没走到 START 时相机不会被唤醒、热点也不会出现，只给一次短等待即可，
+     * 否则用户要干等「25s 首试 + 2s + 25s 自动重试」将近一分钟才看到错误。
+     */
+    private volatile long cameraWifiFallbackTimeoutMs;
     /** 会话期间持有：避免息屏/待机时 Wi‑Fi 无线电休眠导致传输中断。 */
     private final WifiManager wifiManager;
     private WifiManager.WifiLock wifiLock;
@@ -444,14 +458,20 @@ public final class CameraSessionCoordinator {
                 return;
             }
             final long heartbeatGeneration = connectionGeneration;
-            executor.submit(() -> {
+            if (!heartbeatInFlight.compareAndSet(false, true)) {
+                startHeartbeat();
+                return;
+            }
+            heartbeatExecutor.submit(() -> {
                 boolean ok = false;
                 try {
                     ptpIp.probe();
                     ok = true;
-                } catch (Exception ignored) {
-                    // 心跳失败：计入连续失败计数。
+                } catch (Exception error) {
+                    Log.w("ImageFetch", "heartbeat probe failed: " + error);
                 }
+                Log.i("ImageFetch", "heartbeat ok=" + ok);
+                heartbeatInFlight.set(false);
                 final boolean alive = ok;
                 mainHandler.post(() -> {
                     if (!connected || manualDisconnect
@@ -710,6 +730,20 @@ public final class CameraSessionCoordinator {
         void onThumbnail(long handle, byte[] jpeg);
     }
 
+    /** 连接成功后立即进入遥控/事件模式（官方同款），失败不影响后续浏览。 */
+    public void enterRemoteMode() {
+        final PtpOperationService session = operations;
+        if (session == null) return;
+        executor.submit(() -> {
+            try {
+                session.enterRemoteMode();
+                Log.i("ImageFetch", "enterRemoteMode ok");
+            } catch (Exception error) {
+                Log.w("ImageFetch", "enterRemoteMode failed: " + error);
+            }
+        });
+    }
+
     /**
      * 逐张读取缩略图。与其它相机事务共用同一 executor，因此不会与下载/拍摄交错；
      * 命中缓存直接回调。每次调用产生新的 generation，旧批次会被放弃。
@@ -720,11 +754,15 @@ public final class CameraSessionCoordinator {
         final PtpOperationService session = operations;
         if (session == null || items == null || items.isEmpty()) return;
         executor.submit(() -> {
+            Exception firstError = null;
+            int okCount = 0;
+            int emptyCount = 0;
             for (CameraStorage.Item item : items) {
                 if (generation != thumbnailGeneration) return;
                 byte[] cached = thumbnailCache.get(item.handle);
                 if (cached != null) {
                     postThumbnail(generation, callback, item.handle, cached);
+                    okCount++;
                     continue;
                 }
                 byte[] jpeg = null;
@@ -733,13 +771,30 @@ public final class CameraSessionCoordinator {
                     if (read != null && read.length > 0) {
                         jpeg = read;
                         thumbnailCache.put(item.handle, read);
+                        okCount++;
+                    } else {
+                        emptyCount++;
+                        if (emptyCount <= 2) {
+                            Log.w("ImageFetch", "thumbnail empty handle=0x"
+                                    + Long.toHexString(item.handle) + " len="
+                                    + (read == null ? -1 : read.length));
+                        }
                     }
-                } catch (Exception ignored) {
-                    // 单个对象没有缩略图（RAW/视频/机型不支持）属正常，不中断整批。
+                } catch (Exception error) {
+                    // 单个对象没有缩略图（RAW/视频/机型不支持）属正常，不中断整批；
+                    // 记录第一张的失败原因，便于区分「个别对象不支持」和「整批都失败」。
+                    if (firstError == null) {
+                        firstError = error;
+                        Log.w("ImageFetch", "thumbnail failed handle=0x"
+                                + Long.toHexString(item.handle) + " -> " + error);
+                    }
                 }
                 if (generation != thumbnailGeneration) return;
                 postThumbnail(generation, callback, item.handle, jpeg);
             }
+            Log.i("ImageFetch", "thumbnails ok=" + okCount + " empty=" + emptyCount
+                    + " total=" + items.size()
+                    + (firstError == null ? "" : " firstError=" + firstError));
         });
     }
 
@@ -1113,6 +1168,13 @@ public final class CameraSessionCoordinator {
     }
 
     private void closeCurrentTransport() {
+        // 解除进程与相机网络的绑定，避免会话结束后所有请求继续走无互联网的相机 AP。
+        if (connectivityManager != null) {
+            try {
+                connectivityManager.bindProcessToNetwork(null);
+            } catch (Exception ignored) {
+            }
+        }
         closeQuietly(transport);
     }
 
@@ -1246,6 +1308,7 @@ public final class CameraSessionCoordinator {
         unregisterSpecifierCallback();
         releaseWifiLock();
         executor.shutdownNow();
+        heartbeatExecutor.shutdownNow();
     }
 
     public void cancelCurrent() {
@@ -2554,6 +2617,23 @@ public final class CameraSessionCoordinator {
     }
 
     /**
+     * 本次入网要钉住的 BSSID。BLE 交接会直接返回相机 AP 的 BSSID（系统对 App 隐藏了
+     * 当前热点 BSSID，读不到），官方也用这个值 {@code setBssid}，避免隐藏 SSID 只靠
+     * 定向探测匹配不稳。传空串表示不额外指定。
+     */
+    public void setCameraWifiBssid(String bssid) {
+        cameraBssidHint = bssid == null ? "" : bssid.trim();
+    }
+
+    /**
+     * BLE 交接失败后的回退入网：只做一次短等待，不做「超时后再请求一次」的自动重试。
+     * 传 0 或负数恢复正常流程（25s 首试 + 自动重试）。一次性，入网时消费掉。
+     */
+    public void setCameraWifiFallbackTimeout(long timeoutMillis) {
+        cameraWifiFallbackTimeoutMs = Math.max(0L, timeoutMillis);
+    }
+
+    /**
      * 是否用 {@link WifiNetworkSpecifier} 精确加入相机 AP（纯函数，便于契约测试）：
      * 仅 SDK 29+ 且填写了非空 SSID 时才走系统对话框，低版本 / 留空回退自动选网。
      */
@@ -2586,26 +2666,35 @@ public final class CameraSessionCoordinator {
             listener.onStatus("正在加入相机 Wi‑Fi「" + cameraSsid + "」…");
             // 先清掉上一次会话可能残留的回调/闸门，再武装本次的闸门。
             unregisterSpecifierCallback();
-            boolean pinBssid = rememberedBssid(cameraSsid) != null;
+            // 优先用 BLE 交接刚返回的 BSSID，其次用上次成功记录里的；都没有就不钉。
+            String pinnedBssid = cameraBssidHint.isEmpty()
+                    ? rememberedBssid(cameraSsid) : cameraBssidHint;
+            boolean pinBssid = pinnedBssid != null;
+            // BLE 交接失败后的回退：热点大概率不存在，一次性短等待，不做第二轮自动重试。
+            long fallbackTimeout = cameraWifiFallbackTimeoutMs;
+            cameraWifiFallbackTimeoutMs = 0L;
+            boolean quickFallback = fallbackTimeout > 0L;
             long attemptStartedAt = System.currentTimeMillis();
             Network joined = requestAndAwaitSpecifier(
-                    false, pinBssid, true, SPECIFIER_TIMEOUT_MS);
+                    false, pinnedBssid, true,
+                    quickFallback ? fallbackTimeout : SPECIFIER_TIMEOUT_MS);
             // 荣耀在无互联网热点上经常不回调 onUnavailable，只把「找不到设备」挂在系统弹窗里。
             // 超时后自动用同样参数再请求一次，避免用户手动点「重试」。
-            if (joined == null && connectAttemptActive(generation, reconnect)) {
+            if (joined == null && !quickFallback && connectAttemptActive(generation, reconnect)) {
                 unregisterSpecifierCallback();
                 sleepQuietly(2000L);
                 if (!connectAttemptActive(generation, reconnect)) return;
                 listener.onStatus("未扫到相机 Wi‑Fi，自动重试…");
                 attemptStartedAt = System.currentTimeMillis();
                 joined = requestAndAwaitSpecifier(
-                        false, pinBssid, true, SPECIFIER_TIMEOUT_MS);
+                        false, pinnedBssid, true, SPECIFIER_TIMEOUT_MS);
                 android.util.Log.i("ImageFetch", "specifier auto-retry created=" + (joined != null));
             }
-            boolean retryable = specifierRejected
+            boolean retryable = !quickFallback && specifierRejected
                     && System.currentTimeMillis() - attemptStartedAt <= SPECIFIER_FAST_FAIL_MS;
             android.util.Log.i("ImageFetch", "specifier attempt1 pin=" + pinBssid
-                    + " created=" + (joined != null) + " retryable=" + retryable);
+                    + " created=" + (joined != null) + " retryable=" + retryable
+                    + " quickFallback=" + quickFallback);
             if (joined == null && pinBssid && retryable
                     && connectAttemptActive(generation, reconnect)) {
                 // 上次记下的 BSSID 可能已经变了：去掉限定再试，别被旧热点拖死。
@@ -2613,7 +2702,7 @@ public final class CameraSessionCoordinator {
                 listener.onStatus("未加入相机 Wi‑Fi，换用不限定热点重试…");
                 attemptStartedAt = System.currentTimeMillis();
                 joined = requestAndAwaitSpecifier(
-                        false, false, false, SPECIFIER_RETRY_TIMEOUT_MS);
+                        false, null, false, SPECIFIER_RETRY_TIMEOUT_MS);
                 retryable = specifierRejected
                         && System.currentTimeMillis() - attemptStartedAt <= SPECIFIER_FAST_FAIL_MS;
                 android.util.Log.i("ImageFetch", "specifier attempt2 created=" + (joined != null)
@@ -2625,7 +2714,7 @@ public final class CameraSessionCoordinator {
                 listener.onStatus("未加入相机 Wi‑Fi，按隐藏热点重试…");
                 attemptStartedAt = System.currentTimeMillis();
                 joined = requestAndAwaitSpecifier(
-                        false, false, true, SPECIFIER_RETRY_TIMEOUT_MS);
+                        false, null, true, SPECIFIER_RETRY_TIMEOUT_MS);
                 retryable = specifierRejected
                         && System.currentTimeMillis() - attemptStartedAt <= SPECIFIER_FAST_FAIL_MS;
                 android.util.Log.i("ImageFetch", "specifier attempt3(hidden) created="
@@ -2635,12 +2724,20 @@ public final class CameraSessionCoordinator {
                     && connectAttemptActive(generation, reconnect)) {
                 unregisterSpecifierCallback();
                 listener.onStatus("WPA2 未加入，改用 WPA3 重试…");
-                joined = requestAndAwaitSpecifier(true, false, true, SPECIFIER_RETRY_TIMEOUT_MS);
+                joined = requestAndAwaitSpecifier(true, null, true, SPECIFIER_RETRY_TIMEOUT_MS);
             }
             if (joined != null) {
                 // cameraWifiNetwork 已由 onAvailable 置好；这里只补会话绑定与 socket 工厂。
                 sessionNetwork = joined;
                 active.setSocketFactory(joined.getSocketFactory());
+                // 官方在同一位置把整个进程绑定到相机网络：既保证后续请求都走相机 AP，
+                // 也避免系统把这条「无互联网」的临时网络当空闲会话回收。
+                if (connectivityManager != null) {
+                    try {
+                        connectivityManager.bindProcessToNetwork(joined);
+                    } catch (Exception ignored) {
+                    }
+                }
                 // 入网成功不等于路由/DHCP 已就绪：给相机网络栈一点时间再发 PTP/IP 握手。
                 sleepQuietly(WIFI_JOIN_SETTLE_MS);
                 return;
@@ -2658,12 +2755,12 @@ public final class CameraSessionCoordinator {
 
     /** 发起一次入网请求并等结果（executor 线程阻塞）；失败返回 null。 */
     private Network requestAndAwaitSpecifier(
-            boolean useWpa3, boolean pinBssid, boolean hidden, long timeoutMillis) {
+            boolean useWpa3, String bssid, boolean hidden, long timeoutMillis) {
         CountDownLatch latch = new CountDownLatch(1);
         specifierResult.set(null);
         specifierRejected = false;
         specifierLatch = latch;
-        mainHandler.post(() -> requestSpecifierNetwork(latch, useWpa3, pinBssid, hidden));
+        mainHandler.post(() -> requestSpecifierNetwork(latch, useWpa3, bssid, hidden));
         Network joined = awaitSpecifierNetwork(latch, timeoutMillis);
         specifierLatch = null;
         return joined;
@@ -2679,7 +2776,7 @@ public final class CameraSessionCoordinator {
 
     /** 弹出系统「加入相机 Wi‑Fi」对话框并发起请求；必须在主线程调用。 */
     private void requestSpecifierNetwork(
-            CountDownLatch latch, boolean useWpa3, boolean pinBssid, boolean hidden) {
+            CountDownLatch latch, boolean useWpa3, String bssidToPin, boolean hidden) {
         ConnectivityManager manager = connectivityManager;
         if (manager == null || manualDisconnect) {
             latch.countDown();
@@ -2740,10 +2837,9 @@ public final class CameraSessionCoordinator {
             }
             // 记住过 BSSID 时钉住热点：同名的多个 AP 不会被系统挑错。三星机型跳过——
             // 官方实现也这么做，部分三星设备带 BSSID 的 specifier 会直接失败。
-            String bssid = pinBssid ? rememberedBssid(cameraSsid) : null;
-            if (bssid != null && !"samsung".equalsIgnoreCase(Build.MANUFACTURER)) {
+            if (bssidToPin != null && !"samsung".equalsIgnoreCase(Build.MANUFACTURER)) {
                 try {
-                    specifier.setBssid(MacAddress.fromString(bssid));
+                    specifier.setBssid(MacAddress.fromString(bssidToPin));
                 } catch (Exception badBssid) {
                     // 记忆值损坏时忽略即可：不钉 BSSID 也能入网。
                 }
@@ -2763,7 +2859,8 @@ public final class CameraSessionCoordinator {
         try {
             // 不给系统设短超时：相机 AP 起得慢时由应用侧看门狗兜底，避免误判失败。
             android.util.Log.i("ImageFetch", "requestNetwork hidden=" + hidden
-                    + " pin=" + pinBssid + " ssid=" + cameraSsid
+                    + " pin=" + (bssidToPin != null) + " bssid=" + bssidToPin
+                    + " ssid=" + cameraSsid
                     + " passLen=" + cameraPassphrase.length());
             manager.requestNetwork(request, callback);
         } catch (Exception ignored) {

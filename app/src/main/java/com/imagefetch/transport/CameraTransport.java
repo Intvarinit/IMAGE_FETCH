@@ -116,6 +116,14 @@ public interface CameraTransport extends Closeable {
     }
 
     /**
+     * 进入机身遥控/事件模式（Canon：SetRemoteMode + SetEventMode(1)）。
+     * 官方在连上后立即进入；不进入时相机可能把会话当空闲并关闭 Wi‑Fi。
+     * 不支持的传输保持默认空实现。
+     */
+    default void enterRemoteMode() throws Exception {
+    }
+
+    /**
      * 半按再松开快门以唤醒相机的取景管线（不拍照）。取景长时间收不到帧时由上层调用；
      * 不支持的传输实现保持默认（抛 UnsupportedOperationException）。
      */

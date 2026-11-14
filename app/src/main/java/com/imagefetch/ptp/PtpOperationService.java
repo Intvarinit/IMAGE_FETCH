@@ -71,6 +71,11 @@ public final class PtpOperationService {
         transport.invalidateStorageCache();
     }
 
+    /** 进入机身遥控/事件模式；官方连上后立即执行。 */
+    public void enterRemoteMode() throws Exception {
+        transport.enterRemoteMode();
+    }
+
     public byte[] thumbnail(long handle) throws Exception {
         return transport.getStorageThumbnail(handle);
     }

@@ -106,11 +106,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private static final int REQUEST_PICK_STACK = 0x74;
 
     /**
-     * BLE 交接开关。官方会话初始化（service 00010000 的 0001000B / 00010006）尚未补齐，
-     * 现在直接对 WAP 服务（00020000）开通知/写 START 会让 EOS RP 报 Err 70，
-     * 所以默认关闭，只用已保存的 Wi-Fi 凭据连接；等 P0 初始化序列实现并验证后再打开。
+     * BLE 交接开关。已按官方顺序补齐会话初始化：00010006 写 App 名等回执 [2]、读 0001000B、
+     * 身份三连写（UUID/昵称/类型）、REQUEST_AP_CONFIG、按能力位选择 START。
+     * 打开后连接会先走蓝牙唤醒相机热点；出问题可随时改回 false 只走已保存的 Wi-Fi 凭据。
      */
-    private static final boolean BLE_HANDOVER_ENABLED = false;
+    private static final boolean BLE_HANDOVER_ENABLED = true;
+
+    /**
+     * BLE 交接在 START 之前就失败（蓝牙关闭、扫不到广播）：相机根本没被要求开热点，
+     * 回退入网只给一次短等待，避免「25s + 2s + 25s」干等一分钟。
+     */
+    private static final long BLE_FAILED_QUICK_SPECIFIER_TIMEOUT_MS = 12_000L;
+    /** BLE 交接在 START 之后失败：热点可能已在启动，按常规首试时长等一次，仍不做自动重试。 */
+    private static final long BLE_FAILED_STARTED_SPECIFIER_TIMEOUT_MS = 25_000L;
 
     private static final String PREFS_NAME = "image_fetch_prefs";
     private static final String PREF_EXPORT_TO_GALLERY = "export_to_gallery";
@@ -133,6 +141,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private SharedPreferences preferences;
     private EditText hostField;
     private EditText portField;
+    /**
+     * 程序自动回填进地址框的相机 IP（发现相机时写入）。断开后这个值还留在框里，
+     * 但它不是用户手填的——连接时不能因为「框里有字」就跳过 BLE 交接，
+     * 否则相机会话结束后热点已关，Specifier 只会干等一个不存在的网络。
+     */
+    private String autoFilledHost = "";
     /**
      * 相机 Wi‑Fi 凭据只持久化、不在界面上显示：用户到系统 Wi‑Fi 页面自己选网，
      * 名称回来后自动记下。为空表示不改网络，仍用系统已连上的那条。
@@ -1554,6 +1568,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             if (address == null || address.trim().isEmpty()) return;
             if (!address.equals(hostField.getText().toString().trim())) {
+                autoFilledHost = address;
                 hostField.setText(address);
                 hostField.setSelection(hostField.getText().length());
             }
@@ -1573,15 +1588,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                     this, getString(R.string.session_text_connected, cameraName));
             // 主流程：连上就读卡并显示图片栏第一页。
             fullScanMode = false;
+            // 官方连上后立即进遥控/事件模式：既让相机保持活跃，也便于后续取景/快门。
+            coordinator.enterRemoteMode();
             goToPage(0);
             // Wi‑Fi 会话连上后，把实际所用的网络名称/密码/BSSID 记成「上一次成功连接」。
             if (wifiSession) {
                 writeBackCameraAddress();
                 persistSuccessfulWifiRecord();
             }
-            // P0 能力探测（只读）：连接后立刻跑一次，结果落进状态栏的菜单里。
-            // 刻意放在开取景之前：探测要独占命令通道，与取景帧循环抢锁会互相拖慢。
-            coordinator.probeVendorCapabilities(false);
+            // 能力探测只在用户显式查看时执行：它会长时间占用 PTP 传输层的锁，
+            // 自动执行会把 5 秒心跳堵到 40 秒以上，相机按空闲超时直接关热点。
         });
     }
 
@@ -3279,10 +3295,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         coordinator.loadThumbnails(items, (handle, jpeg) -> {
             // 一页最多 100 张，解码全部放主线程会和相机结果回调抢同一个消息队列。
             if (isDestroyed()) return;
+            if (jpeg == null) {
+                android.util.Log.w("ImageFetch", "thumbnail callback null handle=0x"
+                        + Long.toHexString(handle));
+                return;
+            }
             thumbnailExecutor.submit(() -> {
                 Bitmap bitmap = PhotoGridAdapter.decodeJpeg(
                         jpeg, PhotoGridAdapter.THUMBNAIL_TARGET_PX);
-                if (bitmap == null) return;
+                if (bitmap == null) {
+                    android.util.Log.w("ImageFetch", "thumbnail decode failed handle=0x"
+                            + Long.toHexString(handle) + " bytes=" + jpeg.length);
+                    return;
+                }
                 runOnUiThread(() -> {
                     if (generation != gridGeneration) {
                         bitmap.recycle();
@@ -3618,7 +3643,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         }
         if (!permissionAlreadyRequested) {
             // 只有「地址留空」才需要蓝牙（BLE 交接）；手填地址时只补加入 Wi‑Fi 的权限。
-            boolean includeBle = hostField.getText().toString().trim().isEmpty();
+            boolean includeBle = manualHost().isEmpty();
             String[] missing = missingConnectPermissions(includeBle);
             if (missing.length > 0) {
                 pendingWifiConnect = true;
@@ -3635,7 +3660,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
      * 「已连相机 Wi‑Fi + 自动发现 IP」。
      */
     private void beginBleThenConnect(int port) {
-        String typedHost = hostField.getText().toString().trim();
+        String typedHost = manualHost();
         String storedSsid = preferences.getString(PREF_CAMERA_SSID, "");
         String storedPassword = preferences.getString(PREF_CAMERA_PASSWORD, "");
         if (!typedHost.isEmpty() || !BLE_HANDOVER_ENABLED || !hasBlePermissions()) {
@@ -3653,36 +3678,40 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
             @Override public void onReady(CanonBleHandover.Result result) {
                 runOnUiThread(() -> {
-                    bleHandover = null;
-                    // 交接到的 SSID/密码落盘：下次即使蓝牙不可用也能直接入网。
-                    if (result.ssid != null && !result.ssid.isEmpty()) {
-                        preferences.edit().putString(PREF_CAMERA_SSID, result.ssid).apply();
-                    }
-                    if (result.password != null && !result.password.isEmpty()) {
-                        preferences.edit().putString(PREF_CAMERA_PASSWORD, result.password).apply();
-                    }
-                    // 相机要求等 AP 真正起来（WTIME）再入网；再多给 1.5s 让系统扫描缓存刷新。
-                    long wait = Math.max(800L, result.waitMillis) + 1500L;
+                    // 保留 bleHandover：交接完成后仍要靠它维持 BLE 会话保活，
+                    // 断开/退出时由 cancelBleHandover() 统一关闭。
+                    // 交接拿到的是「相机将要使用」的参数，先只用于本次入网；
+                    // 真正连上 PTP 后由 persistSuccessfulWifiRecord 落盘，失败不覆盖上次成功记录。
+                    // 相机要求等 AP 真正起来（WTIME）再入网；实测热点可见比 WTIME 还慢，
+                    // 再多给 8s，避免第一次扫描窗口扑空后一路重试失败。
+                    long wait = Math.max(800L, result.waitMillis) + 8000L;
                     statusView.setText(R.string.ble_handover_ready);
                     connectButton.postDelayed(() -> {
                         boolean sameSsid = result.ssid != null && !result.ssid.isEmpty()
                                 && result.ssid.equals(connectedWifiSsid());
                         if (sameSsid) {
                             // 已经在这个 AP 上：不再弹「加入网络」对话框，直接用交接来的 IP。
-                            performWifiConnect(result.ip, port, "", "");
+                            performWifiConnect(result.ip, port, "", "", "");
                         } else {
-                            performWifiConnect(result.ip, port, result.ssid, result.password);
+                            // 官方同样用交接返回的 BSSID 钉住热点；隐藏 SSID 只靠定向探测不稳。
+                            performWifiConnect(result.ip, port, result.ssid, result.password,
+                                    result.bssid);
                         }
                     }, wait);
                 });
             }
 
             @Override public void onFailed(String message) {
+                // 交接有没有走到 START，决定回退入网给多长等待：没走到 START 时相机不会开热点。
+                boolean startRequested = bleHandover != null && bleHandover.isWifiStartRequested();
+                long fallbackTimeout = startRequested
+                        ? BLE_FAILED_STARTED_SPECIFIER_TIMEOUT_MS
+                        : BLE_FAILED_QUICK_SPECIFIER_TIMEOUT_MS;
                 runOnUiThread(() -> {
                     bleHandover = null;
                     statusView.setText(message + "，改用已保存的 Wi‑Fi 直连…");
                     // 回退必须带上已保存的 SSID/密码，否则带密码的相机热点永远进不去。
-                    performWifiConnect("", port, storedSsid, storedPassword);
+                    performWifiConnect("", port, storedSsid, storedPassword, "", fallbackTimeout);
                 });
             }
         });
@@ -3698,6 +3727,22 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 真正发起 Wi‑Fi 连接；填了 SSID 时由协调器尝试加入，失败会自行回退自动选网。 */
     private void performWifiConnect(String host, int port, String ssid, String password) {
+        performWifiConnect(host, port, ssid, password, "");
+    }
+
+    /** @param bssid BLE 交接返回的相机 AP BSSID；非空时入网会钉住它（官方同样做法）。 */
+    private void performWifiConnect(
+            String host, int port, String ssid, String password, String bssid) {
+        performWifiConnect(host, port, ssid, password, bssid, 0L);
+    }
+
+    /**
+     * @param fallbackSpecifierTimeoutMs BLE 交接失败后的回退入网：只做一次指定时长的 Specifier
+     *     尝试、不做自动重试。0 表示常规流程（25s 首试 + 自动重试）。
+     */
+    private void performWifiConnect(
+            String host, int port, String ssid, String password, String bssid,
+            long fallbackSpecifierTimeoutMs) {
         // BLE 交接完成与自动连接可能几乎同时触发；重复发起会取消系统入网请求。
         if (coordinator.isConnecting()) {
             android.util.Log.i("ImageFetch", "skip duplicate wifi connect");
@@ -3705,10 +3750,13 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         }
         android.util.Log.i("ImageFetch", "performWifiConnect host=" + host
                 + " ssid=" + (ssid == null || ssid.isEmpty() ? "(none)" : ssid)
-                + " passLen=" + (password == null ? 0 : password.length()));
+                + " passLen=" + (password == null ? 0 : password.length())
+                + " fallbackTimeout=" + fallbackSpecifierTimeoutMs);
         pendingWifiSsid = ssid == null ? "" : ssid;
         pendingWifiPassword = password == null ? "" : password;
+        coordinator.setCameraWifiBssid(bssid);
         coordinator.setCameraWifiCredentials(ssid, password);
+        coordinator.setCameraWifiFallbackTimeout(fallbackSpecifierTimeoutMs);
         wifiSession = true;
         setBusy(true);
         updateConnectButton(false);
@@ -3863,6 +3911,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                     dialog.dismiss();
                     autoConnectSuppressed = false;
                     autoConnectLastNetwork = null;
+                    // 选中的是「上次成功连接」的相机热点：断开后相机通常已把热点关掉，
+                    // 直接 Specifier 会一直等不到；先走 BLE 交接让相机重开热点，
+                    // 交接失败会回退到已保存凭据直连（见 beginBleThenConnect）。
+                    String lastSsid = preferences.getString(PREF_CAMERA_SSID, "");
+                    if (BLE_HANDOVER_ENABLED && hasBlePermissions()
+                            && !lastSsid.isEmpty() && lastSsid.equals(ssid)) {
+                        beginBleThenConnect(port);
+                        return;
+                    }
                     performWifiConnect("", port, ssid, password);
                 }));
         dialog.show();
@@ -3981,8 +4038,18 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         String address = coordinator.cameraAddress();
         if (address == null || address.trim().isEmpty()) return;
         if (address.equals(hostField.getText().toString().trim())) return;
+        autoFilledHost = address;
         hostField.setText(address);
         hostField.setSelection(hostField.getText().length());
+    }
+
+    /**
+     * 用户手填的相机地址。自动回填的那个 IP 不算：它只是上次连接留下的痕迹，
+     * 断开后相机热点已关，拿它当「手填地址」会跳过 BLE 交接、干等一个不存在的网络。
+     */
+    private String manualHost() {
+        String typed = hostField.getText().toString().trim();
+        return typed.equals(autoFilledHost) ? "" : typed;
     }
 
     /** 系统当前所连 Wi‑Fi 的名称；读不到时返回空串（原样带引号的系统格式会去掉引号）。 */
