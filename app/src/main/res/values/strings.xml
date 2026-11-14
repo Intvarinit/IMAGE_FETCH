@@ -71,7 +71,6 @@
     <string name="camera_wifi_password_hint">相机 Wi&#8209;Fi 密码</string>
     <string name="camera_wifi_save">保存并连接</string>
     <string name="camera_wifi_open_settings">系统设置里选网</string>
-    <string name="camera_wifi_saved">已记住相机 Wi&#8209;Fi「%1$s」，正在连接…</string>
     <string name="camera_ssid_required">请先填写相机 Wi&#8209;Fi 名称。</string>
     <string name="session_notification_title">IMAGE_FETCH</string>
     <string name="session_notification_idle">相机会话进行中</string>

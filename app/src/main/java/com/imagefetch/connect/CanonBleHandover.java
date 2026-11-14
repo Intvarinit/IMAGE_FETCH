@@ -52,22 +52,45 @@ public final class CanonBleHandover {
 
     private static final UUID SERVICE_SESSION =
             UUID.fromString("00010000-0000-1000-0000-d8492fffa821");
+    private static final UUID CHAR_SESSION_STATE =
+            UUID.fromString("00010005-0000-1000-0000-d8492fffa821");
+    private static final UUID CHAR_SESSION_PAIR =
+            UUID.fromString("00010006-0000-1000-0000-d8492fffa821");
+    /** 会话指令：官方在交接就绪后向它写 {1} 表示会话确认，然后才发 START。 */
+    private static final UUID CHAR_SESSION_CMD =
+            UUID.fromString("0001000a-0000-1000-0000-d8492fffa821");
+    private static final UUID CHAR_SESSION_INIT =
+            UUID.fromString("0001000b-0000-1000-0000-d8492fffa821");
+    private static final UUID CHAR_SESSION_IND =
+            UUID.fromString("0001000c-0000-1000-0000-d8492fffa821");
     private static final UUID SERVICE_WAP =
             UUID.fromString("00020000-0000-1000-0000-d8492fffa821");
+    private static final UUID CHAR_WAP_AP_CONFIG =
+            UUID.fromString("00020001-0000-1000-0000-d8492fffa821");
     private static final UUID CHAR_WAP_CP =
             UUID.fromString("00020002-0000-1000-0000-d8492fffa821");
     private static final UUID CHAR_WAP_STATUS =
             UUID.fromString("00020003-0000-1000-0000-d8492fffa821");
     private static final UUID CHAR_WAP_SSID =
             UUID.fromString("00020004-0000-1000-0000-d8492fffa821");
-    private static final UUID CHAR_WAP_PASSWORD =
+    /** 官方映射：00020005 是安全类型位图，00020006 才是密码（反编译确认）。 */
+    private static final UUID CHAR_WAP_SECURITY =
             UUID.fromString("00020005-0000-1000-0000-d8492fffa821");
+    private static final UUID CHAR_WAP_PASSWORD =
+            UUID.fromString("00020006-0000-1000-0000-d8492fffa821");
+    private static final UUID SERVICE_RC =
+            UUID.fromString("00030000-0000-1000-0000-d8492fffa821");
+    private static final UUID SERVICE_LIVE =
+            UUID.fromString("00040000-0000-1000-0000-d8492fffa821");
+    private static final UUID SERVICE_STATUS =
+            UUID.fromString("00080000-0000-1000-0000-d8492fffa821");
     private static final UUID CCCD =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     private static final long SCAN_TIMEOUT_MS = 12_000L;
     private static final long CONNECT_TIMEOUT_MS = 10_000L;
-    private static final long OVERALL_TIMEOUT_MS = 35_000L;
+    /** 首次要等系统配对弹窗由用户确认，整体窗口放宽到 90s。 */
+    private static final long OVERALL_TIMEOUT_MS = 90_000L;
     private static final long MTU_TIMEOUT_MS = 800L;
 
     public interface Callback {
@@ -105,6 +128,21 @@ public final class CanonBleHandover {
     private BluetoothGattCharacteristic statusCharacteristic;
     private BluetoothGattCharacteristic ssidCharacteristic;
     private BluetoothGattCharacteristic passwordCharacteristic;
+    private BluetoothGattCharacteristic sessionInitCharacteristic;
+    private BluetoothGattCharacteristic sessionStateCharacteristic;
+    private BluetoothGattCharacteristic sessionIndCharacteristic;
+    private BluetoothGattCharacteristic sessionPairCharacteristic;
+    private BluetoothGattCharacteristic sessionCmdCharacteristic;
+    private BluetoothGattCharacteristic apConfigCharacteristic;
+    private BluetoothGattCharacteristic securityCharacteristic;
+
+    /**
+     * GATT 同一时刻只能有一个未完成的操作，官方流程也是一步等一步：
+     * 读会话初始化 → 开会话通知/指示 → 读 AP 参数 → 写 START。
+     */
+    private final java.util.ArrayDeque<Runnable> gattOps = new java.util.ArrayDeque<>();
+    private boolean opInFlight;
+    private boolean sessionStarted;
 
     private String cameraIp;
     private String cameraBssid;
@@ -114,8 +152,6 @@ public final class CanonBleHandover {
     private boolean handoverAccepted;
 
     private boolean finished;
-    private int pendingDescriptorWrites;
-    private boolean indicationRetried;
     private BroadcastReceiver bondReceiver;
 
     private final Runnable overallTimeout = () -> fail("蓝牙交接超时：相机没有回应");
@@ -219,6 +255,17 @@ public final class CanonBleHandover {
         return true;
     }
 
+    /** 静默关闭当前 GATT（配对期间断开等场景），不判失败。 */
+    private void closeGattQuietly() {
+        if (gatt == null) return;
+        try {
+            gatt.disconnect();
+            gatt.close();
+        } catch (Exception ignored) {
+        }
+        gatt = null;
+    }
+
     // ── 扫描 ──
 
     private final ScanCallback scanCallback = new ScanCallback() {
@@ -267,6 +314,13 @@ public final class CanonBleHandover {
                     fail("缺少蓝牙连接权限");
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (bondReceiver != null) {
+                    // 配对期间相机可能短暂断开：先不判失败，等 BOND_BONDED
+                    // 回调后用已配对设备重连（见 registerBondReceiver）。
+                    Log.i(TAG, "disconnected while bonding, waiting for bond result");
+                    closeGattQuietly();
+                    return;
+                }
                 fail("相机断开了蓝牙连接（status " + status + "）");
             }
         }
@@ -286,10 +340,20 @@ public final class CanonBleHandover {
                 fail("相机不支持 Wi‑Fi 蓝牙交接");
                 return;
             }
+            BluetoothGattService session = gatt.getService(SERVICE_SESSION);
+            if (session != null) {
+                sessionInitCharacteristic = session.getCharacteristic(CHAR_SESSION_INIT);
+                sessionStateCharacteristic = session.getCharacteristic(CHAR_SESSION_STATE);
+                sessionIndCharacteristic = session.getCharacteristic(CHAR_SESSION_IND);
+                sessionPairCharacteristic = session.getCharacteristic(CHAR_SESSION_PAIR);
+                sessionCmdCharacteristic = session.getCharacteristic(CHAR_SESSION_CMD);
+            }
             cpCharacteristic = wap.getCharacteristic(CHAR_WAP_CP);
             statusCharacteristic = wap.getCharacteristic(CHAR_WAP_STATUS);
             ssidCharacteristic = wap.getCharacteristic(CHAR_WAP_SSID);
             passwordCharacteristic = wap.getCharacteristic(CHAR_WAP_PASSWORD);
+            apConfigCharacteristic = wap.getCharacteristic(CHAR_WAP_AP_CONFIG);
+            securityCharacteristic = wap.getCharacteristic(CHAR_WAP_SECURITY);
             if (cpCharacteristic == null || ssidCharacteristic == null
                     || passwordCharacteristic == null) {
                 fail("相机的蓝牙交接服务不完整");
@@ -301,9 +365,25 @@ public final class CanonBleHandover {
                 return;
             }
             Log.i(TAG, "bondState=" + device.getBondState());
-            // 官方实现只在特定条件下才 createBond；多数机型直接进入会话/交接即可。
-            // 强制配对会让相机断开链路，所以这里先不配对，写失败再回退。
-            enableNotifications(gatt);
+            if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                // P0：相机在接受 WAP 会话前通常要求先完成 BLE 配对（Just Works）。
+                // 先配对，等 BOND_BONDED 后再开通知、写 START。
+                Log.i(TAG, "creating bond before handover");
+                registerBondReceiver(device);
+                boolean started;
+                try {
+                    started = device.createBond();
+                } catch (SecurityException denied) {
+                    fail("缺少蓝牙连接权限，无法配对相机");
+                    return;
+                }
+                if (!started) {
+                    fail("无法发起与相机的蓝牙配对");
+                    return;
+                }
+                return;
+            }
+            requestMtuThenSession(gatt);
         }
 
         @Override public void onDescriptorWrite(
@@ -311,31 +391,21 @@ public final class CanonBleHandover {
             if (finished) return;
             Log.i(TAG, "descriptor " + descriptor.getCharacteristic().getUuid()
                     + " status=" + status);
-            if (status != BluetoothGatt.GATT_SUCCESS && !indicationRetried) {
-                // 有些机型只支持 indication：换一种描述符值再试一次。
-                indicationRetried = true;
-                try {
-                    descriptor.setValue(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
-                    gatt.writeDescriptor(descriptor);
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                String uuid = descriptor.getCharacteristic().getUuid().toString();
+                if (uuid.equals(CHAR_WAP_STATUS.toString())
+                        || uuid.equals(CHAR_WAP_CP.toString())) {
+                    fail("相机拒绝订阅蓝牙特征（" + status + "）");
                     return;
-                } catch (Exception ignored) {
                 }
+                Log.w(TAG, "subscribe failed, continue: " + uuid + " status=" + status);
             }
-            pendingDescriptorWrites--;
-            if (pendingDescriptorWrites > 0) return;
-            // 通知开好后先尝试拉大 MTU：SSID/密码读取可能超过默认 23 字节。
-            try {
-                if (!gatt.requestMtu(512)) startHandover(gatt);
-            } catch (Exception ignored) {
-                startHandover(gatt);
-            }
-            handler.postDelayed(() -> {
-                if (!finished && !handoverAccepted && cameraIp == null) startHandover(gatt);
-            }, MTU_TIMEOUT_MS);
+            opDone();
         }
 
         @Override public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-            if (!finished) startHandover(gatt);
+            Log.i(TAG, "mtu=" + mtu + " status=" + status);
+            if (!finished) startSession(gatt);
         }
 
         @Override public void onCharacteristicWrite(
@@ -347,8 +417,16 @@ public final class CanonBleHandover {
                 return;
             }
             if (CHAR_WAP_CP.equals(characteristic.getUuid())) {
-                status("相机已收到唤醒请求，正在打开 Wi‑Fi…");
+                byte[] value = characteristic.getValue();
+                int opcode = value != null && value.length > 0 ? (value[0] & 0xff) : 0;
+                status("相机已收到蓝牙交接命令（" + opcode + "）…");
+                // START 已被相机接受：参数（IP/SSID/密码）在 {10} 的回包与后续读取里拿齐了。
+                if ((opcode == 1 || opcode == 4) && cameraIp != null
+                        && handoverSsid != null && handoverPassword != null) {
+                    finishHandover();
+                }
             }
+            opDone();
         }
 
         @Override public void onCharacteristicRead(
@@ -357,18 +435,24 @@ public final class CanonBleHandover {
             Log.i(TAG, "read " + characteristic.getUuid() + " status=" + status
                     + " value=" + hex(characteristic.getValue()));
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                if (CHAR_WAP_SSID.equals(characteristic.getUuid())) {
-                    fail("读取相机 Wi‑Fi 名称失败（" + status + "）");
+                if (CHAR_WAP_SSID.equals(characteristic.getUuid())
+                        || CHAR_WAP_PASSWORD.equals(characteristic.getUuid())) {
+                    fail("读取相机 Wi‑Fi 参数失败（" + status + "）");
+                    return;
                 }
+                Log.w(TAG, "read failed, continue: " + characteristic.getUuid()
+                        + " status=" + status);
+                opDone();
                 return;
             }
             if (CHAR_WAP_SSID.equals(characteristic.getUuid())) {
                 handoverSsid = ascii(characteristic);
-                readPassword(gatt);
             } else if (CHAR_WAP_PASSWORD.equals(characteristic.getUuid())) {
                 handoverPassword = ascii(characteristic);
-                finishHandover();
+            } else if (CHAR_WAP_SECURITY.equals(characteristic.getUuid())) {
+                Log.i(TAG, "security type=" + hex(characteristic.getValue()));
             }
+            opDone();
         }
 
         @Override public void onCharacteristicChanged(
@@ -393,7 +477,14 @@ public final class CanonBleHandover {
                 if (changed == null || !changed.getAddress().equals(device.getAddress())) return;
                 if (state == BluetoothDevice.BOND_BONDED) {
                     unregisterBondReceiver();
-                    if (!finished && gatt != null) enableNotifications(gatt);
+                    if (finished) return;
+                    status("蓝牙配对完成，继续交接…");
+                    if (gatt != null) {
+                        requestMtuThenSession(gatt);
+                    } else {
+                        // 配对期间链路被相机断开：用已配对的设备重新连。
+                        connectTo(changed);
+                    }
                 } else if (state == BluetoothDevice.BOND_NONE) {
                     fail("相机蓝牙配对失败");
                 }
@@ -421,27 +512,206 @@ public final class CanonBleHandover {
         }
     }
 
-    private void enableNotifications(BluetoothGatt gatt) {
-        pendingDescriptorWrites = 0;
-        if (statusCharacteristic != null && enableNotification(gatt, statusCharacteristic)) {
-            pendingDescriptorWrites++;
+    /**
+     * 拉大 MTU 后再走会话初始化：SSID/密码可能超过默认 23 字节。
+     * 相机不回 MTU 时按超时兜底，不阻断流程。
+     */
+    private void requestMtuThenSession(BluetoothGatt gatt) {
+        if (sessionStarted || finished) return;
+        try {
+            if (gatt.requestMtu(512)) {
+                handler.postDelayed(() -> {
+                    if (!finished && !sessionStarted) startSession(gatt);
+                }, MTU_TIMEOUT_MS);
+                return;
+            }
+        } catch (Exception ignored) {
         }
-        if (cpCharacteristic != null && enableNotification(gatt, cpCharacteristic)) {
-            pendingDescriptorWrites++;
-        }
-        if (pendingDescriptorWrites == 0) startHandover(gatt);
+        startSession(gatt);
     }
 
-    private boolean enableNotification(
-            BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+    /**
+     * 官方初始化顺序（来自 Camera Connect 反编译）：
+     * 读会话初始化 0001000B → 读 00010005 并开通知 → 开 0001000C 指示 →
+     * 读 00020001 → 00020003 用 indication、00020002 用 notification →
+     * 读 SSID/密码/安全类型 → 最后写 START。
+     */
+    private void startSession(BluetoothGatt gatt) {
+        if (finished || sessionStarted) return;
+        sessionStarted = true;
+        Log.i(TAG, "startSession");
+        if (sessionInitCharacteristic != null) {
+            enqueue(() -> read(gatt, sessionInitCharacteristic, "会话初始化"));
+        }
+        if (sessionPairCharacteristic != null) {
+            // 官方 startPairingSequence：向 00010006 写 [1] + App 名称。
+            // 相机里虽然已有 IMAGE_FETCH，但官方每次建会话仍会重写一次。
+            byte[] name = "IMAGE_FETCH".getBytes(StandardCharsets.US_ASCII);
+            byte[] payload = new byte[name.length + 1];
+            payload[0] = 1;
+            System.arraycopy(name, 0, payload, 1, name.length);
+            enqueue(() -> write(gatt, sessionPairCharacteristic, payload, "App 名注册"));
+        }
+        if (sessionStateCharacteristic != null) {
+            enqueue(() -> read(gatt, sessionStateCharacteristic, "会话状态"));
+            enqueue(() -> enable(gatt, sessionStateCharacteristic, false));
+        }
+        if (sessionIndCharacteristic != null) {
+            enqueue(() -> enable(gatt, sessionIndCharacteristic, true));
+        }
+        if (apConfigCharacteristic != null) {
+            enqueue(() -> read(gatt, apConfigCharacteristic, "AP 配置"));
+        }
+        if (statusCharacteristic != null) {
+            // 官方对 00020003 用的是 indication；用 notification 会被相机拒绝（GATT 133 → Err 70）。
+            enqueue(() -> enable(gatt, statusCharacteristic, true));
+        }
+        if (cpCharacteristic != null) {
+            enqueue(() -> enable(gatt, cpCharacteristic, false));
+        }
+        subscribeAuxServices(gatt);
+        if (cpCharacteristic != null) {
+            // 官方在 START 之前先发 REQUEST_AP_CONFIG(0x0A)，让相机生成 SSID/密码/安全类型；
+            // 直接读会拿到全 0（实测）。
+            enqueue(() -> requestApConfig(gatt));
+            enqueue(() -> handler.postDelayed(this::opDone, 500L));
+        }
+        if (ssidCharacteristic != null) {
+            enqueue(() -> read(gatt, ssidCharacteristic, "SSID"));
+        }
+        if (passwordCharacteristic != null) {
+            enqueue(() -> read(gatt, passwordCharacteristic, "密码"));
+        }
+        if (securityCharacteristic != null) {
+            enqueue(() -> read(gatt, securityCharacteristic, "安全类型"));
+        }
+        if (sessionCmdCharacteristic != null) {
+            // 官方 T.c(Q.SUCCESS)：交接就绪后先写会话确认 {1} 到 0001000A。
+            enqueue(() -> write(gatt, sessionCmdCharacteristic, new byte[]{1}, "会话确认"));
+        }
+        enqueue(() -> startHandover(gatt));
+    }
+
+    /** 官方的其余订阅：遥控(0003)、实时取景(0004)、相机状态(0008)。少一个相机都可能不认 START。 */
+    private void subscribeAuxServices(BluetoothGatt gatt) {
+        BluetoothGattService rc = gatt.getService(SERVICE_RC);
+        if (rc != null) {
+            enqueueRead(gatt, rc, "00030001-0000-1000-0000-d8492fffa821", "遥控状态");
+            enqueueEnable(gatt, rc, "00030001-0000-1000-0000-d8492fffa821", false);
+            enqueueEnable(gatt, rc, "00030002-0000-1000-0000-d8492fffa821", false);
+            enqueueEnable(gatt, rc, "00030011-0000-1000-0000-d8492fffa821", false);
+            enqueueEnable(gatt, rc, "00030021-0000-1000-0000-d8492fffa821", false);
+            enqueueEnable(gatt, rc, "00030031-0000-1000-0000-d8492fffa821", false);
+        }
+        BluetoothGattService live = gatt.getService(SERVICE_LIVE);
+        if (live != null) {
+            enqueueRead(gatt, live, "00040001-0000-1000-0000-d8492fffa821", "取景状态");
+            enqueueRead(gatt, live, "00040003-0000-1000-0000-d8492fffa821", "取景信息");
+            enqueueEnable(gatt, live, "00040003-0000-1000-0000-d8492fffa821", true);
+        }
+        BluetoothGattService status = gatt.getService(SERVICE_STATUS);
+        if (status != null) {
+            enqueueRead(gatt, status, "00080001-0000-1000-0000-d8492fffa821", "机身状态");
+            enqueueEnable(gatt, status, "00080003-0000-1000-0000-d8492fffa821", true);
+            BluetoothGattCharacteristic call = status.getCharacteristic(
+                    UUID.fromString("00080002-0000-1000-0000-d8492fffa821"));
+            if (call != null) {
+                enqueue(() -> write(gatt, call, new byte[]{1}, "状态订阅"));
+            }
+        }
+    }
+
+    private void enqueueRead(
+            BluetoothGatt gatt, BluetoothGattService service, String uuid, String label) {
+        BluetoothGattCharacteristic characteristic = service.getCharacteristic(UUID.fromString(uuid));
+        if (characteristic != null) enqueue(() -> read(gatt, characteristic, label));
+    }
+
+    private void enqueueEnable(
+            BluetoothGatt gatt, BluetoothGattService service, String uuid, boolean indication) {
+        BluetoothGattCharacteristic characteristic = service.getCharacteristic(UUID.fromString(uuid));
+        if (characteristic != null) enqueue(() -> enable(gatt, characteristic, indication));
+    }
+
+    private void write(
+            BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value, String label) {
+        try {
+            characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            characteristic.setValue(value);
+            boolean ok = gatt.writeCharacteristic(characteristic);
+            Log.i(TAG, "write " + label + " ok=" + ok);
+            if (!ok) opDone();
+        } catch (Exception error) {
+            Log.w(TAG, "write failed " + label, error);
+            opDone();
+        }
+    }
+
+    private void enqueue(Runnable op) {
+        gattOps.add(op);
+        runNextOp();
+    }
+
+    private void runNextOp() {
+        if (finished || opInFlight) return;
+        Runnable op = gattOps.poll();
+        if (op == null) return;
+        opInFlight = true;
+        op.run();
+    }
+
+    private void opDone() {
+        opInFlight = false;
+        runNextOp();
+    }
+
+    private void read(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, String label) {
+        try {
+            boolean ok = gatt.readCharacteristic(characteristic);
+            Log.i(TAG, "read request " + label + " ok=" + ok);
+            if (!ok) opDone();
+        } catch (Exception error) {
+            Log.w(TAG, "read request failed: " + label, error);
+            opDone();
+        }
+    }
+
+    private void enable(
+            BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, boolean indication) {
         try {
             gatt.setCharacteristicNotification(characteristic, true);
             BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CCCD);
-            if (descriptor == null) return false;
-            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-            return gatt.writeDescriptor(descriptor);
-        } catch (Exception ignored) {
-            return false;
+            if (descriptor == null) {
+                opDone();
+                return;
+            }
+            descriptor.setValue(indication
+                    ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                    : BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            boolean ok = gatt.writeDescriptor(descriptor);
+            Log.i(TAG, "enable " + characteristic.getUuid() + " indication=" + indication + " ok=" + ok);
+            if (!ok) opDone();
+        } catch (Exception error) {
+            Log.w(TAG, "enable failed " + characteristic.getUuid(), error);
+            opDone();
+        }
+    }
+
+    /** 请求相机生成 AP 参数（SSID/密码/安全类型）。写成功由 onCharacteristicWrite 放行队列。 */
+    private void requestApConfig(BluetoothGatt gatt) {
+        if (finished || cpCharacteristic == null) {
+            opDone();
+            return;
+        }
+        try {
+            cpCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            cpCharacteristic.setValue(new byte[]{10});
+            boolean ok = gatt.writeCharacteristic(cpCharacteristic);
+            Log.i(TAG, "写 REQUEST_AP_CONFIG(0x0A) ok=" + ok);
+            if (!ok) opDone();
+        } catch (Exception error) {
+            Log.w(TAG, "写 REQUEST_AP_CONFIG 异常", error);
+            opDone();
         }
     }
 
@@ -455,9 +725,11 @@ public final class CanonBleHandover {
         }
         try {
             cpCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-            cpCharacteristic.setValue(new byte[]{1});
+            // 官方支持 START_WITH_SECURITY_TYPE(0x04)+int：安全类型 9（WPA2）。
+            // 之前只发 START(0x01)，相机回 GATT 0 却不开 AP，改发带安全类型的命令。
+            cpCharacteristic.setValue(new byte[]{4, 0, 0, 0, 9});
             boolean ok = gatt.writeCharacteristic(cpCharacteristic);
-            Log.i(TAG, "写 START 到 WAP CP ok=" + ok);
+            Log.i(TAG, "写 START_WITH_SECURITY_TYPE(4,9) 到 WAP CP ok=" + ok);
             if (!ok) handoverAccepted = false;
         } catch (Exception error) {
             Log.w(TAG, "写 START 异常", error);
@@ -479,8 +751,11 @@ public final class CanonBleHandover {
             return;
         }
         if (!CHAR_WAP_CP.equals(characteristic.getUuid())) return;
-        if ((value[0] & 0xff) != 16) return; // 0x10 = WAP CP Response
+        // 相机回包前 2 字节是头（实测 0x7F 0x10），后面才是 TLV；IP/BSSID 为小端序。
         parseTlv(value, 2);
+        if (cameraIp != null && handoverSsid != null && handoverPassword != null) {
+            finishHandover();
+        }
         if (cameraIp != null && handoverSsid == null) {
             readSsid(gatt);
         }
@@ -496,12 +771,13 @@ public final class CanonBleHandover {
             int end = start + length;
             if (end > data.length) break;
             if (type == 16 && length >= 4) {
-                cameraIp = (data[start] & 0xff) + "." + (data[start + 1] & 0xff) + "."
-                        + (data[start + 2] & 0xff) + "." + (data[start + 3] & 0xff);
+                // 相机按小端序回传：C0 A8 01 02 → 192.168.1.2
+                cameraIp = (data[start + 3] & 0xff) + "." + (data[start + 2] & 0xff) + "."
+                        + (data[start + 1] & 0xff) + "." + (data[start] & 0xff);
             } else if (type == 2 && length >= 6) {
                 StringBuilder mac = new StringBuilder();
-                for (int i = 0; i < 6; i++) {
-                    if (i > 0) mac.append(':');
+                for (int i = 5; i >= 0; i--) {
+                    if (i < 5) mac.append(':');
                     mac.append(String.format(Locale.ROOT, "%02X", data[start + i] & 0xff));
                 }
                 cameraBssid = mac.toString();
@@ -516,14 +792,6 @@ public final class CanonBleHandover {
         if (ssidCharacteristic == null) return;
         try {
             gatt.readCharacteristic(ssidCharacteristic);
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void readPassword(BluetoothGatt gatt) {
-        if (passwordCharacteristic == null) return;
-        try {
-            gatt.readCharacteristic(passwordCharacteristic);
         } catch (Exception ignored) {
         }
     }

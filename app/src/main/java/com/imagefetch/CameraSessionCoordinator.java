@@ -14,7 +14,6 @@ import android.net.MacAddress;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiNetworkSpecifier;
 import android.os.Build;
@@ -324,11 +323,10 @@ public final class CameraSessionCoordinator {
     /** 传输结束后的冷却期：相机可能仍在写卡，期间不做保活判定。 */
     private static final long TRANSFER_COOLDOWN_MS = 10000L;
     /**
-     * 等待系统「加入相机 Wi‑Fi」结果的上限。相机 AP 往往要几秒才真正开起来，
-     * 隐藏热点还要等系统扫描出结果、由用户点一次确认；60s 会误伤，放宽到 120s。
-     * 这里只做应用侧看门狗，不再给系统请求设短超时。
+     * 等待系统「加入相机 Wi‑Fi」结果的上限。荣耀在无互联网热点上的扫描/确认窗口很短，
+     * 先等 25s；没结果就自动再请求一次，不依赖用户去点系统弹窗的「重试」。
      */
-    private static final long SPECIFIER_TIMEOUT_MS = 120_000L;
+    private static final long SPECIFIER_TIMEOUT_MS = 25_000L;
     /** 入网重试（去 BSSID / WPA3）的上限：只在首次确实等过一段时间后才重试。 */
     private static final long SPECIFIER_RETRY_TIMEOUT_MS = 30_000L;
     /**
@@ -557,8 +555,14 @@ public final class CameraSessionCoordinator {
     private static final String PREFS_NAME = "image_fetch_prefs";
     /** 持久化发起方 GUID 的键（存 32 位十六进制串）。 */
     private static final String PREF_INITIATOR_GUID = "ptpip_initiator_guid";
-    /** 记住每个相机 SSID 上次成功入网的 BSSID：同名热点有多个时优先精确命中。 */
-    private static final String PREF_WIFI_BSSID_PREFIX = "wifi_bssid_";
+    /**
+     * 只保留「上一次成功连接」的那条 BSSID：与 {@code camera_ssid} 配套写入（MainActivity 负责落盘），
+     * SSID 对不上就不复用，避免相机换热点后拿旧 BSSID 去匹配。
+     */
+    private static final String PREF_CAMERA_SSID = "camera_ssid";
+    private static final String PREF_CAMERA_BSSID = "camera_bssid";
+    /** 旧版按 SSID 分键保存的前缀（wifi_bssid_&lt;ssid&gt;），仅用于读一次做兼容。 */
+    private static final String PREF_LEGACY_BSSID_PREFIX = "wifi_bssid_";
     /** 上次连接成功的相机地址：下次自动发现时第一个探测它。 */
     private static final String PREF_LAST_CAMERA_HOST = "last_camera_host";
 
@@ -2586,6 +2590,18 @@ public final class CameraSessionCoordinator {
             long attemptStartedAt = System.currentTimeMillis();
             Network joined = requestAndAwaitSpecifier(
                     false, pinBssid, true, SPECIFIER_TIMEOUT_MS);
+            // 荣耀在无互联网热点上经常不回调 onUnavailable，只把「找不到设备」挂在系统弹窗里。
+            // 超时后自动用同样参数再请求一次，避免用户手动点「重试」。
+            if (joined == null && connectAttemptActive(generation, reconnect)) {
+                unregisterSpecifierCallback();
+                sleepQuietly(2000L);
+                if (!connectAttemptActive(generation, reconnect)) return;
+                listener.onStatus("未扫到相机 Wi‑Fi，自动重试…");
+                attemptStartedAt = System.currentTimeMillis();
+                joined = requestAndAwaitSpecifier(
+                        false, pinBssid, true, SPECIFIER_TIMEOUT_MS);
+                android.util.Log.i("ImageFetch", "specifier auto-retry created=" + (joined != null));
+            }
             boolean retryable = specifierRejected
                     && System.currentTimeMillis() - attemptStartedAt <= SPECIFIER_FAST_FAIL_MS;
             android.util.Log.i("ImageFetch", "specifier attempt1 pin=" + pinBssid
@@ -2625,7 +2641,6 @@ public final class CameraSessionCoordinator {
                 // cameraWifiNetwork 已由 onAvailable 置好；这里只补会话绑定与 socket 工厂。
                 sessionNetwork = joined;
                 active.setSocketFactory(joined.getSocketFactory());
-                rememberJoinedBssid();
                 // 入网成功不等于路由/DHCP 已就绪：给相机网络栈一点时间再发 PTP/IP 握手。
                 sleepQuietly(WIFI_JOIN_SETTLE_MS);
                 return;
@@ -2758,23 +2773,15 @@ public final class CameraSessionCoordinator {
         }
     }
 
-    /** 记住成功加入的热点 BSSID：下次优先精确命中相机那个 AP。 */
-    @SuppressWarnings("deprecation")
-    private void rememberJoinedBssid() {
-        if (wifiManager == null || !isValidSsid(cameraSsid)) return;
-        try {
-            WifiInfo info = wifiManager.getConnectionInfo();
-            String bssid = info == null ? null : info.getBSSID();
-            if (bssid == null || bssid.isEmpty() || "02:00:00:00:00:00".equals(bssid)) return;
-            prefs().edit().putString(PREF_WIFI_BSSID_PREFIX + cameraSsid, bssid).apply();
-        } catch (Exception ignored) {
-            // 读不到 BSSID（权限/机型差异）只损失下次的精准入网，不影响本次会话。
-        }
-    }
-
     private String rememberedBssid(String ssid) {
         if (!isValidSsid(ssid)) return null;
-        String bssid = prefs().getString(PREF_WIFI_BSSID_PREFIX + ssid, null);
+        // 只认「上一次成功连接」那条记录：SSID 变了就说明是另一个热点，旧 BSSID 不能复用。
+        if (!ssid.equals(prefs().getString(PREF_CAMERA_SSID, ""))) return null;
+        String bssid = prefs().getString(PREF_CAMERA_BSSID, null);
+        if (bssid == null || bssid.trim().isEmpty()) {
+            // 兼容旧版按 SSID 分键的记录，成功连接一次后会被新格式取代并清掉。
+            bssid = prefs().getString(PREF_LEGACY_BSSID_PREFIX + ssid, null);
+        }
         return bssid == null || bssid.trim().isEmpty() ? null : bssid;
     }
 

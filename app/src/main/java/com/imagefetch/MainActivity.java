@@ -105,12 +105,23 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 手动挑照片做景深合成（系统文件选择器，多选）。 */
     private static final int REQUEST_PICK_STACK = 0x74;
 
+    /**
+     * BLE 交接开关。官方会话初始化（service 00010000 的 0001000B / 00010006）尚未补齐，
+     * 现在直接对 WAP 服务（00020000）开通知/写 START 会让 EOS RP 报 Err 70，
+     * 所以默认关闭，只用已保存的 Wi-Fi 凭据连接；等 P0 初始化序列实现并验证后再打开。
+     */
+    private static final boolean BLE_HANDOVER_ENABLED = false;
+
     private static final String PREFS_NAME = "image_fetch_prefs";
     private static final String PREF_EXPORT_TO_GALLERY = "export_to_gallery";
     private static final String PREF_PAGE_SIZE = "page_size";
     private static final String PREF_JPEG_ONLY = "jpeg_only";
     private static final String PREF_CAMERA_SSID = "camera_ssid";
     private static final String PREF_CAMERA_PASSWORD = "camera_password";
+    /** 上次成功连接的 BSSID，与 camera_ssid 配套；换了热点就作废。 */
+    private static final String PREF_CAMERA_BSSID = "camera_bssid";
+    /** 旧版按 SSID 分键保存的 BSSID 前缀，成功写入新记录后清掉。 */
+    private static final String PREF_LEGACY_BSSID_PREFIX = "wifi_bssid_";
     private static final String PREF_LIVE_VIEW_SIZE = "live_view_size";
     private static final String PREF_LIVE_VIEW_GRID = "live_view_grid";
     /** 机身参数基线快照（{@link VendorPropertySnapshot#toText()} 的文本）；空串表示没有基线。 */
@@ -144,6 +155,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private CanonBleHandover bleHandover;
     /** 本次会话是否由 Wi‑Fi 发起（连接成功后据此反写 Wi‑Fi 名称；USB 会话与本机 Wi‑Fi 无关）。 */
     private boolean wifiSession;
+    /** 本次发起连接时用的凭据：只有真正连上相机才写进偏好，保证只留最后一次成功记录。 */
+    private String pendingWifiSsid = "";
+    private String pendingWifiPassword = "";
     private Button connectButton;
     private Button connectUsbButton;
     private Button captureButton;
@@ -1560,10 +1574,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             // 主流程：连上就读卡并显示图片栏第一页。
             fullScanMode = false;
             goToPage(0);
-            // Wi‑Fi 会话连上后，把实际所用的网络名称反写进输入框（密码读不回来）。
+            // Wi‑Fi 会话连上后，把实际所用的网络名称/密码/BSSID 记成「上一次成功连接」。
             if (wifiSession) {
                 writeBackCameraAddress();
-                writeBackCameraSsid();
+                persistSuccessfulWifiRecord();
             }
             // P0 能力探测（只读）：连接后立刻跑一次，结果落进状态栏的菜单里。
             // 刻意放在开取景之前：探测要独占命令通道，与取景帧循环抢锁会互相拖慢。
@@ -3624,7 +3638,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         String typedHost = hostField.getText().toString().trim();
         String storedSsid = preferences.getString(PREF_CAMERA_SSID, "");
         String storedPassword = preferences.getString(PREF_CAMERA_PASSWORD, "");
-        if (!typedHost.isEmpty() || !hasBlePermissions()) {
+        if (!typedHost.isEmpty() || !BLE_HANDOVER_ENABLED || !hasBlePermissions()) {
             performWifiConnect(typedHost, port, storedSsid, storedPassword);
             return;
         }
@@ -3647,8 +3661,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                     if (result.password != null && !result.password.isEmpty()) {
                         preferences.edit().putString(PREF_CAMERA_PASSWORD, result.password).apply();
                     }
-                    // 相机要求等 AP 真正起来（WTIME）再入网。
-                    long wait = Math.max(800L, result.waitMillis);
+                    // 相机要求等 AP 真正起来（WTIME）再入网；再多给 1.5s 让系统扫描缓存刷新。
+                    long wait = Math.max(800L, result.waitMillis) + 1500L;
                     statusView.setText(R.string.ble_handover_ready);
                     connectButton.postDelayed(() -> {
                         boolean sameSsid = result.ssid != null && !result.ssid.isEmpty()
@@ -3684,9 +3698,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     /** 真正发起 Wi‑Fi 连接；填了 SSID 时由协调器尝试加入，失败会自行回退自动选网。 */
     private void performWifiConnect(String host, int port, String ssid, String password) {
+        // BLE 交接完成与自动连接可能几乎同时触发；重复发起会取消系统入网请求。
+        if (coordinator.isConnecting()) {
+            android.util.Log.i("ImageFetch", "skip duplicate wifi connect");
+            return;
+        }
         android.util.Log.i("ImageFetch", "performWifiConnect host=" + host
                 + " ssid=" + (ssid == null || ssid.isEmpty() ? "(none)" : ssid)
                 + " passLen=" + (password == null ? 0 : password.length()));
+        pendingWifiSsid = ssid == null ? "" : ssid;
+        pendingWifiPassword = password == null ? "" : password;
         coordinator.setCameraWifiCredentials(ssid, password);
         wifiSession = true;
         setBusy(true);
@@ -3779,7 +3800,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         if (port <= 0) port = 15740;
         statusView.setText(R.string.auto_connect_detected);
         // 有蓝牙权限时先尝试官方同款 BLE 交接，否则用已记住的凭据直接入网（没有就沿用当前网络）。
-        if (hasBlePermissions()) {
+        if (BLE_HANDOVER_ENABLED && hasBlePermissions()) {
             beginBleThenConnect(port);
         } else {
             performWifiConnect("", port, storedSsid, storedPassword);
@@ -3838,14 +3859,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                         showError(getString(R.string.camera_ssid_required), null);
                         return;
                     }
-                    preferences.edit()
-                            .putString(PREF_CAMERA_SSID, ssid)
-                            .putString(PREF_CAMERA_PASSWORD, password)
-                            .apply();
+                    // 先不落盘：等真正连上相机再保存，失败/密码错不会顶掉上一次成功记录。
                     dialog.dismiss();
                     autoConnectSuppressed = false;
                     autoConnectLastNetwork = null;
-                    statusView.setText(getString(R.string.camera_wifi_saved, ssid));
                     performWifiConnect("", port, ssid, password);
                 }));
         dialog.show();
@@ -3912,8 +3929,51 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private boolean writeBackCameraSsid() {
         String ssid = connectedWifiSsid();
         if (ssid.isEmpty() || ssid.equals(preferences.getString(PREF_CAMERA_SSID, ""))) return false;
-        preferences.edit().putString(PREF_CAMERA_SSID, ssid).apply();
+        // 换了热点，旧 BSSID 不再属于这条记录，一并作废。
+        preferences.edit()
+                .putString(PREF_CAMERA_SSID, ssid)
+                .remove(PREF_CAMERA_BSSID)
+                .apply();
         return true;
+    }
+
+    /**
+     * 只保留「上一次成功连接」的相机 Wi‑Fi 记录：SSID、密码、BSSID 一起写入。
+     * 连接失败时不会走到这里，上一次成功记录得以保留。
+     */
+    private void persistSuccessfulWifiRecord() {
+        String ssid = connectedWifiSsid();
+        if (ssid.isEmpty()) ssid = pendingWifiSsid;
+        if (ssid.isEmpty()) return;
+        boolean sameSsid = ssid.equals(preferences.getString(PREF_CAMERA_SSID, ""));
+        SharedPreferences.Editor edit = preferences.edit()
+                .putString(PREF_CAMERA_SSID, ssid);
+        // 密码只能用本次连接的入参：系统不提供读回接口。
+        if (ssid.equals(pendingWifiSsid) && !pendingWifiPassword.isEmpty()) {
+            edit.putString(PREF_CAMERA_PASSWORD, pendingWifiPassword);
+        }
+        String bssid = connectedWifiBssid();
+        if (!bssid.isEmpty()) {
+            edit.putString(PREF_CAMERA_BSSID, bssid);
+        } else if (!sameSsid) {
+            // 换了热点又读不到新 BSSID：宁可下次不限定热点，也别拿旧 BSSID 去匹配。
+            edit.remove(PREF_CAMERA_BSSID);
+        }
+        edit.apply();
+        purgeLegacyBssidPrefs();
+    }
+
+    /** 把旧版按 SSID 分键（wifi_bssid_<ssid>）保存的 BSSID 记录清掉，只留新单条记录。 */
+    private void purgeLegacyBssidPrefs() {
+        SharedPreferences.Editor edit = preferences.edit();
+        boolean changed = false;
+        for (String key : new ArrayList<>(preferences.getAll().keySet())) {
+            if (key.startsWith(PREF_LEGACY_BSSID_PREFIX)) {
+                edit.remove(key);
+                changed = true;
+            }
+        }
+        if (changed) edit.apply();
     }
 
     /** 把实际连上的相机 IP 反写进地址框：自动发现的结果可见，下次也可直接复用。 */
@@ -3940,6 +4000,21 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             return ssid;
         } catch (Exception ignored) {
             // 缺权限/系统限制时（SecurityException 等）静默跳过：这只影响一次便利性反写。
+            return "";
+        }
+    }
+
+    /** 当前所连热点的 BSSID；读不到（权限/脱敏）时返回空串。 */
+    private String connectedWifiBssid() {
+        try {
+            WifiManager manager = (WifiManager) getApplicationContext()
+                    .getSystemService(Context.WIFI_SERVICE);
+            if (manager == null) return "";
+            WifiInfo info = manager.getConnectionInfo();
+            String bssid = info == null ? null : info.getBSSID();
+            if (bssid == null || bssid.isEmpty() || "02:00:00:00:00:00".equals(bssid)) return "";
+            return bssid;
+        } catch (Exception ignored) {
             return "";
         }
     }
