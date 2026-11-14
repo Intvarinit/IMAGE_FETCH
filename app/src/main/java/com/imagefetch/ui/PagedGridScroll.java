@@ -66,9 +66,23 @@ public final class PagedGridScroll extends HorizontalScrollView {
         int width = getWidth();
         if (width <= 0 || getChildCount() == 0) return;
         int contentWidth = getChildAt(0).getWidth();
+        int maxScroll = Math.max(0, contentWidth - width);
         int screenCount = Math.max(1, (contentWidth + width - 1) / width);
-        int screen = Math.min(screenCount - 1, Math.round((float) getScrollX() / width));
-        int target = Math.min(screen * width, Math.max(0, contentWidth - width));
+        // 最后一屏经常不满整屏：它的停靠位是「贴住右边缘」（maxScroll），
+        // 而不是 (screenCount-1)*width。按各屏真实停靠位逐一比较距离，
+        // 否则最后一屏永远算不进去，末尾几张图滑不到。
+        int screen = 0;
+        int target = 0;
+        int bestDistance = Integer.MAX_VALUE;
+        for (int index = 0; index < screenCount; index++) {
+            int position = Math.min(index * width, maxScroll);
+            int distance = Math.abs(getScrollX() - position);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                screen = index;
+                target = position;
+            }
+        }
         if (Math.abs(getScrollX() - target) > 2) {
             smoothScrollTo(target, 0);
         }

@@ -17,6 +17,10 @@ import android.graphics.Matrix;
 import android.graphics.Typeface;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
@@ -27,6 +31,7 @@ import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.Editable;
+import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.MotionEvent;
 import android.view.View;
@@ -51,6 +56,7 @@ import com.imagefetch.capture.FocusBracketCalculator;
 import com.imagefetch.capture.FocusBracketPlan;
 import com.imagefetch.capture.FocusStackBatch;
 import com.imagefetch.capture.HdrPlan;
+import com.imagefetch.connect.CanonBleHandover;
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
 import com.imagefetch.ptp.CanonImageQuality;
@@ -127,6 +133,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private boolean pendingWifiPicker;
     /** 因缺「附近的设备」权限而暂缓的 Wi‑Fi 连接，授权回调后补发。 */
     private boolean pendingWifiConnect;
+    /** 自动连接：检测到「无互联网的 Wi‑Fi」（相机 AP 的典型形态）就自动发现并连。 */
+    private ConnectivityManager autoConnectManager;
+    private ConnectivityManager.NetworkCallback autoConnectCallback;
+    /** 已经为哪个网络自动连过：防止同一网络反复触发，直到网络丢失/重连。 */
+    private Network autoConnectLastNetwork;
+    /** 用户手动断开或改走 USB 后，本次运行不再自动连；再点连接即解除。 */
+    private boolean autoConnectSuppressed;
+    /** 蓝牙唤醒相机 Wi‑Fi（官方 App 的 BLE handover）：连接期间保持，断开时释放。 */
+    private CanonBleHandover bleHandover;
     /** 本次会话是否由 Wi‑Fi 发起（连接成功后据此反写 Wi‑Fi 名称；USB 会话与本机 Wi‑Fi 无关）。 */
     private boolean wifiSession;
     private Button connectButton;
@@ -153,6 +168,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private TextView gridIndexView;
     /** 每屏能放几张（3 列 × N 行），用于把照片序号换算成屏号。 */
     private int gridPageCapacity;
+    /** 网格每行的格子数（列数）与每屏行数：把滚动位置换算成实际可见的首尾照片。 */
+    private int gridColumns;
+    private int gridRowsPerScreen;
     /** 图片栏代数：换页/断链时自增，用来丢弃迟到的铺格任务与缩略图解码结果。 */
     private int gridGeneration;
     /** 句柄 → 网格单元：缩略图/选中状态到达时就地更新，不重建整页。 */
@@ -397,7 +415,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         // 上次的机身参数基线快照（若存过）：重开 App 后仍能直接对比/恢复。
         diffBaseline = VendorPropertySnapshot.fromText(
                 preferences.getString(PREF_PROPERTY_BASELINE, null));
-        pickWifiButton.setOnClickListener(view -> openWifiPicker());
+        pickWifiButton.setOnClickListener(view -> showCameraWifiDialog());
         boolean export = preferences.getBoolean(PREF_EXPORT_TO_GALLERY, true);
         int configuredPageSize = preferences.getInt(PREF_PAGE_SIZE, DEFAULT_PAGE_SIZE);
         setUpPageSizeSpinner(configuredPageSize);
@@ -429,14 +447,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
         connectButton.setOnClickListener(view -> {
             if (coordinator.isConnected()) {
+                // 用户明确断开：本次运行不再自动连，避免刚断就被系统网络回调拉回去。
+                autoConnectSuppressed = true;
                 coordinator.disconnect();
                 showReconnectHint();
                 return;
             }
-            String host = hostField.getText().toString().trim();
+            // 手动连接解除抑制，并允许重新为当前网络自动发现。
+            autoConnectSuppressed = false;
+            autoConnectLastNetwork = null;
             int port = parsePort(portField.getText().toString().trim());
-            if (host.isEmpty() || port <= 0) {
-                showError("请输入有效的相机地址与端口。", null);
+            // 地址留空表示自动发现：连上相机 Wi‑Fi 后按网段探测 15740。
+            if (port <= 0) {
+                showError("请输入有效的端口。", null);
                 return;
             }
             connectWifi(false);
@@ -447,6 +470,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 coordinator.disconnect();
                 return;
             }
+            // 改走 USB 时不要再被 Wi‑Fi 自动连接打断。
+            autoConnectSuppressed = true;
             setBusy(true);
             updateConnectButton(false);
             wifiSession = false;
@@ -1443,6 +1468,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         super.onStart();
         // 回到前台：重新武装保活探测（HOLD 三态里 SUSPEND → HOLD）。
         if (coordinator != null) coordinator.resumeHold();
+        startAutoConnectWatch();
+        // 冷启动时相机 Wi‑Fi 可能早就连着了：网络回调不一定会再补一次 onAvailable。
+        maybeAutoConnect(currentCameraWifiNetwork());
     }
 
     @Override
@@ -1461,12 +1489,14 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     protected void onStop() {
         // 退到后台：停心跳探测省电、也避免后台一次网络抖动就误判离线；
         // 链路、WifiLock 与正在进行的传输/拍摄/取景都不受影响。
+        stopAutoConnectWatch();
         if (coordinator != null) coordinator.suspendHold();
         super.onStop();
     }
 
     @Override
     protected void onDestroy() {
+        cancelBleHandover();
         // 先收起遥控面板：它持有取景位图，且停取景要在 executor 关闭之前发出。
         if (viewerDialog != null) {
             viewerDialog.dismiss();
@@ -1505,6 +1535,19 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     @Override
+    public void onCameraAddress(String address) {
+        // 发现即回填：让用户先看到「相机在哪」，握手结果随后再更新状态。
+        runOnUiThread(() -> {
+            if (address == null || address.trim().isEmpty()) return;
+            if (!address.equals(hostField.getText().toString().trim())) {
+                hostField.setText(address);
+                hostField.setSelection(hostField.getText().length());
+            }
+            statusView.setText("已发现相机 " + address + "，正在握手…");
+        });
+    }
+
+    @Override
     public void onConnected(String cameraName) {
         runOnUiThread(() -> {
             setBusy(false);
@@ -1518,7 +1561,10 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             fullScanMode = false;
             goToPage(0);
             // Wi‑Fi 会话连上后，把实际所用的网络名称反写进输入框（密码读不回来）。
-            if (wifiSession) writeBackCameraSsid();
+            if (wifiSession) {
+                writeBackCameraAddress();
+                writeBackCameraSsid();
+            }
             // P0 能力探测（只读）：连接后立刻跑一次，结果落进状态栏的菜单里。
             // 刻意放在开取景之前：探测要独占命令通道，与取景帧循环抢锁会互相拖慢。
             coordinator.probeVendorCapabilities(false);
@@ -1530,6 +1576,7 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         runOnUiThread(() -> {
             setBusy(false);
             updateConnectButton(false);
+            cancelBleHandover();
             // 链路已断：遥控面板里的取景与参数都没了意义，先收起。
             dismissCapturePanel();
             // 链路已断：能力报告里的按钮已无法执行，一并收起。
@@ -3249,12 +3296,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             return;
         }
 
+        // 3 列：缩略图宽度比 4 列大约三分之一，能看清内容；格子高度目标 96dp，
+        // 屏幕高度富余时自动放大（行数 = 高度 ÷ 目标），保证粗估 2~3 行。
         int columnsPerScreen = 3;
         int cellWidth = width / columnsPerScreen;
-        int cellHeightDp = 120;
+        int cellHeightDp = 96;
         int rows = Math.max(1, Math.round(height / (float) dp(cellHeightDp)));
         int cellHeight = height / rows;
         gridPageCapacity = columnsPerScreen * rows;
+        gridColumns = columnsPerScreen;
+        gridRowsPerScreen = rows;
 
         LinearLayout column = null;
         for (int index = 0; index < items.size(); index++) {
@@ -3267,8 +3318,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             CameraStorage.Item item = items.get(index);
             final int position = index;
             View cell = gridAdapter.getView(index, null, column);
-            // 格子之间留 3dp 间隙：宽度/高度按去掉两侧间隙后的尺寸分配。
-            int gap = Math.round(dp(3));
+            // 格子之间留 2dp 间隙：宽度/高度按去掉两侧间隙后的尺寸分配。
+            int gap = Math.round(dp(2));
             LinearLayout.LayoutParams cellParams =
                     new LinearLayout.LayoutParams(cellWidth - gap * 2, cellHeight - gap * 2);
             cellParams.setMargins(gap, gap, gap, gap);
@@ -3295,13 +3346,18 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 停稳在某屏后更新右下角「第 x-y 张 / 共 n 张」。 */
     private void updateGridIndex(int screen, int screenCount) {
         int total = gridAdapter.getCount();
-        if (total == 0 || gridPageCapacity <= 0) {
+        if (total == 0 || gridPageCapacity <= 0 || gridColumns <= 0) {
             gridIndexView.setText("");
             gridIndexView.setVisibility(View.GONE);
             return;
         }
-        int start = Math.min(total, screen * gridPageCapacity + 1);
-        int end = Math.min(total, (screen + 1) * gridPageCapacity);
+        // 最后一屏会与上一屏重叠（内容宽度不是整屏的整数倍），按真实滚动位置
+        // 算可见的首列，避免序号和画面对不上。
+        int cellWidth = Math.max(1, gridPager.getWidth() / gridColumns);
+        int firstColumn = Math.max(0,
+                Math.round(gridPager.getScrollX() / (float) cellWidth));
+        int start = Math.min(total, firstColumn * gridRowsPerScreen + 1);
+        int end = Math.min(total, (firstColumn + gridColumns) * gridRowsPerScreen);
         String text = String.format(Locale.ROOT, "第 %d-%d 张 / 共 %d 张", start, end, total);
         if (screenCount > 1) {
             text += String.format(Locale.ROOT, "（%d/%d 屏）", screen + 1, screenCount);
@@ -3343,11 +3399,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         gridPagerContent.removeAllViews();
         gridCells.clear();
         gridPageCapacity = 0;
+        gridColumns = 0;
+        gridRowsPerScreen = 0;
         gridIndexView.setText("");
         gridIndexView.setVisibility(View.GONE);
     }
 
     private void setBusy(boolean busy) {
+        // 进度条只在有传输/读取时占位，平时收起，把高度留给缩略图网格。
+        progressBar.setVisibility(busy ? View.VISIBLE : View.GONE);
         captureButton.setEnabled(!busy);
         refreshButton.setEnabled(!busy);
         downloadButton.setEnabled(!busy);
@@ -3536,30 +3596,259 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
      *     「申请 → 回调 → 再申请」的死循环：用户拒绝后系统不会再弹窗）
      */
     private void connectWifi(boolean permissionAlreadyRequested) {
-        String host = hostField.getText().toString().trim();
         int port = parsePort(portField.getText().toString().trim());
-        if (host.isEmpty() || port <= 0) {
-            showError("请输入有效的相机地址与端口。", null);
+        // 地址留空 = 自动发现（推荐）；端口仍必须是有效值。
+        if (port <= 0) {
+            showError("请输入有效的端口。", null);
             return;
         }
-        // 凭据来自「选择 Wi‑Fi」后自动记下的偏好值，界面上不再有输入框。
-        String ssid = preferences.getString(PREF_CAMERA_SSID, "");
-        String password = preferences.getString(PREF_CAMERA_PASSWORD, "");
-        if (!permissionAlreadyRequested && !ssid.isEmpty() && !hasNearbyWifiPermission()) {
-            pendingWifiConnect = true;
-            requestNearbyWifiPermission();
+        if (!permissionAlreadyRequested) {
+            // 只有「地址留空」才需要蓝牙（BLE 交接）；手填地址时只补加入 Wi‑Fi 的权限。
+            boolean includeBle = hostField.getText().toString().trim().isEmpty();
+            String[] missing = missingConnectPermissions(includeBle);
+            if (missing.length > 0) {
+                pendingWifiConnect = true;
+                requestPermissions(missing, REQUEST_NEARBY_WIFI);
+                return;
+            }
+        }
+        beginBleThenConnect(port);
+    }
+
+    /**
+     * 连接前置流程：地址留空且有蓝牙权限时，先走官方同款 BLE 交接——
+     * 相机自己打开 Wi‑Fi 并把 SSID/密码/IP 交回来；失败或没权限再回退到
+     * 「已连相机 Wi‑Fi + 自动发现 IP」。
+     */
+    private void beginBleThenConnect(int port) {
+        String typedHost = hostField.getText().toString().trim();
+        String storedSsid = preferences.getString(PREF_CAMERA_SSID, "");
+        String storedPassword = preferences.getString(PREF_CAMERA_PASSWORD, "");
+        if (!typedHost.isEmpty() || !hasBlePermissions()) {
+            performWifiConnect(typedHost, port, storedSsid, storedPassword);
             return;
         }
-        performWifiConnect(host, port, ssid, password);
+        if (bleHandover != null) return;
+        setBusy(true);
+        updateConnectButton(false);
+        statusView.setText(R.string.ble_handover_scanning);
+        bleHandover = new CanonBleHandover(this, new CanonBleHandover.Callback() {
+            @Override public void onStatus(String message) {
+                runOnUiThread(() -> statusView.setText(message));
+            }
+
+            @Override public void onReady(CanonBleHandover.Result result) {
+                runOnUiThread(() -> {
+                    bleHandover = null;
+                    // 交接到的 SSID/密码落盘：下次即使蓝牙不可用也能直接入网。
+                    if (result.ssid != null && !result.ssid.isEmpty()) {
+                        preferences.edit().putString(PREF_CAMERA_SSID, result.ssid).apply();
+                    }
+                    if (result.password != null && !result.password.isEmpty()) {
+                        preferences.edit().putString(PREF_CAMERA_PASSWORD, result.password).apply();
+                    }
+                    // 相机要求等 AP 真正起来（WTIME）再入网。
+                    long wait = Math.max(800L, result.waitMillis);
+                    statusView.setText(R.string.ble_handover_ready);
+                    connectButton.postDelayed(() -> {
+                        boolean sameSsid = result.ssid != null && !result.ssid.isEmpty()
+                                && result.ssid.equals(connectedWifiSsid());
+                        if (sameSsid) {
+                            // 已经在这个 AP 上：不再弹「加入网络」对话框，直接用交接来的 IP。
+                            performWifiConnect(result.ip, port, "", "");
+                        } else {
+                            performWifiConnect(result.ip, port, result.ssid, result.password);
+                        }
+                    }, wait);
+                });
+            }
+
+            @Override public void onFailed(String message) {
+                runOnUiThread(() -> {
+                    bleHandover = null;
+                    statusView.setText(message + "，改用已保存的 Wi‑Fi 直连…");
+                    // 回退必须带上已保存的 SSID/密码，否则带密码的相机热点永远进不去。
+                    performWifiConnect("", port, storedSsid, storedPassword);
+                });
+            }
+        });
+        bleHandover.start();
+    }
+
+    /** 蓝牙交接连接是会话级资源：断开/退出时释放。 */
+    private void cancelBleHandover() {
+        CanonBleHandover handover = bleHandover;
+        bleHandover = null;
+        if (handover != null) handover.close();
     }
 
     /** 真正发起 Wi‑Fi 连接；填了 SSID 时由协调器尝试加入，失败会自行回退自动选网。 */
     private void performWifiConnect(String host, int port, String ssid, String password) {
+        android.util.Log.i("ImageFetch", "performWifiConnect host=" + host
+                + " ssid=" + (ssid == null || ssid.isEmpty() ? "(none)" : ssid)
+                + " passLen=" + (password == null ? 0 : password.length()));
         coordinator.setCameraWifiCredentials(ssid, password);
         wifiSession = true;
         setBusy(true);
         updateConnectButton(false);
         coordinator.connect(CameraSessionCoordinator.TransportKind.WIFI, host, port);
+    }
+
+    /**
+     * 自动连接：相机 AP 在系统里通常表现为「Wi‑Fi 但没有互联网」，监听这类网络出现即发现并连接。
+     * 只在应用前台注册，避免后台偷偷改网络；用户手动断开或改走 USB 后不再自动触发。
+     */
+    private void startAutoConnectWatch() {
+        if (autoConnectCallback != null) return;
+        ConnectivityManager manager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager == null) return;
+        autoConnectManager = manager;
+        autoConnectCallback = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network network) {
+                runOnUiThread(() -> maybeAutoConnect(network));
+            }
+
+            @Override public void onLost(Network network) {
+                runOnUiThread(() -> {
+                    if (network.equals(autoConnectLastNetwork)) autoConnectLastNetwork = null;
+                });
+            }
+        };
+        NetworkRequest request = new NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build();
+        try {
+            manager.registerNetworkCallback(request, autoConnectCallback);
+        } catch (Exception ignored) {
+            autoConnectCallback = null;
+        }
+    }
+
+    private void stopAutoConnectWatch() {
+        ConnectivityManager manager = autoConnectManager;
+        ConnectivityManager.NetworkCallback callback = autoConnectCallback;
+        autoConnectManager = null;
+        autoConnectCallback = null;
+        if (manager == null || callback == null) return;
+        try {
+            manager.unregisterNetworkCallback(callback);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 当前是否已经连着一个「无互联网的 Wi‑Fi」——相机直连 AP 的典型形态。 */
+    private Network currentCameraWifiNetwork() {
+        ConnectivityManager manager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager == null) return null;
+        try {
+            for (Network network : manager.getAllNetworks()) {
+                NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+                if (capabilities == null
+                        || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    continue;
+                }
+                if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                    return network;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /** 检测到相机 Wi‑Fi 就自动发现并连接；同一网络只尝试一次，避免失败后反复弹错。 */
+    private void maybeAutoConnect(Network candidate) {
+        if (autoConnectSuppressed || coordinator == null || coordinator.isConnected()
+                || coordinator.isConnecting()) {
+            return;
+        }
+        Network cameraNetwork = candidate != null ? candidate : currentCameraWifiNetwork();
+        if (cameraNetwork == null || cameraNetwork.equals(autoConnectLastNetwork)) return;
+        // 记过相机 SSID 且能读到当前 SSID 时，只在名称匹配时才自动连，避免误连其它无网 Wi‑Fi。
+        String storedSsid = preferences.getString(PREF_CAMERA_SSID, "");
+        String storedPassword = preferences.getString(PREF_CAMERA_PASSWORD, "");
+        if (!storedSsid.isEmpty()) {
+            String currentSsid = connectedWifiSsid();
+            if (!currentSsid.isEmpty() && !storedSsid.equals(currentSsid)) return;
+        }
+        autoConnectLastNetwork = cameraNetwork;
+        int port = parsePort(portField.getText().toString().trim());
+        if (port <= 0) port = 15740;
+        statusView.setText(R.string.auto_connect_detected);
+        // 有蓝牙权限时先尝试官方同款 BLE 交接，否则用已记住的凭据直接入网（没有就沿用当前网络）。
+        if (hasBlePermissions()) {
+            beginBleThenConnect(port);
+        } else {
+            performWifiConnect("", port, storedSsid, storedPassword);
+        }
+    }
+
+    /**
+     * 相机 Wi‑Fi 凭据：SSID + 密码只存本机。有了它，协调器会用 WifiNetworkSpecifier
+     * 把相机热点变成「仅本应用使用」的网络——系统不会因为「无互联网」把连接切走。
+     * 同时保留原来的「去系统设置选网」入口。
+     */
+    private void showCameraWifiDialog() {
+        int parsedPort = parsePort(portField.getText().toString().trim());
+        final int port = parsedPort > 0 ? parsedPort : 15740;
+
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        int horizontal = Math.round(dp(20));
+        form.setPadding(horizontal, Math.round(dp(4)), horizontal, 0);
+
+        final EditText ssidField = new EditText(this);
+        ssidField.setHint(R.string.camera_ssid_hint);
+        ssidField.setSingleLine(true);
+        ssidField.setText(preferences.getString(PREF_CAMERA_SSID, ""));
+        form.addView(ssidField, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        final EditText passwordField = new EditText(this);
+        passwordField.setHint(R.string.camera_wifi_password_hint);
+        passwordField.setSingleLine(true);
+        passwordField.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passwordField.setText(preferences.getString(PREF_CAMERA_PASSWORD, ""));
+        LinearLayout.LayoutParams passwordParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        passwordParams.topMargin = Math.round(dp(8));
+        form.addView(passwordField, passwordParams);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.camera_wifi_title)
+                .setMessage(R.string.camera_wifi_message)
+                .setView(form)
+                .setPositiveButton(R.string.camera_wifi_save, null)
+                .setNeutralButton(R.string.camera_wifi_open_settings,
+                        (ignored, which) -> openWifiPicker())
+                .setNegativeButton(android.R.string.cancel, null)
+                .create();
+        // 自己接管「保存并连接」：SSID 为空时提示而不是直接关掉对话框。
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(view -> {
+                    String ssid = ssidField.getText().toString().trim();
+                    String password = passwordField.getText().toString();
+                    if (ssid.isEmpty()) {
+                        showError(getString(R.string.camera_ssid_required), null);
+                        return;
+                    }
+                    preferences.edit()
+                            .putString(PREF_CAMERA_SSID, ssid)
+                            .putString(PREF_CAMERA_PASSWORD, password)
+                            .apply();
+                    dialog.dismiss();
+                    autoConnectSuppressed = false;
+                    autoConnectLastNetwork = null;
+                    statusView.setText(getString(R.string.camera_wifi_saved, ssid));
+                    performWifiConnect("", port, ssid, password);
+                }));
+        dialog.show();
     }
 
     /**
@@ -3627,6 +3916,15 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         return true;
     }
 
+    /** 把实际连上的相机 IP 反写进地址框：自动发现的结果可见，下次也可直接复用。 */
+    private void writeBackCameraAddress() {
+        String address = coordinator.cameraAddress();
+        if (address == null || address.trim().isEmpty()) return;
+        if (address.equals(hostField.getText().toString().trim())) return;
+        hostField.setText(address);
+        hostField.setSelection(hostField.getText().length());
+    }
+
     /** 系统当前所连 Wi‑Fi 的名称；读不到时返回空串（原样带引号的系统格式会去掉引号）。 */
     private String connectedWifiSsid() {
         try {
@@ -3658,6 +3956,35 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
     private boolean hasNearbyWifiPermission() {
         return checkSelfPermission(nearbyWifiPermission()) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** 本次连接需要的运行时权限：BLE 扫描/连接 + 加入相机 Wi‑Fi（13+ 是「附近的设备」）。 */
+    private String[] missingConnectPermissions(boolean includeBle) {
+        java.util.LinkedHashSet<String> needed = new java.util.LinkedHashSet<>();
+        if (includeBle && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            needed.add(Manifest.permission.BLUETOOTH_SCAN);
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT);
+        }
+        needed.add(nearbyWifiPermission());
+        java.util.ArrayList<String> missing = new java.util.ArrayList<>();
+        for (String permission : needed) {
+            if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+                missing.add(permission);
+            }
+        }
+        return missing.toArray(new String[0]);
+    }
+
+    /** 蓝牙是否可用：12+ 需要扫描与连接两项运行时权限，11 及以下靠定位权限。 */
+    private boolean hasBlePermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)
+                    == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                    == PackageManager.PERMISSION_GRANTED;
+        }
+        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestNearbyWifiPermission() {

@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- WifiNetworkSpecifier 的 requestNetwork 需要它；缺了会直接抛 SecurityException，
+         表现为「填了 SSID 却从不弹加入网络框、总是回退到系统当前 Wi-Fi」。 -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- 连接期间持有 WifiLock：避免息屏待机时 Wi-Fi 休眠导致大文件传输中断 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -17,6 +20,15 @@
     <!-- 定位：读当前 Wi‑Fi 名称（WifiInfo#getSSID）与扫描结果的敏感字段在 13+ 仍要求它；
          同时兼容 API 32 及以下 WifiNetworkSpecifier 的声明要求。选网时按需申请。 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- 蓝牙唤醒相机 Wi‑Fi（对齐官方 Camera Connect 的 BLE 交接）：
+         12+ 用 BLUETOOTH_SCAN/CONNECT，11 及以下用旧权限 + 定位。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <!-- 仅 Android 9 及以下需要：API 29+ 走分区存储导出到相册，无需存储权限 -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"

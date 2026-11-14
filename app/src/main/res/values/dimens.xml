@@ -6,7 +6,7 @@
     <dimen name="space_m">12dp</dimen>
     <dimen name="space_l">16dp</dimen>
 
-    <dimen name="card_padding">@dimen/space_m</dimen>
+    <dimen name="card_padding">10dp</dimen>
     <dimen name="radius_card">14dp</dimen>
     <dimen name="radius_control">10dp</dimen>
     <dimen name="radius_thumb">12dp</dimen>

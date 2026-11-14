@@ -11,6 +11,8 @@
  */
 package com.imagefetch.transport;
 
+import android.util.Log;
+
 import com.imagefetch.ptp.CameraStorage;
 import com.imagefetch.ptp.CanonExposure;
 import com.imagefetch.ptp.CanonImageQuality;
@@ -353,6 +355,8 @@ public final class PtpIpTransport implements CameraTransport {
      * 给相机约 16s 的恢复窗口。
      */
     private static final long[] CONNECT_RETRY_DELAYS_MS = {3000L, 5000L, 8000L};
+    /** 瞬态握手失败（相机 RST / 对端关闭）的重试间隔：相机通常一两秒就能回收上一次连接。 */
+    private static final long[] RESET_RETRY_DELAYS_MS = {700L, 1500L, 3000L};
     private static final int CONNECT_ATTEMPTS = CONNECT_RETRY_DELAYS_MS.length + 1;
 
     /** 已连 PTP/IP 相机的厂商分类（detectVendor 结果，断连清零）。 */
@@ -374,6 +378,8 @@ public final class PtpIpTransport implements CameraTransport {
     /** 最近一次 connect() 的逐次尝试记录，供报错弹窗直接展示。 */
     private final List<String> connectDiagnostics =
             Collections.synchronizedList(new ArrayList<>());
+    /** 握手进行到哪一步（诊断用）：Init_Command / Init_Event / OpenSession。 */
+    private volatile String handshakeStage = "";
     // 默认走系统路由；协调器在相机 Wi‑Fi 非默认网络时注入
     // Network.getSocketFactory()，把 PTP/IP socket 绑定到相机所在 Wi‑Fi。
     private volatile SocketFactory socketFactory = SocketFactory.getDefault();
@@ -456,6 +462,11 @@ public final class PtpIpTransport implements CameraTransport {
     }
 
     /** 注入 socket 工厂（传 null 恢复默认路由）；须在 connect() 前调用。 */
+    /** 当前 socket 工厂（相机网络绑定时为 Network#getSocketFactory）：地址自动发现也走它。 */
+    public synchronized SocketFactory socketFactory() {
+        return socketFactory;
+    }
+
     public synchronized void setSocketFactory(SocketFactory factory) {
         bindToCameraNetwork = factory != null;
         socketFactory = factory != null ? factory : SocketFactory.getDefault();
@@ -489,22 +500,21 @@ public final class PtpIpTransport implements CameraTransport {
                         System.currentTimeMillis() - startedAt,
                         lastLocalEndpoint));
                 return name;
-            } catch (InitRejectedException rejection) {
-                // 相机侧仍持有旧会话：稍等后重新握手即可，用户不必去重开相机 Wi‑Fi。
-                lastFailure = rejection;
-                recordConnectFailure(attempt, startedAt, rejection, true);
-            } catch (Exception refused) {
-                // ECONNREFUSED：网络可达但 15740 无人监听——相机的 PTP 服务很可能刚随
-                // 上一个连接结束而重启，给它几秒。其它失败（EHOSTUNREACH 等）不重试。
-                if (!isConnectionRefused(refused)) {
-                    recordConnectFailure(attempt, startedAt, refused, false);
-                    throw refused;
-                }
-                lastFailure = refused;
-                recordConnectFailure(attempt, startedAt, refused, true);
+            } catch (Exception failure) {
+                // 三类可重试：相机仍持有旧会话（InitFail）、PTP 服务正在重启（ECONNREFUSED）、
+                // 以及握手途中被相机 RST——刚探测过端口的相机常要几百毫秒回收上一次连接。
+                boolean retry = failure instanceof InitRejectedException
+                        || isConnectionRefused(failure)
+                        || isTransientHandshakeFailure(failure);
+                lastFailure = failure;
+                recordConnectFailure(attempt, startedAt, failure, retry);
+                Log.w("ImageFetch", "PTP/IP " + attempt + "/" + CONNECT_ATTEMPTS
+                        + " failed stage=" + (handshakeStage.isEmpty() ? "-" : handshakeStage)
+                        + " retry=" + retry + " -> " + describe(failure));
+                if (!retry) throw failure;
             }
             if (attempt == CONNECT_ATTEMPTS) break;
-            sleepQuietly(CONNECT_RETRY_DELAYS_MS[attempt - 1]);
+            sleepQuietly(retryDelayMs(lastFailure, attempt));
         }
         if (lastFailure instanceof InitRejectedException) {
             throw new IOException(
@@ -513,6 +523,28 @@ public final class PtpIpTransport implements CameraTransport {
                     lastFailure);
         }
         throw lastFailure;
+    }
+
+    /** RST / 对端关闭 / 连接代际失效：属于瞬态，短退避后重试往往就能过。 */
+    static boolean isTransientHandshakeFailure(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof EOFException) return true;
+            String message = cause.getMessage();
+            if (message == null) continue;
+            if (message.contains("reset") || message.contains("Reset")
+                    || message.contains("Broken pipe")
+                    || message.contains("连接尝试已失效")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 瞬态握手失败用短退避（相机回收连接通常只要一两秒），其余沿用长退避。 */
+    private static long retryDelayMs(Exception failure, int attempt) {
+        int index = Math.max(0, Math.min(attempt - 1, RESET_RETRY_DELAYS_MS.length - 1));
+        if (isTransientHandshakeFailure(failure)) return RESET_RETRY_DELAYS_MS[index];
+        return CONNECT_RETRY_DELAYS_MS[Math.min(index, CONNECT_RETRY_DELAYS_MS.length - 1)];
     }
 
     /** ECONNREFUSED：目标可达但端口无监听（与 EHOSTUNREACH「主机不可达」相反）。 */
@@ -529,12 +561,14 @@ public final class PtpIpTransport implements CameraTransport {
 
     private void recordConnectFailure(
             int attempt, long startedAt, Throwable error, boolean willRetry) {
+        String stage = handshakeStage;
         connectDiagnostics.add(String.format(
                 Locale.ROOT,
-                "第 %d/%d 次握手失败（%d ms，%s）：%s",
+                "第 %d/%d 次握手失败（%d ms%s，%s）：%s",
                 attempt,
                 CONNECT_ATTEMPTS,
                 System.currentTimeMillis() - startedAt,
+                stage.isEmpty() ? "" : "，阶段 " + stage,
                 willRetry ? "将重试" : "不重试",
                 describe(error)));
     }
@@ -585,11 +619,13 @@ public final class PtpIpTransport implements CameraTransport {
             initialization.bytes(guid);
             initialization.utf16(initiatorName);
             initialization.u32(0x00010000L);
+            handshakeStage = "Init_Command 发送";
             writePacket(
                     pendingCommandOutput,
                     PACKET_INIT_COMMAND_REQUEST,
                     initialization.data());
             ensureTransportGeneration(generation);
+            handshakeStage = "Init_Command 应答";
             Packet commandAck = readPacket(pendingCommandInput);
             ensureTransportGeneration(generation);
             if (commandAck.type == PACKET_INIT_FAIL) {
@@ -610,6 +646,7 @@ public final class PtpIpTransport implements CameraTransport {
                     pendingEventSocket.getOutputStream());
             ByteWriter eventInitialization = new ByteWriter();
             eventInitialization.u32(connectionNumber);
+            handshakeStage = "Init_Event 通道";
             writePacket(
                     pendingEventOutput,
                     PACKET_INIT_EVENT_REQUEST,
@@ -643,6 +680,7 @@ public final class PtpIpTransport implements CameraTransport {
                     pendingEventOutput,
                     generation);
 
+            handshakeStage = "OpenSession";
             int response = command(OPERATION_OPEN_SESSION, 0, new long[]{SESSION_ID});
             // 相机侧只维持一个会话：我们固定用 sessionID=1，若它仍持有我们上次的会话，
             // 视为成功直接复用（与 USB 侧一致），而不是报错逼用户重开相机 Wi‑Fi。
@@ -651,6 +689,7 @@ public final class PtpIpTransport implements CameraTransport {
             }
             ensureTransportGeneration(generation);
             transactionId = 1;
+            handshakeStage = "";
             return cameraName;
         } catch (Exception error) {
             close();
@@ -2265,30 +2304,24 @@ public final class PtpIpTransport implements CameraTransport {
 
     /**
      * 保活探测。
-     * 原始实现把「PING 无应答」直接当成链路断开，但相当多的相机只单向下发 PING、
-     * 并不回应发起方的 PING——于是空闲十几秒就会被误判掉线，触发一次无谓的拆链重连
-     * （真机表现为「下载完一个文件、等一会儿就提示重连」）。
-     * 现在改为：PING 无应答时用一次真实 PTP 往返复核，复核通过即认定链路存活，
-     * 并永久降级为命令探测；只有两种方式都失败才判定离线。
+     * <p>PING 只能证明「包能来回」，不能证明「PTP 会话还活着」：EOS RP 实测按
+     * 「会话里有没有真实命令」计时，约 36s 没有真实命令就把 Wi‑Fi 客户端断开
+     * （disassoc reason 4）。所以每次保活都补一次真实命令往返（GetDeviceInfo）；
+     * PING 仍保留作为快速探活，PING 不通时降级为只用命令往返。
      */
     public synchronized void probe() throws Exception {
-        if (!pingKeepAliveSupported) {
-            verifyAlive();
-            return;
-        }
-        Exception pingFailure;
-        try {
-            probeWithPing();
-            return;
-        } catch (Exception failure) {
-            pingFailure = failure;
-        }
-        synchronized (probeMonitor) {
-            // 通道已因真实 IO 错误判死时没有复核的必要，直接失败。
-            if (eventReaderFailure != null || commandChannelFailure != null) throw pingFailure;
+        if (pingKeepAliveSupported) {
+            try {
+                probeWithPing();
+            } catch (Exception pingFailure) {
+                synchronized (probeMonitor) {
+                    // 通道已因真实 IO 错误判死时没有复核的必要，直接失败。
+                    if (eventReaderFailure != null || commandChannelFailure != null) throw pingFailure;
+                }
+                pingKeepAliveSupported = false;
+            }
         }
         verifyAlive();
-        pingKeepAliveSupported = false;
     }
 
     /** 相机是否会对发起方的 PING 回 PONG；为 false 时保活走真实命令往返。 */

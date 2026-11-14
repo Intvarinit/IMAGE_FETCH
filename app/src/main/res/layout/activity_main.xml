@@ -17,69 +17,70 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:padding="@dimen/space_l">
+        android:padding="@dimen/space_m">
 
-        <!-- ① 连接 -->
+        <!-- ① 连接：地址/端口一行，三个按钮一行；不占额外标题行，把高度让给图片网格。 -->
         <LinearLayout
             style="@style/Widget.Card"
             android:layout_width="match_parent"
             android:layout_height="wrap_content">
 
-            <TextView
-                style="@style/Text.Section"
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/host_label" />
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
 
-            <EditText
-                android:id="@+id/host"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:hint="@string/host_hint"
-                android:inputType="textUri"
-                android:maxLines="1"
-                android:text="192.168.1.2" />
+                <EditText
+                    android:id="@+id/host"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="@string/host_hint"
+                    android:inputType="textUri"
+                    android:maxLines="1" />
+
+                <EditText
+                    android:id="@+id/port"
+                    android:layout_width="96dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="@dimen/space_s"
+                    android:hint="@string/port_label"
+                    android:inputType="number"
+                    android:maxLines="1"
+                    android:text="15740" />
+            </LinearLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="@dimen/space_s"
-                android:gravity="center_vertical"
                 android:orientation="horizontal">
-
-                <EditText
-                    android:id="@+id/port"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="@string/port_label"
-                    android:inputType="number"
-                    android:maxLines="1"
-                    android:text="15740" />
 
                 <Button
                     android:id="@+id/connect"
                     style="@style/Widget.Button.Primary"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="@dimen/space_s"
+                    android:layout_weight="1"
                     android:text="@string/connect" />
 
                 <Button
                     android:id="@+id/connectUsb"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="@dimen/space_s"
+                    android:layout_weight="1"
                     android:text="@string/connect_usb" />
-            </LinearLayout>
 
-            <Button
-                android:id="@+id/pickWifi"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="@dimen/space_s"
-                android:text="@string/pick_wifi" />
+                <Button
+                    android:id="@+id/pickWifi"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="@dimen/space_s"
+                    android:layout_weight="1"
+                    android:text="@string/pick_wifi" />
+            </LinearLayout>
         </LinearLayout>
 
         <ProgressBar
@@ -87,14 +88,15 @@
             style="?android:attr/progressBarStyleHorizontal"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/space_s"
-            android:max="100" />
+            android:layout_marginTop="6dp"
+            android:max="100"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="4dp"
             android:text="@string/status_idle"
             android:textColor="@color/ink"
             android:textSize="13sp" />
@@ -103,8 +105,7 @@
             android:id="@+id/outputDir"
             style="@style/Text.Caption"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="2dp" />
+            android:layout_height="wrap_content" />
 
         <!-- ② 操作 -->
         <LinearLayout
@@ -133,20 +134,6 @@
                     android:layout_marginStart="@dimen/space_s"
                     android:layout_weight="1"
                     android:text="@string/refresh_storage" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="@dimen/space_s"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/download"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="@string/download_selected" />
 
                 <Button
                     android:id="@+id/fullScan"
@@ -164,23 +151,32 @@
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
-                <CheckBox
-                    android:id="@+id/exportToGallery"
+                <Button
+                    android:id="@+id/download"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:checked="true"
-                    android:text="@string/export_to_gallery"
-                    android:textColor="@color/ink"
-                    android:textSize="13sp" />
+                    android:text="@string/download_selected" />
 
                 <Button
                     android:id="@+id/delete"
                     style="@style/Widget.Button.Danger"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="@dimen/space_s"
+                    android:layout_weight="1"
+                    android:text="@string/delete_selected" />
+
+                <CheckBox
+                    android:id="@+id/exportToGallery"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="@dimen/space_s"
-                    android:text="@string/delete_selected" />
+                    android:checked="true"
+                    android:maxLines="1"
+                    android:text="@string/export_to_gallery"
+                    android:textColor="@color/ink"
+                    android:textSize="13sp" />
             </LinearLayout>
 
         </LinearLayout>
@@ -203,7 +199,7 @@
                     android:id="@+id/prevPage"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minHeight="40dp"
+                    android:minHeight="34dp"
                     android:text="@string/previous_page" />
 
                 <TextView
@@ -235,14 +231,14 @@
                     android:id="@+id/nextPage"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:minHeight="40dp"
+                    android:minHeight="34dp"
                     android:text="@string/next_page" />
             </LinearLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="@dimen/space_s"
+                android:layout_marginTop="6dp"
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
@@ -276,7 +272,7 @@
             <FrameLayout
                 android:layout_width="match_parent"
                 android:layout_height="0dp"
-                android:layout_marginTop="@dimen/space_s"
+                android:layout_marginTop="6dp"
                 android:layout_weight="1">
 
                 <com.imagefetch.ui.PagedGridScroll
@@ -314,8 +310,8 @@
             style="@style/Widget.Button.Primary"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/space_s"
-            android:minHeight="48dp"
+            android:layout_marginTop="6dp"
+            android:minHeight="@dimen/touch_min"
             android:text="@string/shot_options" />
     </LinearLayout>
 

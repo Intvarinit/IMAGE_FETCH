@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">IMAGE_FETCH</string>
-    <string name="host_label">相机地址（Wi&#8209;Fi AP 或局域网 IP）</string>
-    <string name="host_hint">192.168.1.1</string>
+    <string name="host_hint">留空自动发现；也可填相机 IP</string>
+    <string name="auto_connect_detected">检测到相机 Wi‑Fi，正在自动发现并连接…</string>
+    <string name="ble_handover_scanning">正在通过蓝牙唤醒相机 Wi‑Fi…</string>
+    <string name="ble_handover_ready">蓝牙已唤醒相机 Wi‑Fi，等待相机网络就绪…</string>
     <string name="port_label">端口</string>
     <string name="connect">连接</string>
     <string name="connect_usb">连接 USB</string>
@@ -63,6 +65,14 @@
     <string name="live_view_tap_focus_hint">点按预览可移动对焦框（只移动、不触发对焦）。需先把「对焦方式」切到单点(Live)或定点(LiveSpotAF)——区域/面部追踪等方式下相机不响应移动命令。落点会用白色小方框标出。</string>
     <string name="pick_wifi">选择 Wi&#8209;Fi</string>
     <string name="pick_wifi_hint">已打开系统 Wi&#8209;Fi 设置；连上相机热点后回到本页即可连接。</string>
+    <string name="camera_wifi_title">相机 Wi&#8209;Fi</string>
+    <string name="camera_wifi_message">填好相机「显示 SSID 和密码」页面上的名称与密码后，本应用会用系统精确入网独占这个热点——即使它没有互联网，系统也不会把连接自动切到别的 Wi&#8209;Fi。只保存在本机。</string>
+    <string name="camera_ssid_hint">相机 Wi&#8209;Fi 名称（SSID）</string>
+    <string name="camera_wifi_password_hint">相机 Wi&#8209;Fi 密码</string>
+    <string name="camera_wifi_save">保存并连接</string>
+    <string name="camera_wifi_open_settings">系统设置里选网</string>
+    <string name="camera_wifi_saved">已记住相机 Wi&#8209;Fi「%1$s」，正在连接…</string>
+    <string name="camera_ssid_required">请先填写相机 Wi&#8209;Fi 名称。</string>
     <string name="session_notification_title">IMAGE_FETCH</string>
     <string name="session_notification_idle">相机会话进行中</string>
     <string name="session_channel_name">相机会话</string>
