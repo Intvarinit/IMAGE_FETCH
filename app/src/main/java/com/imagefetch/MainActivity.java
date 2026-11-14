@@ -17,10 +17,6 @@ import android.graphics.Matrix;
 import android.graphics.Typeface;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
-import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
@@ -158,13 +154,6 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private boolean pendingWifiPicker;
     /** 因缺「附近的设备」权限而暂缓的 Wi‑Fi 连接，授权回调后补发。 */
     private boolean pendingWifiConnect;
-    /** 自动连接：检测到「无互联网的 Wi‑Fi」（相机 AP 的典型形态）就自动发现并连。 */
-    private ConnectivityManager autoConnectManager;
-    private ConnectivityManager.NetworkCallback autoConnectCallback;
-    /** 已经为哪个网络自动连过：防止同一网络反复触发，直到网络丢失/重连。 */
-    private Network autoConnectLastNetwork;
-    /** 用户手动断开或改走 USB 后，本次运行不再自动连；再点连接即解除。 */
-    private boolean autoConnectSuppressed;
     /** 蓝牙唤醒相机 Wi‑Fi（官方 App 的 BLE handover）：连接期间保持，断开时释放。 */
     private CanonBleHandover bleHandover;
     /** 本次会话是否由 Wi‑Fi 发起（连接成功后据此反写 Wi‑Fi 名称；USB 会话与本机 Wi‑Fi 无关）。 */
@@ -201,6 +190,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private int gridRowsPerScreen;
     /** 图片栏代数：换页/断链时自增，用来丢弃迟到的铺格任务与缩略图解码结果。 */
     private int gridGeneration;
+    /** 铺格任务代数：分批建格子时作废尚未执行的后续批次。 */
+    private int gridBuildToken;
     /** 句柄 → 网格单元：缩略图/选中状态到达时就地更新，不重建整页。 */
     private final Map<Long, View> gridCells = new HashMap<>();
     /** 全屏看图页；不持有图片引用，关掉即释放。 */
@@ -475,15 +466,11 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
 
         connectButton.setOnClickListener(view -> {
             if (coordinator.isConnected()) {
-                // 用户明确断开：本次运行不再自动连，避免刚断就被系统网络回调拉回去。
-                autoConnectSuppressed = true;
+                // 用户明确断开：连接只在点击「连接」时发起，不保留任何自动重连。
                 coordinator.disconnect();
                 showReconnectHint();
                 return;
             }
-            // 手动连接解除抑制，并允许重新为当前网络自动发现。
-            autoConnectSuppressed = false;
-            autoConnectLastNetwork = null;
             int port = parsePort(portField.getText().toString().trim());
             // 地址留空表示自动发现：连上相机 Wi‑Fi 后按网段探测 15740。
             if (port <= 0) {
@@ -498,8 +485,6 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                 coordinator.disconnect();
                 return;
             }
-            // 改走 USB 时不要再被 Wi‑Fi 自动连接打断。
-            autoConnectSuppressed = true;
             setBusy(true);
             updateConnectButton(false);
             wifiSession = false;
@@ -580,6 +565,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         final int target = Math.max(0, pageIndex);
         setBusy(true);
         statusView.setText("正在读取存储卡…");
+        // 先作废上一页的整批缩略图：否则新页读取要排在剩余缩略图取回之后。
+        coordinator.cancelThumbnailFetch();
         coordinator.loadStoragePage(
                 target,
                 fullScanMode,
@@ -1494,11 +1481,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     @Override
     protected void onStart() {
         super.onStart();
-        // 回到前台：重新武装保活探测（HOLD 三态里 SUSPEND → HOLD）。
+        // 回到前台：恢复保活探测（HOLD 三态里 SUSPEND → HOLD）。
+        // 连接/蓝牙交接只由用户点击「连接」触发，进前台不再自动扫描或自动连接。
         if (coordinator != null) coordinator.resumeHold();
-        startAutoConnectWatch();
-        // 冷启动时相机 Wi‑Fi 可能早就连着了：网络回调不一定会再补一次 onAvailable。
-        maybeAutoConnect(currentCameraWifiNetwork());
     }
 
     @Override
@@ -1517,7 +1502,6 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     protected void onStop() {
         // 退到后台：停心跳探测省电、也避免后台一次网络抖动就误判离线；
         // 链路、WifiLock 与正在进行的传输/拍摄/取景都不受影响。
-        stopAutoConnectWatch();
         if (coordinator != null) coordinator.suspendHold();
         super.onStop();
     }
@@ -1537,6 +1521,9 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         dismissCapturePanel();
         deferredRecycle.removeCallbacksAndMessages(null);
         debounceHandler.removeCallbacksAndMessages(null);
+        // 作废尚未执行的铺格批次，避免它们继续往已销毁的视图上加格子。
+        gridGeneration++;
+        gridBuildToken++;
         thumbnailExecutor.shutdownNow();
         recycleLiveViewBitmap();
         if (coordinator != null) coordinator.shutdown();
@@ -3325,8 +3312,6 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
      * 先向下排满一列再往右开下一列，左右滑动整屏翻页。
      */
     private void rebuildPagedGrid(final List<CameraStorage.Item> items) {
-        gridPagerContent.removeAllViews();
-        gridCells.clear();
         int width = gridPager.getWidth();
         int height = gridPager.getHeight();
         if (width <= 0 || height <= 0) {
@@ -3334,6 +3319,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             gridPager.post(() -> rebuildPagedGrid(items));
             return;
         }
+        gridPagerContent.removeAllViews();
+        gridCells.clear();
 
         // 3 列：缩略图宽度比 4 列大约三分之一，能看清内容；格子高度目标 96dp，
         // 屏幕高度富余时自动放大（行数 = 高度 ÷ 目标），保证粗估 2~3 行。
@@ -3345,13 +3332,32 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
         gridPageCapacity = columnsPerScreen * rows;
         gridColumns = columnsPerScreen;
         gridRowsPerScreen = rows;
+        gridPager.scrollTo(0, 0);
 
+        final int buildToken = ++gridBuildToken;
+        buildGridChunk(items, 0, buildToken, cellWidth, cellHeight, height, rows);
+    }
+
+    /**
+     * 分批铺格：一次只建一屏（3 列 × N 行），剩余交给消息队列。
+     * 100 张/页时整页同步 inflate 会让主线程停顿，既卡翻页也顺延保活/超时回调。
+     */
+    private void buildGridChunk(
+            final List<CameraStorage.Item> items,
+            final int startIndex,
+            final int buildToken,
+            final int cellWidth,
+            final int cellHeight,
+            final int columnHeight,
+            final int rows) {
+        if (buildToken != gridBuildToken) return;
+        final int end = Math.min(items.size(), startIndex + gridColumns * rows);
         LinearLayout column = null;
-        for (int index = 0; index < items.size(); index++) {
-            if (index % rows == 0) {
+        for (int index = startIndex; index < end; index++) {
+            if (index % rows == 0 || column == null) {
                 column = new LinearLayout(this);
                 column.setOrientation(LinearLayout.VERTICAL);
-                column.setLayoutParams(new LinearLayout.LayoutParams(cellWidth, height));
+                column.setLayoutParams(new LinearLayout.LayoutParams(cellWidth, columnHeight));
                 gridPagerContent.addView(column);
             }
             CameraStorage.Item item = items.get(index);
@@ -3368,9 +3374,12 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
             gridCells.put(item.handle, cell);
             column.addView(cell);
         }
-
-        gridPager.scrollTo(0, 0);
-        gridPager.post(() -> updateGridIndex(0, gridScreenCount()));
+        if (end < items.size()) {
+            gridPager.post(() ->
+                    buildGridChunk(items, end, buildToken, cellWidth, cellHeight, columnHeight, rows));
+        } else {
+            gridPager.post(() -> updateGridIndex(0, gridScreenCount()));
+        }
     }
 
     private float dp(float value) {
@@ -3435,6 +3444,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     private void clearGridPager() {
         // 代数自增：把还没执行的铺格任务和在途缩略图解码结果一并作废。
         gridGeneration++;
+        gridBuildToken++;
+        if (coordinator != null) coordinator.cancelThumbnailFetch();
         gridPagerContent.removeAllViews();
         gridCells.clear();
         gridPageCapacity = 0;
@@ -3684,20 +3695,29 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                     // 真正连上 PTP 后由 persistSuccessfulWifiRecord 落盘，失败不覆盖上次成功记录。
                     // 相机要求等 AP 真正起来（WTIME）再入网；实测热点可见比 WTIME 还慢，
                     // 再多给 8s，避免第一次扫描窗口扑空后一路重试失败。
-                    long wait = Math.max(800L, result.waitMillis) + 8000L;
+                    // 例外：手机已经连在相机热点上时热点就在手边，等到几乎等于白等，
+                    // 还会把相机的 AP 空闲计时拖到临界点。
                     statusView.setText(R.string.ble_handover_ready);
-                    connectButton.postDelayed(() -> {
-                        boolean sameSsid = result.ssid != null && !result.ssid.isEmpty()
-                                && result.ssid.equals(connectedWifiSsid());
-                        if (sameSsid) {
-                            // 已经在这个 AP 上：不再弹「加入网络」对话框，直接用交接来的 IP。
-                            performWifiConnect(result.ip, port, "", "", "");
-                        } else {
-                            // 官方同样用交接返回的 BSSID 钉住热点；隐藏 SSID 只靠定向探测不稳。
-                            performWifiConnect(result.ip, port, result.ssid, result.password,
-                                    result.bssid);
-                        }
-                    }, wait);
+                    // 先把本次交接的 SSID/密码交给协调器：onReady 阶段的「是否已在相机热点」
+                    // 检查要用它做比较，否则只能等 performWifiConnect 之后再设置。
+                    coordinator.setCameraWifiCredentials(result.ssid, result.password);
+                    coordinator.setCameraWifiBssid(result.bssid);
+                    coordinator.checkAlreadyOnCameraWifi(alreadyOnCameraWifi -> {
+                        long wait = alreadyOnCameraWifi
+                                ? 0L : Math.max(800L, result.waitMillis) + 8000L;
+                        connectButton.postDelayed(() -> {
+                            boolean sameSsid = result.ssid != null && !result.ssid.isEmpty()
+                                    && result.ssid.equals(connectedWifiSsid());
+                            if (sameSsid) {
+                                // 已经在这个 AP 上：不再弹「加入网络」对话框，直接用交接来的 IP。
+                                performWifiConnect(result.ip, port, "", "", "");
+                            } else {
+                                // 官方同样用交接返回的 BSSID 钉住热点；隐藏 SSID 只靠定向探测不稳。
+                                performWifiConnect(result.ip, port, result.ssid, result.password,
+                                        result.bssid);
+                            }
+                        }, wait);
+                    });
                 });
             }
 
@@ -3764,98 +3784,6 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     /**
-     * 自动连接：相机 AP 在系统里通常表现为「Wi‑Fi 但没有互联网」，监听这类网络出现即发现并连接。
-     * 只在应用前台注册，避免后台偷偷改网络；用户手动断开或改走 USB 后不再自动触发。
-     */
-    private void startAutoConnectWatch() {
-        if (autoConnectCallback != null) return;
-        ConnectivityManager manager =
-                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (manager == null) return;
-        autoConnectManager = manager;
-        autoConnectCallback = new ConnectivityManager.NetworkCallback() {
-            @Override public void onAvailable(Network network) {
-                runOnUiThread(() -> maybeAutoConnect(network));
-            }
-
-            @Override public void onLost(Network network) {
-                runOnUiThread(() -> {
-                    if (network.equals(autoConnectLastNetwork)) autoConnectLastNetwork = null;
-                });
-            }
-        };
-        NetworkRequest request = new NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build();
-        try {
-            manager.registerNetworkCallback(request, autoConnectCallback);
-        } catch (Exception ignored) {
-            autoConnectCallback = null;
-        }
-    }
-
-    private void stopAutoConnectWatch() {
-        ConnectivityManager manager = autoConnectManager;
-        ConnectivityManager.NetworkCallback callback = autoConnectCallback;
-        autoConnectManager = null;
-        autoConnectCallback = null;
-        if (manager == null || callback == null) return;
-        try {
-            manager.unregisterNetworkCallback(callback);
-        } catch (Exception ignored) {
-        }
-    }
-
-    /** 当前是否已经连着一个「无互联网的 Wi‑Fi」——相机直连 AP 的典型形态。 */
-    private Network currentCameraWifiNetwork() {
-        ConnectivityManager manager =
-                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (manager == null) return null;
-        try {
-            for (Network network : manager.getAllNetworks()) {
-                NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
-                if (capabilities == null
-                        || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    continue;
-                }
-                if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                    return network;
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return null;
-    }
-
-    /** 检测到相机 Wi‑Fi 就自动发现并连接；同一网络只尝试一次，避免失败后反复弹错。 */
-    private void maybeAutoConnect(Network candidate) {
-        if (autoConnectSuppressed || coordinator == null || coordinator.isConnected()
-                || coordinator.isConnecting()) {
-            return;
-        }
-        Network cameraNetwork = candidate != null ? candidate : currentCameraWifiNetwork();
-        if (cameraNetwork == null || cameraNetwork.equals(autoConnectLastNetwork)) return;
-        // 记过相机 SSID 且能读到当前 SSID 时，只在名称匹配时才自动连，避免误连其它无网 Wi‑Fi。
-        String storedSsid = preferences.getString(PREF_CAMERA_SSID, "");
-        String storedPassword = preferences.getString(PREF_CAMERA_PASSWORD, "");
-        if (!storedSsid.isEmpty()) {
-            String currentSsid = connectedWifiSsid();
-            if (!currentSsid.isEmpty() && !storedSsid.equals(currentSsid)) return;
-        }
-        autoConnectLastNetwork = cameraNetwork;
-        int port = parsePort(portField.getText().toString().trim());
-        if (port <= 0) port = 15740;
-        statusView.setText(R.string.auto_connect_detected);
-        // 有蓝牙权限时先尝试官方同款 BLE 交接，否则用已记住的凭据直接入网（没有就沿用当前网络）。
-        if (BLE_HANDOVER_ENABLED && hasBlePermissions()) {
-            beginBleThenConnect(port);
-        } else {
-            performWifiConnect("", port, storedSsid, storedPassword);
-        }
-    }
-
-    /**
      * 相机 Wi‑Fi 凭据：SSID + 密码只存本机。有了它，协调器会用 WifiNetworkSpecifier
      * 把相机热点变成「仅本应用使用」的网络——系统不会因为「无互联网」把连接切走。
      * 同时保留原来的「去系统设置选网」入口。
@@ -3909,8 +3837,6 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
                     }
                     // 先不落盘：等真正连上相机再保存，失败/密码错不会顶掉上一次成功记录。
                     dialog.dismiss();
-                    autoConnectSuppressed = false;
-                    autoConnectLastNetwork = null;
                     // 选中的是「上次成功连接」的相机热点：断开后相机通常已把热点关掉，
                     // 直接 Specifier 会一直等不到；先走 BLE 交接让相机重开热点，
                     // 交接失败会回退到已保存凭据直连（见 beginBleThenConnect）。

@@ -9,7 +9,7 @@
 ## 1. 链路总览
 
 ```
-点「连接」/ 启动自动连接
+点「连接」（唯一入口，启动/回前台不自动扫描）
   → BLE 交接：唤醒相机、让相机自己开热点，交回 SSID/密码/IP/BSSID/WTIME
   → 等 WTIME + 8s（实测热点可见比相机上报的 WTIME 还慢）
   → WifiNetworkSpecifier 入网（钉 BSSID + 声明隐藏 SSID + WPA2 密码）
@@ -69,6 +69,12 @@
    不限定 BSSID → 按隐藏热点 → WPA3。避免连续弹系统对话框。
 4. 入网成功：`bindProcessToNetwork(network)`，再等 600ms 让 DHCP/路由就绪才发 PTP 握手。
 5. 手动断开时 `bindProcessToNetwork(null)`。
+
+「已在相机热点上」的快路径：`isAlreadyOnCameraWifi()` 先比对 SSID
+（`WifiInfo`，脱敏时退回 `NetworkCapabilities.getTransportInfo()`）；两者都读不到时，
+对上次相机地址做一次 600ms TCP 探测。**只有探测确认 PTP 端口可达才跳过 Specifier**，
+并给探测连接 900ms 回收时间后直接握手；探测失败仍走上面的 Specifier 链路。
+BLE 交接会重启相机 AP，手动连接可能因此短暂掉线，这时探测会失败并正确回退。
 
 注意：打开系统 Wi‑Fi 设置页会释放 App 的 Specifier 网络，导致 PTP `ECONNABORTED`；
 测试时不要中途跳设置页。
@@ -160,9 +166,9 @@ adb shell am force-stop --user 0 com.imagefetch
 ## 8. 已知限制 / 后续可做
 
 - 后台只做了 3 分钟息屏测试；更长待机（Doze 深度休眠、厂商杀进程）未压测。
-  心跳跑在主线程 Handler 上，极端省电策略下仍可能被节流。
-- 蓝牙关闭场景仍会先试 12s Specifier 再扫描网段；
-  若要更快，可先判断「当前是否已连相机 SSID」，已连就直接发现 IP。
+  PTP 心跳计时已移到独立 `ScheduledExecutorService`，BLE 保活计时也已独立，主线程繁忙不再顺延 tick。
+- 蓝牙关闭场景若系统已连在相机热点上，会先做一次 TCP 探测：PTP 端口可达就跳过 Specifier
+  直接握手，不可达仍先试 Specifier 再扫描网段。BLE 交接重启热点导致掉线时会自动回退。
 - 大批量下载期间相机侧的空闲判定未单独验证（下载与心跳已分线程）。
 - BLE 交接的看门狗只对已配对设备生效，首次配对仍按 90s 总超时兜底。
 

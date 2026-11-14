@@ -4,6 +4,7 @@ import com.imagefetch.transport.CameraTransport;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.Map;
 
 /**
  * 会话与操作的单一入口：连接、拍摄、存储卷/对象枚举、对象下载。
@@ -54,6 +55,12 @@ public final class PtpOperationService {
     /** 枚举存储卡对象；maxItems &gt; 0 时每目录只取最新的 maxItems 张。 */
     public CameraStorage.Snapshot snapshot(int maxItems) throws Exception {
         return transport.listStorage(maxItems);
+    }
+
+    /** 只枚举拍摄基线之后新增的对象（各卷按最大句柄判界），用于收图轮询。 */
+    public CameraStorage.Snapshot snapshotNewerThan(
+            Map<Long, Long> maxHandles, int maxItems) throws Exception {
+        return transport.listStorageNewerThan(maxHandles, maxItems);
     }
 
     /** 快速分页：只对当前页取 ObjectInfo，翻页复用句柄缓存。 */

@@ -14,6 +14,8 @@ import android.net.MacAddress;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.TransportInfo;
+import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiNetworkSpecifier;
 import android.os.Build;
@@ -51,7 +53,9 @@ import com.imagefetch.transport.UsbPtpTransport;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.NoRouteToHostException;
+import java.net.Socket;
 import java.net.UnknownHostException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -62,6 +66,8 @@ import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -274,10 +280,20 @@ public final class CameraSessionCoordinator {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     /**
+     * 缩略图取图独立线程：整页 20~100 张是一次很长的任务，与翻页/预览/拍摄共用 FIFO 时，
+     * 用户翻页要排在剩余缩略图之后（与「能力探测堵心跳」同一类问题）。
+     * 传输层每个方法都持有实例锁，两条线程不会让 PTP 命令交错。
+     */
+    private final ExecutorService thumbnailFetchExecutor = Executors.newSingleThreadExecutor();
+    /**
      * 心跳独立线程：与 executor 共用时会被整批缩略图/翻页任务堵住，
      * 实测能出现 40 秒空窗，相机按空闲超时直接关热点。
      */
     private final ExecutorService heartbeatExecutor = Executors.newSingleThreadExecutor();
+    /** 心跳计时器：主线程忙时 postDelayed 会被顺延，保活 tick 必须自己有一条时间线。 */
+    private final ScheduledExecutorService heartbeatTimer =
+            Executors.newSingleThreadScheduledExecutor();
+    private volatile ScheduledFuture<?> heartbeatFuture;
     private final AtomicBoolean heartbeatInFlight = new AtomicBoolean(false);
     private final PtpIpTransport wifiTransport = new PtpIpTransport();
     private final UsbPtpTransport usbTransport;
@@ -342,6 +358,12 @@ public final class CameraSessionCoordinator {
     private static final long SPECIFIER_FAST_FAIL_MS = 5_000L;
     /** 入网成功后给相机网络栈一点时间（路由/DHCP 生效），再发 PTP/IP 握手。 */
     private static final long WIFI_JOIN_SETTLE_MS = 600L;
+    /** 判断「当前已经在相机热点上」时，短 TCP 探测相机 PTP 端口的超时。 */
+    private static final long CAMERA_REACHABILITY_TIMEOUT_MS = 600L;
+    /** 「已确认在相机热点上」的短缓存：避免 onReady 与 bindWifiNetwork 各探测一次。 */
+    private static final long CAMERA_WIFI_CONFIRM_TTL_MS = 10_000L;
+    private volatile boolean cameraWifiConfirmed;
+    private volatile long cameraWifiConfirmedAt;
     /** 自动发现：单次 TCP 探测超时与并发度。 */
     private static final int DISCOVERY_PROBE_TIMEOUT_MS = 500;
     private static final int DISCOVERY_CONCURRENCY = 24;
@@ -363,9 +385,10 @@ public final class CameraSessionCoordinator {
     private volatile CapabilityReport lastCapabilityReport;
     private volatile int pageSize = DEFAULT_PAGE_SIZE;
 
-    /** 缩略图缓存：按张数计，避免来回滚动时重复向相机取图。 */
+    /** 缩略图缓存：按张数计，至少覆盖界面可选的最大页（100 张）×3 页，回翻不必重复取图。 */
+    private static final int THUMBNAIL_CACHE_ENTRIES = 300;
     private final LruCache<Long, byte[]> thumbnailCache =
-            new LruCache<Long, byte[]>(64) {
+            new LruCache<Long, byte[]>(THUMBNAIL_CACHE_ENTRIES) {
                 @Override protected int sizeOf(Long key, byte[] value) {
                     return 1;
                 }
@@ -745,7 +768,8 @@ public final class CameraSessionCoordinator {
     }
 
     /**
-     * 逐张读取缩略图。与其它相机事务共用同一 executor，因此不会与下载/拍摄交错；
+     * 逐张读取缩略图。走独立的 {@link #thumbnailFetchExecutor}：翻页/预览/拍摄命令
+     * 不必排在整页取图之后；传输层实例锁保证两条线程的命令不会在同一个 socket 上交错。
      * 命中缓存直接回调。每次调用产生新的 generation，旧批次会被放弃。
      */
     public void loadThumbnails(
@@ -753,7 +777,7 @@ public final class CameraSessionCoordinator {
         final long generation = ++thumbnailGeneration;
         final PtpOperationService session = operations;
         if (session == null || items == null || items.isEmpty()) return;
-        executor.submit(() -> {
+        thumbnailFetchExecutor.submit(() -> {
             Exception firstError = null;
             int okCount = 0;
             int emptyCount = 0;
@@ -803,6 +827,14 @@ public final class CameraSessionCoordinator {
         mainHandler.post(() -> {
             if (generation == thumbnailGeneration) callback.onThumbnail(handle, jpeg);
         });
+    }
+
+    /**
+     * 作废在途缩略图批次（翻页/换筛选/断开前调用）。旧批次会在当前这张取完后退出，
+     * 不再让新页读取排在整页缩略图之后。线程安全：只在主线程调用，代际为 volatile。
+     */
+    public void cancelThumbnailFetch() {
+        thumbnailGeneration++;
     }
 
     /** 放大预览回调；bitmap 为 null 表示取不到原图（RAW/视频/相机不支持），沿用缩略图。 */
@@ -910,7 +942,7 @@ public final class CameraSessionCoordinator {
         heartbeat.reset();
         reconnectAttempt = 0;
         // 用户主动连接优先于任何在途的自动重连。
-        mainHandler.removeCallbacks(heartbeatRunnable);
+        cancelHeartbeat();
         mainHandler.removeCallbacks(reconnectRunnable);
         cameraHost = host == null ? "" : host.trim();
         cameraPort = port;
@@ -1259,7 +1291,7 @@ public final class CameraSessionCoordinator {
         suspended = false;
         reconnecting = false;
         connecting = false;
-        mainHandler.removeCallbacks(heartbeatRunnable);
+        cancelHeartbeat();
         mainHandler.removeCallbacks(reconnectRunnable);
         unregisterWifiNetworkCallback();
         unregisterSpecifierCallback();
@@ -1293,7 +1325,7 @@ public final class CameraSessionCoordinator {
         manualDisconnect = true;
         suspended = false;
         invalidateLiveView();
-        mainHandler.removeCallbacks(heartbeatRunnable);
+        cancelHeartbeat();
         mainHandler.removeCallbacks(reconnectRunnable);
         CameraTransport session = transport;
         TransferControl current = control;
@@ -1308,7 +1340,9 @@ public final class CameraSessionCoordinator {
         unregisterSpecifierCallback();
         releaseWifiLock();
         executor.shutdownNow();
+        thumbnailFetchExecutor.shutdownNow();
         heartbeatExecutor.shutdownNow();
+        heartbeatTimer.shutdownNow();
     }
 
     public void cancelCurrent() {
@@ -2544,8 +2578,17 @@ public final class CameraSessionCoordinator {
     }
 
     private void startHeartbeat(long intervalMillis) {
-        mainHandler.removeCallbacks(heartbeatRunnable);
-        mainHandler.postDelayed(heartbeatRunnable, intervalMillis);
+        cancelHeartbeat();
+        // 断开/重连期间不再续约；在途 runnable 结束后也不会把自己重新挂上。
+        if (manualDisconnect || reconnecting || !connected) return;
+        heartbeatFuture = heartbeatTimer.schedule(
+                heartbeatRunnable, Math.max(0L, intervalMillis), TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelHeartbeat() {
+        ScheduledFuture<?> pending = heartbeatFuture;
+        heartbeatFuture = null;
+        if (pending != null) pending.cancel(false);
     }
 
     /** 连续 3 次心跳无响应 / 绑定网络丢失 → 判离线，进入重连态。 */
@@ -2558,7 +2601,7 @@ public final class CameraSessionCoordinator {
         connected = false;
         heartbeat.reset();
         reconnectAttempt = 0;
-        mainHandler.removeCallbacks(heartbeatRunnable);
+        cancelHeartbeat();
         unregisterWifiNetworkCallback();
         unregisterSpecifierCallback();
         // 绑定网络随会话作废；候选缓存保留，供紧接的自动重连复用。
@@ -2647,6 +2690,120 @@ public final class CameraSessionCoordinator {
     }
 
     /**
+     * 系统当前是否已经连在相机热点上（手动连接或上次 Specifier 会话遗留）。
+     *
+     * <p>优先比对 SSID；Android 13+ 未授予定位时 {@code WifiInfo#getSSID()} 会脱敏成
+     * {@code <unknown ssid>}，此时退回 {@link NetworkCapabilities#getSsid()}（API 29+）。
+     * 两者都读不到时，用一次短 TCP 探测确认「上次的相机地址」在当前网络可达——
+     * 只要相机 PTP 端口能连上，就没必要再弹 Specifier 干等十几秒。
+     */
+    private boolean isAlreadyOnCameraWifi() {
+        if (!isValidSsid(cameraSsid)) return false;
+        long now = System.currentTimeMillis();
+        if (cameraWifiConfirmed
+                && now - cameraWifiConfirmedAt < CAMERA_WIFI_CONFIRM_TTL_MS) {
+            return true;
+        }
+        String target = cameraSsid.trim();
+        String current = currentWifiSsid();
+        if (target.equals(current)) {
+            markCameraWifiConfirmed();
+            Log.i("ImageFetch", "isAlreadyOnCameraWifi ssid=" + current + " -> true");
+            return true;
+        }
+        String host = cameraHost != null && !cameraHost.trim().isEmpty()
+                ? cameraHost.trim()
+                : prefs().getString(PREF_LAST_CAMERA_HOST, "");
+        boolean reachable = isCameraHostReachable(host);
+        Log.i("ImageFetch", "isAlreadyOnCameraWifi current=" + current
+                + " host=" + host + " reachable=" + reachable);
+        if (reachable) {
+            // 探测连接刚关掉：给相机一点时间回收再发真正的 PTP/IP 握手（同地址发现）。
+            sleepQuietly(DISCOVERY_SETTLE_MS);
+            markCameraWifiConfirmed();
+        }
+        return reachable;
+    }
+
+    private void markCameraWifiConfirmed() {
+        cameraWifiConfirmed = true;
+        cameraWifiConfirmedAt = System.currentTimeMillis();
+    }
+
+    /** 供界面在 BLE 交接完成后判断：热点已经在手边时不必再干等 WTIME + 8s。 */
+    public interface CameraWifiCallback {
+        void onResult(boolean alreadyOnCameraWifi);
+    }
+
+    public void checkAlreadyOnCameraWifi(final CameraWifiCallback callback) {
+        executor.submit(() -> {
+            final boolean result = isAlreadyOnCameraWifi();
+            mainHandler.post(() -> callback.onResult(result));
+        });
+    }
+
+    /** 当前所连 Wi-Fi 的 SSID（脱敏/不可读时返回空串）。 */
+    @SuppressWarnings("deprecation")
+    private String currentWifiSsid() {
+        if (wifiManager != null) {
+            try {
+                WifiInfo info = wifiManager.getConnectionInfo();
+                if (info != null && info.getNetworkId() != -1) {
+                    String ssid = normalizeSsid(info.getSSID());
+                    if (!ssid.isEmpty()) return ssid;
+                }
+            } catch (Exception ignored) {
+                // 缺权限时走下面的 NetworkCapabilities 兜底。
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && connectivityManager != null) {
+            try {
+                Network active = connectivityManager.getActiveNetwork();
+                NetworkCapabilities capabilities =
+                        connectivityManager.getNetworkCapabilities(active);
+                if (capabilities != null
+                        && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    TransportInfo transport = capabilities.getTransportInfo();
+                    if (transport instanceof WifiInfo) {
+                        return normalizeSsid(((WifiInfo) transport).getSSID());
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return "";
+    }
+
+    /** 去掉系统给的引号；{@code <unknown ssid>} 这类脱敏值按空串处理。 */
+    private static String normalizeSsid(String ssid) {
+        if (ssid == null) return "";
+        String value = ssid;
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length() - 1);
+        }
+        return value.startsWith("<") ? "" : value;
+    }
+
+    /** 短 TCP 探测相机 PTP 端口：只验证「当前网络能看到相机」，不建立 PTP 会话。 */
+    private boolean isCameraHostReachable(String host) {
+        if (host == null || host.trim().isEmpty()) return false;
+        int port = cameraPort > 0 ? cameraPort : 15740;
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(host.trim(), port),
+                    (int) CAMERA_REACHABILITY_TIMEOUT_MS);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    /**
      * 为当前会话绑定相机 Wi‑Fi 网络，并把 socket 工厂注入传输层。
      * 填了 SSID 且系统支持时优先弹「加入网络」对话框精确加入；用户取消 / 超时 / 密码错
      * 只回退到自动选网，不判失败。两条路径都只在拿到「首选网络」时注入其 SocketFactory，
@@ -2659,7 +2816,19 @@ public final class CameraSessionCoordinator {
      * <p>在 executor 线程上执行；等待系统对话框会短暂阻塞该线程。
      */
     private void bindWifiNetwork(PtpIpTransport active, long generation, boolean reconnect) {
-        if (shouldUseSpecifier(Build.VERSION.SDK_INT, cameraSsid)
+        // 系统已经连在相机热点上（手动入网/上次会话遗留）时不必再弹一次 Specifier：
+        // 荣耀等机型上这一步要等 25s+ 才失败，白白拖慢整条连接链路。
+        boolean alreadyOnCameraWifi = shouldUseSpecifier(Build.VERSION.SDK_INT, cameraSsid)
+                && isAlreadyOnCameraWifi();
+        if (alreadyOnCameraWifi) {
+            // 本次不需要交接失败后的短等待；清掉以免污染下一次连接。
+            cameraWifiFallbackTimeoutMs = 0L;
+            unregisterSpecifierCallback();
+            listener.onStatus("已连接相机 Wi‑Fi「" + cameraSsid + "」，直接建立 PTP/IP…");
+            Log.i("ImageFetch", "already on camera wifi ssid=" + cameraSsid);
+        }
+        if (!alreadyOnCameraWifi
+                && shouldUseSpecifier(Build.VERSION.SDK_INT, cameraSsid)
                 && connectAttemptActive(generation, reconnect)) {
             android.util.Log.i("ImageFetch", "bindWifiNetwork ssid=" + cameraSsid
                     + " passLen=" + cameraPassphrase.length() + " reconnect=" + reconnect);
@@ -2751,6 +2920,13 @@ public final class CameraSessionCoordinator {
         Network network = liveCameraWifiNetwork();
         sessionNetwork = network;
         active.setSocketFactory(network != null ? network.getSocketFactory() : null);
+        if (alreadyOnCameraWifi && network != null && connectivityManager != null) {
+            // 手动入网不属于 App，系统可能随时切回有网的热点；把进程钉在相机网络上。
+            try {
+                connectivityManager.bindProcessToNetwork(network);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     /** 发起一次入网请求并等结果（executor 线程阻塞）；失败返回 null。 */

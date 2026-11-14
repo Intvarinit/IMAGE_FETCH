@@ -8,8 +8,10 @@ package com.imagefetch.ptp;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /** Standard PTP datasets: storage ids, object handles, storage info, object info. */
 public final class CameraStorage {
@@ -99,10 +101,22 @@ public final class CameraStorage {
     public static final class Snapshot {
         public final List<Volume> volumes;
         public final List<Item> items;
+        /**
+         * 每个存储卷枚举到的最大对象句柄（含目录）。拍摄收图轮询用它做「只需要看更新对象」的
+         * 下界，避免每轮都对整卡逐张取 ObjectInfo。没有枚举信息时为空表。
+         */
+        public final Map<Long, Long> maxHandleByStorage;
 
         public Snapshot(List<Volume> volumes, List<Item> items) {
+            this(volumes, items, Collections.emptyMap());
+        }
+
+        public Snapshot(
+                List<Volume> volumes, List<Item> items, Map<Long, Long> maxHandleByStorage) {
             this.volumes = Collections.unmodifiableList(new ArrayList<>(volumes));
             this.items = Collections.unmodifiableList(new ArrayList<>(items));
+            this.maxHandleByStorage = Collections.unmodifiableMap(
+                    new LinkedHashMap<>(maxHandleByStorage));
         }
 
         public long capacityBytes() {

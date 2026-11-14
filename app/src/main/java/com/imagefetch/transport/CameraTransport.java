@@ -9,6 +9,7 @@ import com.imagefetch.ptp.VendorPropertySnapshot;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.Map;
 
 /**
  * 相机传输抽象。首版只有 Wi‑Fi/PTP‑IP 实现（{@link PtpIpTransport}）；
@@ -43,6 +44,17 @@ public interface CameraTransport extends Closeable {
      *                 &lt;= 0 表示不限、整卡枚举。
      */
     CameraStorage.Snapshot listStorage(int maxItems) throws Exception;
+
+    /**
+     * 只枚举「句柄大于基线」的对象（拍摄收图轮询专用），避免每轮对整卡逐张取 ObjectInfo。
+     * 默认实现退回完整枚举（对不支持快速枚举的传输保持原行为）。
+     *
+     * @param maxHandles 基线时各存储卷的最大句柄；缺失的卷按没有基线处理
+     */
+    default CameraStorage.Snapshot listStorageNewerThan(
+            Map<Long, Long> maxHandles, int maxItems) throws Exception {
+        return listStorage(maxItems);
+    }
 
     /**
      * 快速分页：只列文件句柄（浅层目录探测）并只对当前页取 ObjectInfo，

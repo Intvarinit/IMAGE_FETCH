@@ -239,23 +239,64 @@ public final class StorageBrowser {
     public static CameraStorage.Snapshot loadAll(Invoker invoker, int maxItems) throws Exception {
         List<CameraStorage.Volume> volumes = new ArrayList<>();
         List<CameraStorage.Item> items = new ArrayList<>();
+        Map<Long, Long> maxHandles = new LinkedHashMap<>();
         for (Long storageId : storageIds(invoker)) {
             volumes.add(CameraStorage.parseStorageInfo(
                     storageId,
                     invoker.invoke(GET_STORAGE_INFO, new long[]{storageId})));
-            appendAll(invoker, storageId, items, maxItems);
+            appendAll(invoker, storageId, items, maxItems, maxHandles);
         }
         sortNewestFirst(items);
         if (maxItems > 0 && items.size() > maxItems) {
             items = new ArrayList<>(items.subList(0, maxItems));
         }
-        return new CameraStorage.Snapshot(volumes, items);
+        return new CameraStorage.Snapshot(volumes, items, maxHandles);
+    }
+
+    /**
+     * 只列「句柄大于基线最大值」的对象（拍摄收图轮询专用）。
+     *
+     * <p>完整扫描每轮都会对最新几十张逐个取 ObjectInfo，而拍摄等待时每秒要轮询一次；
+     * 这里改成先做浅层句柄枚举（拍照只会在既有 DCF 目录里追加文件），再只对超出基线的
+     * 少量新句柄取 ObjectInfo，把每轮往返从「60+ 次」降到「目录数 + 新张数」。
+     *
+     * <p>依赖相机「句柄单调递增」的通行行为（与 {@link CameraStorage#newestHandles} 同一假设）。
+     *
+     * @param maxHandles 基线时各存储卷枚举到的最大句柄；缺失的卷按「没有基线」处理
+     */
+    public static CameraStorage.Snapshot loadNewerThan(
+            Invoker invoker, Map<Long, Long> maxHandles, int maxItems) throws Exception {
+        int limit = maxItems > 0 ? maxItems : Integer.MAX_VALUE;
+        List<CameraStorage.Item> items = new ArrayList<>();
+        for (Long storageId : storageIds(invoker)) {
+            Long baseline = maxHandles == null ? null : maxHandles.get(storageId);
+            long minHandle = baseline == null ? Long.MIN_VALUE : baseline;
+            List<Long> fresh = new ArrayList<>();
+            for (Long handle : collectFileHandles(invoker, storageId)) {
+                if (handle != null && handle > minHandle) fresh.add(handle);
+            }
+            fresh.sort((left, right) -> Long.compare(right, left));
+            int inspected = Math.min(fresh.size(), limit);
+            for (int index = 0; index < inspected; index++) {
+                CameraStorage.Item item = objectInfo(invoker, fresh.get(index));
+                if (item != null) items.add(item);
+            }
+            if (items.size() >= limit) break;
+        }
+        sortNewestFirst(items);
+        if (items.size() > limit) items = new ArrayList<>(items.subList(0, limit));
+        return new CameraStorage.Snapshot(Collections.emptyList(), items);
     }
 
     private static void appendAll(
-            Invoker invoker, long storageId, List<CameraStorage.Item> items, int maxItems)
-            throws Exception {
-        ArrayDeque<Long> pending = new ArrayDeque<>(handles(invoker, storageId, ROOT_ASSOCIATION));
+            Invoker invoker,
+            long storageId,
+            List<CameraStorage.Item> items,
+            int maxItems,
+            Map<Long, Long> maxHandles) throws Exception {
+        List<Long> rootHandles = handles(invoker, storageId, ROOT_ASSOCIATION);
+        noteMaxHandles(maxHandles, storageId, rootHandles);
+        ArrayDeque<Long> pending = new ArrayDeque<>(rootHandles);
         Set<Long> visited = new HashSet<>();
         while (!pending.isEmpty()) {
             long handle = pending.removeFirst();
@@ -263,6 +304,9 @@ public final class StorageBrowser {
             byte[] info = invoker.invoke(GET_OBJECT_INFO, new long[]{handle});
             if (CameraStorage.isAssociation(info)) {
                 List<Long> children = new ArrayList<>(handles(invoker, storageId, handle));
+                // 即使裁剪 ObjectInfo 调用量，也要先把整份句柄计入最大值：
+                // 下一轮增量枚举据此判断哪些才是拍摄之后新增的对象。
+                noteMaxHandles(maxHandles, storageId, children);
                 // 目录内按“句柄越大越新”裁剪，把 ObjectInfo 调用量从整卡文件数降到 maxItems。
                 if (maxItems > 0 && children.size() > maxItems) {
                     children = CameraStorage.newestHandles(children, maxItems);
@@ -275,6 +319,17 @@ public final class StorageBrowser {
             CameraStorage.Item item = CameraStorage.parseObjectInfo(handle, info);
             if (item != null) items.add(item);
         }
+    }
+
+    /** 记录某存储卷枚举到的最大句柄（目录与文件都算：它们共享同一套句柄空间）。 */
+    private static void noteMaxHandles(
+            Map<Long, Long> maxHandles, long storageId, List<Long> handles) {
+        Long previous = maxHandles.get(storageId);
+        long max = previous == null ? Long.MIN_VALUE : previous;
+        for (Long handle : handles) {
+            if (handle != null && handle > max) max = handle;
+        }
+        if (max != Long.MIN_VALUE) maxHandles.put(storageId, max);
     }
 
     /** 相机返回的存储卷列表。 */

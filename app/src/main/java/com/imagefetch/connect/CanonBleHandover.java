@@ -32,6 +32,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 佳能相机的 BLE → Wi‑Fi 交接（handover）：复刻官方 Camera Connect 的唤醒路径。
@@ -180,16 +184,18 @@ public final class CanonBleHandover {
     /** 会话初始化看门狗是否已武装：只对已配对设备生效（首次配对要等用户确认系统弹窗）。 */
     private boolean watchdogArmed;
     private final Runnable sessionProgressTimeout = () -> fail("相机蓝牙无响应，请重试");
-    private final Runnable sessionKeepAlive = new Runnable() {
-        @Override public void run() {
-            if (finished || !ready) return;
-            if (gatt != null && sessionStateCharacteristic != null) {
-                Log.i(TAG, "会话保活：读 00010005");
-                enqueue(() -> read(gatt, sessionStateCharacteristic, "会话保活"));
-            }
-            handler.postDelayed(this, SESSION_KEEPALIVE_MS);
-        }
-    };
+    /**
+     * BLE 会话保活：计时不放在主线程 Handler 上——主线程忙时 tick 会被顺延，
+     * 15s 的保活周期就不再准。GATT 读写本身仍 post 回主线程执行。
+     */
+    private final ScheduledExecutorService keepAliveTimer =
+            Executors.newSingleThreadScheduledExecutor();
+    private volatile ScheduledFuture<?> keepAliveFuture;
+    private final Runnable sessionKeepAlive = () -> handler.post(() -> {
+        if (finished || !ready || gatt == null || sessionStateCharacteristic == null) return;
+        Log.i(TAG, "会话保活：读 00010005");
+        enqueue(() -> read(gatt, sessionStateCharacteristic, "会话保活"));
+    });
     private final Runnable startStatusFallback = () -> {
         if (finished) return;
         Log.w(TAG, "没有收到 WAP 状态指示，按参数齐全收尾");
@@ -269,6 +275,8 @@ public final class CanonBleHandover {
         finished = true;
         ready = false;
         watchdogArmed = false;
+        cancelSessionKeepAlive();
+        keepAliveTimer.shutdownNow();
         handler.removeCallbacksAndMessages(null);
         unregisterBondReceiver();
         if (gatt != null) {
@@ -381,7 +389,7 @@ public final class CanonBleHandover {
                     // 交接完成后的 BLE 会话断开：只停保活，Wi‑Fi 会话由上层自行续命。
                     Log.w(TAG, "相机断开了蓝牙会话（status " + status + "）");
                     ready = false;
-                    handler.removeCallbacks(sessionKeepAlive);
+                    cancelSessionKeepAlive();
                     closeGattQuietly();
                     return;
                 }
@@ -1130,7 +1138,21 @@ public final class CanonBleHandover {
         callback.onReady(new Result(handoverSsid, handoverPassword, cameraIp,
                 cameraBssid, waitMillis));
         // 会话期间保持 BLE 有心跳：官方在 Wi‑Fi 连接期间 BLE 也一直在线。
-        handler.postDelayed(sessionKeepAlive, SESSION_KEEPALIVE_MS);
+        startSessionKeepAlive();
+    }
+
+    /** 启动 15s BLE 会话保活（改用独立计时线程，不受主线程排队影响）。 */
+    private void startSessionKeepAlive() {
+        cancelSessionKeepAlive();
+        if (finished) return;
+        keepAliveFuture = keepAliveTimer.scheduleWithFixedDelay(
+                sessionKeepAlive, SESSION_KEEPALIVE_MS, SESSION_KEEPALIVE_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelSessionKeepAlive() {
+        ScheduledFuture<?> pending = keepAliveFuture;
+        keepAliveFuture = null;
+        if (pending != null) pending.cancel(false);
     }
 
     private static String ascii(BluetoothGattCharacteristic characteristic) {

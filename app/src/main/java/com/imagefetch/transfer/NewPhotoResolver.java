@@ -39,6 +39,8 @@ public final class NewPhotoResolver {
     private final Predicate<String> alreadyImported;
     private final Set<String> baselineKeys = new LinkedHashSet<>();
     private final Set<Long> eventHandles = new LinkedHashSet<>();
+    /** 拍摄前各存储卷枚举到的最大句柄：每轮只查比它更新的对象，避免整卡逐张取 ObjectInfo。 */
+    private final Map<Long, Long> baselineMaxHandles = new LinkedHashMap<>();
 
     public NewPhotoResolver(String cameraIdentity, Predicate<String> alreadyImported) {
         this.cameraIdentity = cameraIdentity == null ? "" : cameraIdentity;
@@ -49,10 +51,21 @@ public final class NewPhotoResolver {
     public synchronized void recordBaseline(CameraStorage.Snapshot snapshot) {
         baselineKeys.clear();
         eventHandles.clear();
+        baselineMaxHandles.clear();
         if (snapshot == null) return;
+        baselineMaxHandles.putAll(snapshot.maxHandleByStorage);
         for (CameraStorage.Item item : snapshot.items) {
             baselineKeys.add(objectKey(item));
+            // 兼容没有枚举信息的 Snapshot（单测/外部构造）：退化成从条目里取最大句柄。
+            Long current = baselineMaxHandles.get(item.storageId);
+            if (current == null || item.handle > current) {
+                baselineMaxHandles.put(item.storageId, item.handle);
+            }
         }
+    }
+
+    private synchronized Map<Long, Long> baselineHandles() {
+        return new LinkedHashMap<>(baselineMaxHandles);
     }
 
     /** 相机上报新增对象（event reader 线程调用）。 */
@@ -121,7 +134,7 @@ public final class NewPhotoResolver {
 
             CameraStorage.Snapshot snapshot;
             try {
-                snapshot = operations.snapshot(maxItems);
+                snapshot = operations.snapshotNewerThan(baselineHandles(), maxItems);
             } catch (PtpResponseException busy) {
                 // HDR/机内合成/连拍写卡期间相机回 0xA106（屏幕同时显示 busy），
                 // 这一轮读不到卡并不代表拍摄失败，等处理完继续轮询即可。

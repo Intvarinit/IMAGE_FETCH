@@ -3,6 +3,7 @@ package com.imagefetch.ui;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.util.LruCache;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -14,7 +15,6 @@ import com.imagefetch.R;
 import com.imagefetch.ptp.CameraStorage;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -32,7 +32,17 @@ public final class PhotoGridAdapter extends BaseAdapter {
     private final Context context;
     private final LayoutInflater inflater;
     private final List<CameraStorage.Item> items = new ArrayList<>();
-    private final Map<Long, Bitmap> thumbnails = new HashMap<>();
+    /**
+     * 解码后的缩略图位图。按字节数做 LRU：浏览多页后未命中的旧页会被回收，
+     * 不再像普通 HashMap 那样一路累积到 OOM（当前页的 ImageView 仍持有引用，回收缓存不影响显示）。
+     */
+    private final LruCache<Long, Bitmap> thumbnails = new LruCache<Long, Bitmap>(
+            Math.max(16 * 1024 * 1024, (int) Math.min(
+                    Integer.MAX_VALUE, Runtime.getRuntime().maxMemory() / 8))) {
+        @Override protected int sizeOf(Long key, Bitmap value) {
+            return value == null || value.isRecycled() ? 1 : value.getByteCount();
+        }
+    };
     /**
      * 跨页保留选中项：翻页只换 items，选中集合按对象句柄累积，
      * 因此可以跨页勾选后一次性下载。
@@ -100,7 +110,7 @@ public final class PhotoGridAdapter extends BaseAdapter {
      */
     public void reset() {
         items.clear();
-        thumbnails.clear();
+        thumbnails.evictAll();
         selected.clear();
         notifyDataSetChanged();
         notifySelection();

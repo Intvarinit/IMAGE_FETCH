@@ -2411,6 +2411,14 @@ public final class PtpIpTransport implements CameraTransport {
         return StorageBrowser.loadAll(this::invokeOperation, maxItems);
     }
 
+    /** 增量枚举：只对拍摄基线之后的新句柄取 ObjectInfo，降低收图轮询的往返次数。 */
+    @Override
+    public synchronized CameraStorage.Snapshot listStorageNewerThan(
+            Map<Long, Long> maxHandles, int maxItems) throws Exception {
+        ensureConnected();
+        return StorageBrowser.loadNewerThan(this::invokeOperation, maxHandles, maxItems);
+    }
+
     @Override
     public synchronized CameraStorage.Page listStoragePage(
             int pageSize, int pageIndex, boolean jpegOnly) throws Exception {
