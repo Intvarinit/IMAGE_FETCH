@@ -36,7 +36,7 @@
     <string name="preview_toggle_select">选中此图</string>
     <string name="preview_toggle_unselect">取消选中</string>
     <string name="preview_download">下载此图</string>
-    <string name="preview_download_unavailable">仅 JPG 可下载</string>
+    <string name="preview_download_unavailable">视频不可下载</string>
     <string name="preview_delete">删除此图</string>
     <string name="preview_loading">正在读取原图…</string>
     <string name="preview_thumbnail_only">（无原图可读，当前为缩略图）</string>
@@ -54,11 +54,11 @@
     <string name="exposure_hint">点数值直接选档，−/+ 逐档调整</string>
     <string name="af_mode_label">对焦方式</string>
     <string name="image_quality_label">画质</string>
-    <string name="image_quality_hint">此处选的是相机写卡的文件格式（JPG / RAW / RAW+JPG），切换后立即改机内设置。设为仅 RAW 时，「仅 JPG」分页与景深合成将没有可处理的图片。</string>
+    <string name="image_quality_hint">此处选的是相机写卡的文件格式（JPG / RAW / RAW+JPG），切换后立即改机内设置。设为仅 RAW 时，「仅 JPG」分页与景深合成将没有可处理的图片；RAW 仍可在「全部」里下载并导出全尺寸 JPG。</string>
     <string name="image_quality_unavailable">未获相机画质列表，当前连接方式不可调。</string>
-    <string name="image_quality_warn_raw_only">当前画质不含 JPG：「仅 JPG」分页与景深合成没有可处理图片。</string>
+    <string name="image_quality_warn_raw_only">当前画质不含 JPG：「仅 JPG」分页与景深合成没有可处理图片；RAW 下载时会导出全尺寸 JPG。</string>
     <string name="image_quality_switch_title">当前画质不含 JPG</string>
-    <string name="image_quality_switch_message">当前画质只会产生 RAW，App 取不回可处理的 JPG。可先切到「%1$s」再拍摄。</string>
+    <string name="image_quality_switch_message">当前画质只会产生 RAW，「仅 JPG」分页和景深合成没有可处理图片；RAW 仍可在下载时导出全尺寸 JPG。可先切到「%1$s」再拍摄。</string>
     <string name="image_quality_switch_and_shoot">切到「%1$s」并继续</string>
     <string name="image_quality_shoot_anyway">仍然拍摄</string>
     <string name="image_quality_switch_extra_stack">本批还将无法做景深合成。</string>

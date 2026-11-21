@@ -7,6 +7,8 @@ import static com.imagefetch.testutil.Bytes.u32;
 import static com.imagefetch.testutil.Bytes.zeros;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.imagefetch.testutil.Bytes;
@@ -34,16 +36,20 @@ public class StorageBrowserTest {
         private final Map<Integer, Integer> calls = new LinkedHashMap<>();
 
         long folder(long handle, String name, long parent) {
-            objectInfo.put(handle, dataset(name, true));
+            objectInfo.put(handle, dataset(name, true, 0));
             if (parent == ROOT) roots.add(handle);
             else children.computeIfAbsent(parent, key -> new ArrayList<>()).add(handle);
             return handle;
         }
 
         long file(long handle, String name, long parent) {
-            objectInfo.put(handle, dataset(name, false));
+            objectInfo.put(handle, dataset(name, false, parent));
             children.computeIfAbsent(parent, key -> new ArrayList<>()).add(handle);
             return handle;
+        }
+
+        CameraStorage.Item item(long handle) {
+            return CameraStorage.parseObjectInfo(handle, objectInfo.get(handle));
         }
 
         int callCount(int operation) {
@@ -84,8 +90,8 @@ public class StorageBrowserTest {
             return children.getOrDefault(parent, new ArrayList<>());
         }
 
-        /** ObjectInfo 数据集：associationType@42 区分目录/文件。 */
-        private static byte[] dataset(String name, boolean isFolder) {
+        /** ObjectInfo 数据集：associationType@42 区分目录/文件，ParentObject@38 记目录。 */
+        private static byte[] dataset(String name, boolean isFolder, long parent) {
             return concat(
                     u32(STORAGE_ID),
                     u16(isFolder ? 0x3001 : 0x3801),
@@ -94,7 +100,8 @@ public class StorageBrowserTest {
                     zeros(14),
                     u32(6000),
                     u32(4000),
-                    zeros(8),
+                    u32(0),
+                    u32(parent),
                     u16(isFolder ? 1 : 0),
                     zeros(8),
                     ptpString(name),
@@ -123,6 +130,40 @@ public class StorageBrowserTest {
 
         assertEquals("1 个存储卷", 1, snapshot.volumes.size());
         assertEquals("两个目录共 50 张", 50, snapshot.items.size());
+    }
+
+    @Test
+    public void companionJpegIsFoundInTheSameFolderOnly() throws Exception {
+        FakeCard card = new FakeCard();
+        long dcim = card.folder(1L, "DCIM", ROOT);
+        long folderA = card.folder(2L, "100CANON", dcim);
+        long folderB = card.folder(3L, "101CANON", dcim);
+        long rawHandle = card.file(500L, "IMG_0001.CR3", folderA);
+        long jpgHandle = card.file(501L, "IMG_0001.JPG", folderA);
+        card.file(502L, "IMG_0001.JPG", folderB);
+
+        CameraStorage.Item companion =
+                StorageBrowser.findCompanionJpeg(card.invoker(), card.item(rawHandle));
+
+        assertNotNull(companion);
+        assertEquals(jpgHandle, companion.handle);
+        assertEquals(
+                "只查同目录兄弟，不扫另一个目录",
+                1,
+                card.callCount(StorageBrowser.GET_OBJECT_INFO));
+    }
+
+    @Test
+    public void companionLookupWithoutParentFallsBackToRawDevelopment() throws Exception {
+        FakeCard card = dcfCard(1);
+        CameraStorage.Item raw = new CameraStorage.Item(
+                500L, STORAGE_ID, 0, "IMG_0001.CR3", 1, 0, 0, "—", false, 0L);
+
+        assertNull(StorageBrowser.findCompanionJpeg(card.invoker(), raw));
+        assertEquals(
+                "没有 ParentObject 时不做整卡扫描",
+                0,
+                card.callCount(StorageBrowser.GET_OBJECT_HANDLES));
     }
 
     @Test

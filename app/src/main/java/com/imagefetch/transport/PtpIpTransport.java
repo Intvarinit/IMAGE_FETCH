@@ -2434,6 +2434,13 @@ public final class PtpIpTransport implements CameraTransport {
     }
 
     @Override
+    public synchronized CameraStorage.Item findCompanionJpeg(CameraStorage.Item raw)
+            throws Exception {
+        ensureConnected();
+        return StorageBrowser.findCompanionJpeg(this::invokeOperation, raw);
+    }
+
+    @Override
     public void invalidateStorageCache() {
         synchronized (pageCache) {
             pageCache.clear();

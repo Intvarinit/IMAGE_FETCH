@@ -73,6 +73,11 @@ public final class PtpOperationService {
         return transport.listStoragePhotoPage(pageSize, pageIndex);
     }
 
+    /** 在 RAW 所在目录里找同名 JPG；没有返回 null（调用方退回 RAW 显影）。 */
+    public CameraStorage.Item findCompanionJpeg(CameraStorage.Item raw) throws Exception {
+        return transport.findCompanionJpeg(raw);
+    }
+
     /** 存储卡结构变化后清掉句柄缓存。 */
     public void invalidateStorageCache() {
         transport.invalidateStorageCache();

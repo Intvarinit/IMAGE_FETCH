@@ -217,6 +217,13 @@ public final class UsbPtpTransport implements CameraTransport {
     }
 
     @Override
+    public synchronized CameraStorage.Item findCompanionJpeg(CameraStorage.Item raw)
+            throws Exception {
+        ensureConnected();
+        return StorageBrowser.findCompanionJpeg(this::invokeOperation, raw);
+    }
+
+    @Override
     public void invalidateStorageCache() {
         pageCache.clear();
     }

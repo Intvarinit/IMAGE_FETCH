@@ -169,15 +169,16 @@ public final class PhotoViewerDialog extends Dialog {
         return adapter.itemAt(position);
     }
 
-    /** 任意格式都可选中（选中后既能删除，JPEG 还能下载），因此全部显示切换按钮。 */
+    /** 任意格式都可选中（选中后既能删除，JPG/RAW 还能下载），因此全部显示切换按钮。 */
     private void updateToggle(CameraStorage.Item item) {
         toggleView.setVisibility(View.VISIBLE);
         toggleView.setText(adapter.isSelected(item.handle)
                 ? R.string.preview_toggle_unselect
                 : R.string.preview_toggle_select);
-        // 取回只处理 JPEG：RAW/视频停在缩略图状态，下载按钮置灰，避免点了之后只得到一句跳过的提示。
-        downloadView.setEnabled(item.isJpeg());
-        downloadView.setText(item.isJpeg()
+        // JPG 直接取回；RAW 会先找同名 JPG，没有则显影成全尺寸 JPG。视频不支持取回。
+        boolean downloadable = item.isJpeg() || item.isRaw();
+        downloadView.setEnabled(downloadable);
+        downloadView.setText(downloadable
                 ? R.string.preview_download
                 : R.string.preview_download_unavailable);
     }

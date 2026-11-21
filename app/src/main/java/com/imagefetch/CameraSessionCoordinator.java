@@ -36,6 +36,8 @@ import com.imagefetch.ptp.SensorPointMapper;
 import com.imagefetch.ptp.VendorProperty;
 import com.imagefetch.ptp.VendorPropertySnapshot;
 import com.imagefetch.ptp.WhiteBalanceChoices;
+import com.imagefetch.raw.RawDeveloper;
+import com.imagefetch.raw.RawJpegMetadata;
 import com.imagefetch.storage.GalleryExporter;
 import com.imagefetch.storage.JpegOrientation;
 import com.imagefetch.storage.PhotoRepository;
@@ -50,9 +52,11 @@ import com.imagefetch.transport.PtpIpTransport;
 import com.imagefetch.transport.PtpResponseException;
 import com.imagefetch.transport.UsbPtpTransport;
 
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.NoRouteToHostException;
 import java.net.Socket;
@@ -61,11 +65,15 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -286,6 +294,11 @@ public final class CameraSessionCoordinator {
      */
     private final ExecutorService thumbnailFetchExecutor = Executors.newSingleThreadExecutor();
     /**
+     * RAW 显影独立线程：单张 26MP RAW 要数秒和数百 MB 原生内存，绝不能占用 PTP 单线程
+     * executor（同景深合成的约束）。下载走 PTP，显影只在这条线程上跑。
+     */
+    private final ExecutorService rawExportExecutor = Executors.newSingleThreadExecutor();
+    /**
      * 心跳独立线程：与 executor 共用时会被整批缩略图/翻页任务堵住，
      * 实测能出现 40 秒空窗，相机按空闲超时直接关热点。
      */
@@ -316,6 +329,8 @@ public final class CameraSessionCoordinator {
     private static final int MAX_PAGE_SIZE = 500;
     /** 放大预览的原图解码目标边长（像素）。 */
     private static final int PREVIEW_MAX_PX = 1600;
+    /** RAW 显影导出的 JPEG 质量（1–100）；全尺寸输出，不在这里做缩放。 */
+    private static final int RAW_JPEG_QUALITY = 92;
     /** 拍摄前基线只需覆盖最新的若干张，不必整卡枚举。 */
     private static final int CAPTURE_BASELINE_ITEMS = 60;
     /** 实时取景取帧间隔（约 10fps，与 libgphoto2 的取景循环同量级）。 */
@@ -1341,6 +1356,7 @@ public final class CameraSessionCoordinator {
         releaseWifiLock();
         executor.shutdownNow();
         thumbnailFetchExecutor.shutdownNow();
+        rawExportExecutor.shutdownNow();
         heartbeatExecutor.shutdownNow();
         heartbeatTimer.shutdownNow();
     }
@@ -2331,7 +2347,12 @@ public final class CameraSessionCoordinator {
         return null;
     }
 
-    /** 手动下载选中的相机对象；与拍摄路径一致，仅 JPEG 可下载，RAW/其他格式一律跳过。 */
+    /**
+     * 手动下载选中的相机对象。
+     *
+     * <p>JPG 直接取回；RAW 先找卡上同名 JPG（RAW+JPG 拍摄）并直接取回那张全尺寸 JPG，
+     * 找不到时才把 RAW 下载到缓存、用 LibRaw 显影成全尺寸 JPG。视频等其他格式跳过。
+     */
     public void download(List<CameraStorage.Item> items) {
         executor.submit(() -> {
             if (!isConnected()) {
@@ -2347,39 +2368,46 @@ public final class CameraSessionCoordinator {
             exportFailureReported = false;
             try {
                 List<CameraStorage.Item> jpegs = new ArrayList<>();
+                List<CameraStorage.Item> raws = new ArrayList<>();
                 List<CameraStorage.Item> skipped = new ArrayList<>();
                 for (CameraStorage.Item item : items) {
                     if (item.isJpeg()) jpegs.add(item);
+                    else if (item.isRaw()) raws.add(item);
                     else skipped.add(item);
                 }
-                if (jpegs.isEmpty()) {
-                    listener.onStatus("所选对象不是 JPEG（" + names(skipped)
-                            + "）；按设置（无 JPEG 不保存）已跳过，未下载。");
+                if (jpegs.isEmpty() && raws.isEmpty()) {
+                    listener.onStatus("所选对象不是 JPG/RAW（" + names(skipped) + "），未下载。");
                     return;
                 }
                 if (!skipped.isEmpty()) {
-                    listener.onStatus("仅 JPEG 可下载，跳过：" + names(skipped));
+                    listener.onStatus("仅 JPG/RAW 可下载，跳过：" + names(skipped));
                 }
+                final String identity = operations.cameraIdentity();
+                final Set<String> handled = new HashSet<>();
                 for (CameraStorage.Item item : jpegs) {
+                    if (!handled.add(item.objectKey(identity))) continue;
                     current.throwIfCancelled();
-                    listener.onStatus("下载 " + item.filename + " …");
-                    PhotoTransferWorker worker =
-                            new PhotoTransferWorker(operations, repository);
-                    PhotoTransferWorker.Result result = worker.transfer(
-                            item,
-                            (received, total) -> listener.onProgress(received, total),
-                            current);
-                    if (result.alreadyImported) {
-                        listener.onStatus(item.filename + " 已入库，跳过。");
+                    downloadJpeg(item, current);
+                }
+                for (CameraStorage.Item item : raws) {
+                    current.throwIfCancelled();
+                    CameraStorage.Item companion = null;
+                    try {
+                        companion = operations.findCompanionJpeg(item);
+                    } catch (Exception error) {
+                        // 找不到同名 JPG 不该阻断 RAW 显影；继续走兜底路径。
+                        listener.onStatus("查找 " + item.filename + " 的同名 JPG 失败，改为显影 RAW："
+                                + describeError(error));
+                    }
+                    if (companion != null) {
+                        if (!handled.add(companion.objectKey(identity))) {
+                            listener.onStatus(item.filename + " 对应的 JPG 已在本批处理，跳过。");
+                            continue;
+                        }
+                        downloadCompanionJpeg(item, companion, current);
                         continue;
                     }
-                    // 与拍摄路径一致：落盘成功后按用户开关导出到系统相册。
-                    String note = exportToGalleryIfEnabled(result.file);
-                    listener.onStatus("已保存 " + result.file.getName()
-                            + " · " + result.bytes + " 字节 · " + result.elapsedMillis + " ms"
-                            + note);
-                    mainHandler.post(() -> listener.onFileSaved(
-                            result.file, result.bytes, result.elapsedMillis, note));
+                    exportRawAsJpeg(item, current, identity);
                 }
             } catch (InterruptedException interrupted) {
                 mainHandler.post(() -> listener.onStatus(interruptedMessage(current)));
@@ -2393,6 +2421,138 @@ public final class CameraSessionCoordinator {
             }
         });
     }
+
+    /** 普通 JPG 取回：落盘 → 相册导出（按开关）→ 状态上报。 */
+    private void downloadJpeg(CameraStorage.Item item, TransferControl current) throws Exception {
+        listener.onStatus("下载 " + item.filename + " …");
+        PhotoTransferWorker worker = new PhotoTransferWorker(operations, repository);
+        PhotoTransferWorker.Result result = worker.transfer(
+                item,
+                (received, total) -> listener.onProgress(received, total),
+                current);
+        if (result.alreadyImported) {
+            listener.onStatus(item.filename + " 已入库，跳过。");
+            return;
+        }
+        // 与拍摄路径一致：落盘成功后按用户开关导出到系统相册。
+        String note = exportToGalleryIfEnabled(result.file);
+        listener.onStatus("已保存 " + result.file.getName()
+                + " · " + result.bytes + " 字节 · " + result.elapsedMillis + " ms"
+                + note);
+        mainHandler.post(() -> listener.onFileSaved(
+                result.file, result.bytes, result.elapsedMillis, note));
+    }
+
+    /** RAW+JPG 拍摄：直接取回卡上的全尺寸 JPG，不需要显影，画质与机内 JPG 一致。 */
+    private void downloadCompanionJpeg(
+            CameraStorage.Item raw,
+            CameraStorage.Item companion,
+            TransferControl current) throws Exception {
+        listener.onStatus("下载 " + raw.filename + " 对应的 JPG（" + companion.filename + "）…");
+        PhotoTransferWorker worker = new PhotoTransferWorker(operations, repository);
+        PhotoTransferWorker.Result result = worker.transfer(
+                companion,
+                (received, total) -> listener.onProgress(received, total),
+                current);
+        if (result.alreadyImported) {
+            listener.onStatus(raw.filename + " 对应的 JPG 已入库，跳过。");
+            return;
+        }
+        String note = exportToGalleryIfEnabled(result.file);
+        listener.onStatus("已保存 " + result.file.getName()
+                + "（" + raw.filename + " 对应的全尺寸 JPG）"
+                + " · " + result.bytes + " 字节 · " + result.elapsedMillis + " ms"
+                + note);
+        mainHandler.post(() -> listener.onFileSaved(
+                result.file, result.bytes, result.elapsedMillis, note));
+    }
+
+    /**
+     * 仅 RAW 拍摄：先把 RAW 流式下载到缓存，再交给独立线程用 LibRaw 显影成全尺寸 JPG。
+     * RAW 只是显影输入，提交后立即删除；应用内/相册里只留 JPG。
+     */
+    private void exportRawAsJpeg(
+            CameraStorage.Item raw, TransferControl current, String identity) throws Exception {
+        final String key = raw.objectKey(identity);
+        if (repository.isImported(key)) {
+            listener.onStatus(raw.filename + " 已入库，跳过。");
+            return;
+        }
+        File cacheDirectory = new File(context.getCacheDir(), "raw_src");
+        if (!cacheDirectory.exists() && !cacheDirectory.mkdirs()) {
+            throw new Exception("无法创建 RAW 缓存目录：" + cacheDirectory.getAbsolutePath());
+        }
+        final long startedAt = System.currentTimeMillis();
+        File rawFile = new File(cacheDirectory,
+                "raw_" + System.nanoTime() + "." + extensionOf(raw.filename));
+        try {
+            listener.onStatus("下载 RAW " + raw.filename + " …");
+            try (OutputStream output = new BufferedOutputStream(new FileOutputStream(rawFile))) {
+                operations.download(
+                        raw.handle,
+                        output,
+                        (received, total) -> listener.onProgress(received, total));
+                output.flush();
+            }
+            if (raw.sizeBytes > 0 && rawFile.length() != raw.sizeBytes) {
+                throw new Exception("RAW 长度与相机声明不一致：声明 " + raw.sizeBytes
+                        + " 字节，实际 " + rawFile.length() + " 字节");
+            }
+            if (!RawDeveloper.isAvailable()) {
+                throw new Exception(RawDeveloper.unavailableReason());
+            }
+            // 机型串在 PTP 线程上先取好：transport 的方法是 synchronized 的，
+            // 不要让显影线程反向去碰传输层。
+            final String cameraName = operations.cameraName();
+            final PhotoRepository.StagedFile staged = repository.stage(
+                    CameraStorage.baseName(raw.filename) + ".jpg", cameraName);
+            try {
+                listener.onStatus("RAW 显影中（全尺寸 JPG）：" + raw.filename + " …");
+                final RawDeveloper.Result dimensions;
+                Future<RawDeveloper.Result> task = rawExportExecutor.submit(() -> {
+                    RawDeveloper.Result result = RawDeveloper.develop(
+                            rawFile, staged.staging, RAW_JPEG_QUALITY);
+                    // 补拍摄时间/机型，避免相册按“导入时间”排序。
+                    RawJpegMetadata.apply(staged.staging, raw.capturedAt, cameraName);
+                    return result;
+                });
+                try {
+                    dimensions = task.get();
+                } catch (InterruptedException interrupted) {
+                    task.cancel(true);
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                } catch (ExecutionException failure) {
+                    Throwable cause = failure.getCause();
+                    if (cause instanceof Exception) throw (Exception) cause;
+                    throw new Exception(cause == null ? "RAW 显影失败" : describeError(cause), cause);
+                }
+                current.throwIfCancelled();
+                final long bytes = staged.staging.length();
+                // 用 RAW 对象身份记为已入库：下次再选同一张 RAW 不会重复下载/显影。
+                repository.commit(staged, key, bytes);
+                final String note = exportToGalleryIfEnabled(staged.destination);
+                final long elapsed = System.currentTimeMillis() - startedAt;
+                listener.onStatus("已保存 " + staged.destination.getName()
+                        + "（RAW 显影 " + dimensions.width + "×" + dimensions.height + "）"
+                        + " · " + bytes + " 字节 · " + elapsed + " ms" + note);
+                mainHandler.post(() -> listener.onFileSaved(
+                        staged.destination, bytes, elapsed, note));
+            } finally {
+                repository.discard(staged);
+            }
+        } finally {
+            rawFile.delete();
+        }
+    }
+
+    private static String extensionOf(String filename) {
+        int dot = filename == null ? -1 : filename.lastIndexOf('.');
+        String extension = dot >= 0 ? filename.substring(dot + 1) : "raw";
+        extension = extension.replaceAll("[^A-Za-z0-9]", "").toLowerCase(Locale.ROOT);
+        return extension.isEmpty() ? "raw" : extension;
+    }
+
 
     /**
      * 读取一页图片来源（JPG + RAW）（胶片模拟页专用）。
@@ -2537,7 +2697,7 @@ public final class CameraSessionCoordinator {
     }
 
     /** 异常转一句可读文案（无 message 时退回类名）。 */
-    private static String describeError(Exception error) {
+    private static String describeError(Throwable error) {
         String message = error == null ? null : error.getMessage();
         if (message != null && !message.isEmpty()) return message;
         return error == null ? "未知错误" : error.getClass().getSimpleName();

@@ -26,6 +26,7 @@ public class PtpIpTransportContractTest {
     private static final long STORAGE_ID = 0x10000001L;
     private static final long HANDLE = 0x2001L;
     private static final long OPEN_SESSION = 0x1002L;
+    private static final long GET_DEVICE_INFO = 0x1001L;
     private static final long CAPTURE = 0x100eL;
     private static final long GET_OBJECT = 0x1009L;
     private static final long DELETE_OBJECT = 0x100bL;
@@ -239,7 +240,13 @@ public class PtpIpTransportContractTest {
     @Test
     public void probeRoundTripsAndObjectAddedIsDispatchedToTheListener() throws Exception {
         try (FakePtpIpCamera camera = new FakePtpIpCamera("Fake Sony", (channel, operation, tx, params) -> {
-            if (operation == OPEN_SESSION) channel.respond(tx, RESPONSE_OK);
+            if (operation == OPEN_SESSION) {
+                channel.respond(tx, RESPONSE_OK);
+            } else if (operation == GET_DEVICE_INFO) {
+                // probe() 在 ProbeRequest 之后还会做一次真实命令往返（GetDeviceInfo），
+                // 用于识别“PING 能回但会话已僵死”的相机；伪相机必须回数据阶段。
+                channel.sendData(tx, new byte[8], 8);
+            }
         })) {
             PtpIpTransport transport = new PtpIpTransport();
             try {

@@ -79,7 +79,8 @@ public final class PhotoGridAdapter extends BaseAdapter {
     }
 
     /**
-     * 切换选中。任意格式都可选中：下载仍只处理 JPEG（非 JPEG 会在下载时被跳过），
+     * 切换选中。任意格式都可选中：删除支持所有格式；下载支持 JPG 与 RAW
+     * （RAW 下载时会导出对应 JPG），视频在下载时被跳过。
      * 但删除支持任意格式，因此不能因为「不能下载」就拒绝选中。
      */
     public void toggle(CameraStorage.Item item) {

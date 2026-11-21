@@ -89,9 +89,36 @@ public class CameraStorageTest {
         assertEquals(4000, item.height);
         assertEquals("IMG_0001.JPG", item.filename);
         assertEquals("2026-01-01 12:00:00", item.capturedAt);
+        assertEquals(0L, item.parentHandle);
         assertTrue(item.isJpeg());
         assertFalse(item.isRaw());
         assertFalse(item.isVideo());
+    }
+
+    @Test
+    public void parsesParentHandleForCompanionLookup() {
+        byte[] data = objectInfoDataset(
+                0x10000001L, 0x3801, 123456L, 6000, 4000, 0,
+                "IMG_0001.JPG", "20260101T120000", 0x2005L);
+        CameraStorage.Item item = CameraStorage.parseObjectInfo(0x2001, data);
+        assertNotNull(item);
+        assertEquals(0x2005L, item.parentHandle);
+    }
+
+    @Test
+    public void companionJpegMatchesBaseNameStorageAndFolder() {
+        CameraStorage.Item raw = new CameraStorage.Item(
+                5, 9, 0, "IMG_0001.CR3", 1, 0, 0, "—", false, 77);
+        assertTrue(raw.hasCompanionJpeg(new CameraStorage.Item(
+                6, 9, 0, "IMG_0001.JPG", 1, 0, 0, "—", false, 77)));
+        assertFalse("主文件名不同", raw.hasCompanionJpeg(new CameraStorage.Item(
+                7, 9, 0, "IMG_0002.JPG", 1, 0, 0, "—", false, 77)));
+        assertFalse("存储卷不同", raw.hasCompanionJpeg(new CameraStorage.Item(
+                8, 10, 0, "IMG_0001.JPG", 1, 0, 0, "—", false, 77)));
+        assertFalse("目录不同", raw.hasCompanionJpeg(new CameraStorage.Item(
+                9, 9, 0, "IMG_0001.JPG", 1, 0, 0, "—", false, 88)));
+        assertFalse("同扩展名不是 JPG", raw.hasCompanionJpeg(new CameraStorage.Item(
+                10, 9, 0, "IMG_0001.CR3", 1, 0, 0, "—", false, 77)));
     }
 
     @Test
@@ -171,6 +198,25 @@ public class CameraStorageTest {
             int associationType,
             String filename,
             String capturedAt) {
+        return objectInfoDataset(
+                storageId, format, size, width, height, associationType, filename, capturedAt, 0L);
+    }
+
+    /**
+     * ObjectInfo 数据集：storageId@0、format@4、protection@6、size@8、
+     * width@26、height@30、bitDepth@34、parentObject@38、associationType@42、
+     * filename@52、captureDate 紧随其后。
+     */
+    private static byte[] objectInfoDataset(
+            long storageId,
+            int format,
+            long size,
+            int width,
+            int height,
+            int associationType,
+            String filename,
+            String capturedAt,
+            long parentHandle) {
         return concat(
                 u32(storageId),
                 u16(format),
@@ -179,7 +225,8 @@ public class CameraStorageTest {
                 zeros(14),
                 u32(width),
                 u32(height),
-                zeros(8),
+                u32(0),
+                u32(parentHandle),
                 u16(associationType),
                 zeros(8),
                 ptpString(filename),

@@ -56,8 +56,10 @@ Android 端相机取图 App：通过 **Wi‑Fi PTP/IP**（或 USB PTP）连上�
   **不退出遥控态**。libgphoto2 那套收尾（`SetRemoteMode(0)/(1)` + `SetEventMode(0)` + `ResetUILock`）
   是给「马上要断开连接」的会话用的——我们保持会话，退遥控态反而把相机留在半状态，机身按键无响应、屏幕报 busy。
 - **拍摄前暂停取景写 `0`**（彻底停画面上游），与关面板写 `0x01` 是两条不同路径，取值相反、不可混用。
-- **只处理 JPEG**：不支持 CR3/RAW 下载；相机设为仅 RAW 时只提示、不报错。
-  **删除不受此限制**：删除走标准 `0x100B DeleteObject`，任意格式（CR3/RAW/视频）都能选、都能删，
+- **JPG 与 RAW 取回**：JPG 直接取回；RAW 下载时优先取卡上同名 JPG（相机以 RAW+JPG 拍摄），
+  没有同名 JPG 时用内置 LibRaw 在手机上显影成全尺寸 JPG（显影结果按相机白平衡/sRGB 输出，
+  色彩可能略异于机内 JPG；未启用 zlib/libjpeg，个别压缩 DNG 可能显影失败）。视频不支持取回。
+  **删除不受格式限制**：删除走标准 `0x100B DeleteObject`，任意格式（CR3/RAW/视频）都能选、都能删，
   删除前必须二次确认。
 - **「仅 JPG」是一种分页范围，不是界面过滤**：该模式下每页就是 `pageSize` 张 JPG，总数也是 JPG 张数
   （不再先按全部对象切片、再由界面丢掉 RAW，导致一页只剩两三张）。JPG 与否只能从 ObjectInfo 的文件名
@@ -75,12 +77,17 @@ app/src/main/java/com/imagefetch/
 ├── CameraConnectionService.java      前台服务，保持连接不被回收
 ├── transport/                        CameraTransport 接口 + PTP/IP、USB 两种实现
 ├── ptp/                              PTP 操作转发、存储浏览、Canon 曝光档位表
+├── raw/                              LibRaw 显影封装（仅 JNI 入口）
 ├── transfer/                         新对象发现（事件优先 + 句柄差集）、取回、心跳、重连策略
 ├── storage/                          本地仓库与相册导出
 └── ui/                               列表适配器
 ```
 
+原生层源码在 `app/src/main/cpp/`：LibRaw 静态库、JNI 入口与 stb JPEG 编码。
+
 ## 构建与测试
+
+需要 Android SDK 35、NDK `27.0.12077973`、CMake `3.22.1`（RAW 显影的原生库）。
 
 ```powershell
 $env:JAVA_HOME='D:\devTool\jdk-21.0.12.1+1'

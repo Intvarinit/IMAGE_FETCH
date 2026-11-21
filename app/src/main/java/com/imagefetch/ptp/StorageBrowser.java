@@ -235,6 +235,25 @@ public final class StorageBrowser {
         return files;
     }
 
+    /**
+     * 在 RAW 所在目录里找同名 JPG（RAW+JPG 拍摄）。
+     *
+     * <p>只枚举同一 ParentObject 下的兄弟对象，不整卡扫描；ParentObject 未知
+     * （老实现/机身内存对象）时返回 null，由调用方退回 RAW 显影。
+     */
+    public static CameraStorage.Item findCompanionJpeg(
+            Invoker invoker, CameraStorage.Item raw) throws Exception {
+        if (raw == null || !raw.isRaw() || raw.storageId <= 0 || raw.parentHandle <= 0) {
+            return null;
+        }
+        for (long handle : handles(invoker, raw.storageId, raw.parentHandle)) {
+            if (handle == raw.handle) continue;
+            CameraStorage.Item candidate = objectInfo(invoker, handle);
+            if (raw.hasCompanionJpeg(candidate)) return candidate;
+        }
+        return null;
+    }
+
     /** 完整扫描：任意深度递归，逐对象取 ObjectInfo。 */
     public static CameraStorage.Snapshot loadAll(Invoker invoker, int maxItems) throws Exception {
         List<CameraStorage.Volume> volumes = new ArrayList<>();

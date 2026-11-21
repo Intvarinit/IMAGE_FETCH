@@ -377,7 +377,8 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     /** 当前页序号（从 0 开始）与是否处于“完整扫描”模式。 */
     private int currentPage;
     private boolean fullScanMode;
-    /** 图片栏是否只显示 JPG（默认开：只有 JPG 能下载，RAW 显示出来也没法用）。
+    /** 图片栏是否只显示 JPG（默认开：浏览以 JPG 为主）。
+     *  RAW 不会出现在这个分页里，切到「全部」后下载时导出为全尺寸 JPG。
      *  同时决定分页范围——「仅 JPG」时每页就是 {@code pageSize} 张 JPG。 */
     private boolean jpegOnly = true;
 
@@ -632,16 +633,16 @@ public final class MainActivity extends Activity implements CameraSessionCoordin
     }
 
     /**
-     * 全屏看图里直接下载当前这张：只处理 JPEG；发起后收起看图页，
-     * 让主界面显示传输进度与最终的「已保存」结果。
+     * 全屏看图里直接下载当前这张：JPG 直接取回；RAW 优先取卡上同名 JPG，
+     * 没有则显影成全尺寸 JPG。发起后收起看图页，让主界面显示传输/显影进度。
      */
     private void downloadFromViewer(CameraStorage.Item item) {
         if (!coordinator.isConnected()) {
             showError("请先连接相机。", null);
             return;
         }
-        if (!item.isJpeg()) {
-            showError("当前只支持取回 JPG；RAW 或视频请在相机上处理。", null);
+        if (!item.isJpeg() && !item.isRaw()) {
+            showError("视频暂不支持取回；JPG 直接下载，RAW 会导出全尺寸 JPG。", null);
             return;
         }
         if (viewerDialog != null && viewerDialog.isShowing()) viewerDialog.dismiss();

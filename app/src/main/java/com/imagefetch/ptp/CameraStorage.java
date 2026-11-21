@@ -49,6 +49,8 @@ public final class CameraStorage {
         public final int height;
         public final String capturedAt;
         public final boolean protectedObject;
+        /** ObjectInfo 里的 ParentObject；用来在同目录内找 RAW 对应的 JPG，未知为 0。 */
+        public final long parentHandle;
 
         public Item(
                 long handle,
@@ -60,6 +62,21 @@ public final class CameraStorage {
                 int height,
                 String capturedAt,
                 boolean protectedObject) {
+            this(handle, storageId, format, filename, sizeBytes, width, height,
+                    capturedAt, protectedObject, 0L);
+        }
+
+        public Item(
+                long handle,
+                long storageId,
+                int format,
+                String filename,
+                long sizeBytes,
+                int width,
+                int height,
+                String capturedAt,
+                boolean protectedObject,
+                long parentHandle) {
             this.handle = handle;
             this.storageId = storageId;
             this.format = format;
@@ -69,6 +86,7 @@ public final class CameraStorage {
             this.height = height;
             this.capturedAt = capturedAt;
             this.protectedObject = protectedObject;
+            this.parentHandle = parentHandle;
         }
 
         public boolean isVideo() {
@@ -83,7 +101,7 @@ public final class CameraStorage {
             return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
         }
 
-        /** RAW（.cr2/.cr3/.nef/.arw 等）：仅用于识别与跳过，不落盘（只保存 JPEG）。 */
+        /** RAW（.cr2/.cr3/.nef/.arw 等）：可下载，导出为对应的全尺寸 JPG。 */
         public boolean isRaw() {
             String lower = filename.toLowerCase(Locale.ROOT);
             return lower.endsWith(".cr2") || lower.endsWith(".cr3")
@@ -96,6 +114,31 @@ public final class CameraStorage {
         public String objectKey(String cameraIdentity) {
             return cameraIdentity + ":" + storageId + ":" + handle;
         }
+
+        /**
+         * 判断 candidate 是否是本 RAW 在机内的同名 JPG（RAW+JPG 模式）。
+         *
+         * <p>佳能等机型把两种格式写成同一主文件名（IMG_0001.CR3 / IMG_0001.JPG），
+         * 且放在同一目录；ParentObject 未知时只比较存储卷与主文件名，宁可多配一次也不漏。
+         */
+        public boolean hasCompanionJpeg(Item candidate) {
+            if (candidate == null || !isRaw() || !candidate.isJpeg()) return false;
+            if (storageId != candidate.storageId) return false;
+            if (parentHandle > 0 && candidate.parentHandle > 0
+                    && parentHandle != candidate.parentHandle) {
+                return false;
+            }
+            return baseName(filename).equalsIgnoreCase(baseName(candidate.filename));
+        }
+    }
+
+    /** 去掉最后一个扩展名的主文件名，用于 RAW+JPG 同名配对。 */
+    public static String baseName(String filename) {
+        if (filename == null) return "";
+        int slash = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
+        int dot = filename.lastIndexOf('.');
+        if (dot <= slash) return filename.trim();
+        return filename.substring(0, dot).trim();
     }
 
     public static final class Snapshot {
@@ -233,6 +276,7 @@ public final class CameraStorage {
         int width = saturatedInt(u32(data, 26));
         int height = saturatedInt(u32(data, 30));
         int associationType = u16(data, 42);
+        long parentHandle = u32(data, 38);
         PtpString filename = ptpString(data, 52);
         PtpString capturedAt = ptpString(data, filename.nextOffset);
         if (associationType != 0 || filename.value.isEmpty()) return null;
@@ -245,7 +289,8 @@ public final class CameraStorage {
                 width,
                 height,
                 displayDate(capturedAt.value),
-                protectedObject);
+                protectedObject,
+                parentHandle);
     }
 
     public static boolean isAssociation(byte[] data) {

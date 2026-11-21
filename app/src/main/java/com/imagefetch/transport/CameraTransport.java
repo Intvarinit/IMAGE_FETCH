@@ -57,6 +57,14 @@ public interface CameraTransport extends Closeable {
     }
 
     /**
+     * 在 RAW 所在目录里找同名 JPG（相机以 RAW+JPG 拍摄时存在）。
+     * 返回 null 表示没有同名 JPG，调用方应退回 RAW 显影；不支持的传输也返回 null。
+     */
+    default CameraStorage.Item findCompanionJpeg(CameraStorage.Item raw) throws Exception {
+        return null;
+    }
+
+    /**
      * 快速分页：只列文件句柄（浅层目录探测）并只对当前页取 ObjectInfo，
      * 大卡翻页无需整卡枚举。实现内部缓存句柄列表，翻页复用。
      *
